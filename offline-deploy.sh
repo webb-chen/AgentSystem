@@ -661,7 +661,6 @@ setup_autostart() {
     cat >"$unit" <<UNIT
 [Unit]
 Description=${APP_BRAND} ${APP_NAME} Offline Stack (v${APP_VERSION})
-Documentation=file://${INSTALL_DIR}/README.md
 Requires=docker.service
 After=docker.service network-online.target
 Wants=network-online.target
@@ -670,7 +669,6 @@ Wants=network-online.target
 Type=oneshot
 RemainAfterExit=yes
 WorkingDirectory=${DOCKER_DIR}
-ExecStartPre=-/usr/bin/docker compose -p ${PROJECT_NAME} --env-file ${ENV_FILE} -f ${COMPOSE_FILE} down --remove-orphans
 ExecStart=${exec_start}
 ExecStop=${exec_stop}
 TimeoutStartSec=0
@@ -683,6 +681,9 @@ UNIT
     if systemctl enable "$SERVICE_NAME" >/dev/null 2>&1; then
       ok "systemd 单元已创建：${unit}"
       ok "开机自启：systemctl is-enabled ${SERVICE_NAME} → $(systemctl is-enabled "$SERVICE_NAME" 2>/dev/null || echo enabled)"
+      # 让单元进入 active(exited) 状态：compose up -d 幂等，不会重启已在运行的容器
+      systemctl start "$SERVICE_NAME" >/dev/null 2>&1 || true
+      ok "systemd 单元状态：$(systemctl is-active "$SERVICE_NAME" 2>/dev/null || echo unknown)"
     else
       warn "systemctl enable 失败，请手动执行：systemctl enable ${SERVICE_NAME}"
     fi
