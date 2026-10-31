@@ -1,0 +1,520 @@
+package calldatabase
+
+import (
+	"context"
+	"fmt"
+	"testing"
+
+	"github.com/webb-chen/AgentSystem/api/internal/modules/app/workflow/graph_engine/entities"
+	"github.com/webb-chen/AgentSystem/api/internal/modules/app/workflow/nodes/base"
+	"github.com/webb-chen/AgentSystem/api/internal/modules/app/workflow/nodes/end"
+	"github.com/webb-chen/AgentSystem/api/internal/modules/app/workflow/nodes/start"
+	"github.com/webb-chen/AgentSystem/api/internal/modules/app/workflow/shared"
+	"github.com/webb-chen/AgentSystem/api/pkg/sql_base"
+	"github.com/webb-chen/AgentSystem/api/pkg/sql_base/audit"
+)
+
+type fakeSQLBase struct {
+	sql_base.SQLBase
+	auditCtx    *audit.Context
+	auditCtxs   []audit.Context
+	executeFunc func(ctx context.Context, query string, params []any, auditCtx *audit.Context) (*sql_base.QueryResult, error)
+}
+
+func (f *fakeSQLBase) ExecuteSQL(ctx context.Context, query string, params []any, auditCtx *audit.Context) (*sql_base.QueryResult, error) {
+	f.auditCtx = auditCtx
+	if auditCtx != nil {
+		f.auditCtxs = append(f.auditCtxs, *auditCtx)
+	}
+	if f.executeFunc != nil {
+		return f.executeFunc(ctx, query, params, auditCtx)
+	}
+	return nil, nil
+}
+
+func ExampleNode_executeRun() {
+	mockClient := &fakeSQLBase{
+		executeFunc: func(ctx context.Context, query string, params []any, auditCtx *audit.Context) (*sql_base.QueryResult, error) {
+			return &sql_base.QueryResult{
+				RowsAffected: 1,
+				Columns:      []string{"id", "status"},
+				Rows: [][]any{
+					{int64(42), "active"},
+				},
+			}, nil
+		},
+	}
+
+	node := &Node{
+		NodeStruct: base.NodeStruct{
+			InstanceID: "demo-instance",
+			NodeID:     "call-db-node",
+			NodeType:   shared.CallDatabase,
+		},
+		NodeData: NodeData{
+			DataSource: DataSourceConfig{
+				ID:   "pg-main",
+				Name: "生产库",
+				Type: "postgres",
+			},
+			TableSelection: []TableRef{
+				{Schema: "public", Name: "users", Columns: []string{"id", "status"}},
+			},
+			ManualSQL: "SELECT id, status FROM public.users WHERE status = 'active' LIMIT 1",
+			Execution: ExecutionConfig{
+				TimeoutSeconds: 10,
+				MaxRetries:     0,
+			},
+		},
+		sqlClient: mockClient,
+	}
+
+	result, _ := node.executeRun(context.Background())
+	fmt.Printf("rows=%v row_count=%v\n", result.Outputs["rows"], result.Outputs["row_count"])
+	// Output: rows=[map[id:42 status:active]] row_count=1
+}
+
+func TestWorkflowChainStartCallDatabaseEnd(t *testing.T) {
+	ctx := context.Background()
+
+	state := entities.NewGraphRuntimeStateWithDefaults()
+	state.VariablePool.UserInputs["request"] = "fetch active users"
+
+	initParams := entities.GraphInitParams{
+		TenantID:       "workspace-1",
+		OrganizationID: "organization-1",
+		AppID:          "app-1",
+		WorkflowType:   entities.WorkflowTypeWorkflow,
+		WorkflowID:     "workflow-1",
+		GraphConfig:    map[string]any{},
+		UserID:         "user-1",
+		UserFrom:       entities.UserFromAccount,
+		InvokeFrom:     entities.InvokeFromDebugger,
+		CallDepth:      1,
+	}
+	graph := &entities.Graph{}
+
+	startConfig := map[string]any{
+		"id": "start-node",
+		"data": map[string]any{
+			"variables": []any{},
+		},
+	}
+	startNode, err := start.New("start-instance", startConfig, initParams, graph, state, nil)
+	if err != nil {
+		t.Fatalf("start.New error: %v", err)
+	}
+	startResult := runNode(t, ctx, startNode)
+	addOutputsToPool(state, "start-node", startResult.Outputs)
+
+	rawSQL := "SELECT id, email FROM public.users LIMIT 1"
+	expectedSQL := `SELECT id, email FROM "public"."mingyingkeji_base_users" LIMIT 1`
+	mockClient := &fakeSQLBase{
+		executeFunc: func(ctx context.Context, query string, params []any, auditCtx *audit.Context) (*sql_base.QueryResult, error) {
+			if query != expectedSQL {
+				t.Fatalf("unexpected query: %s", query)
+			}
+			return &sql_base.QueryResult{
+				RowsAffected: 1,
+				Columns:      []string{"id", "email"},
+				Rows: [][]any{
+					{int64(1), "alice@example.com"},
+				},
+			}, nil
+		},
+	}
+
+	callConfig := map[string]any{
+		"id": "call-db-node",
+		"data": map[string]any{
+			"data_source": map[string]any{
+				"id":   "pg-main",
+				"name": "main",
+				"type": "postgres",
+			},
+			"table_selection": []any{
+				map[string]any{
+					"schema":  "public",
+					"name":    "users",
+					"label":   "Users",
+					"id":      "table-uuid-1",
+					"columns": []any{"id", "email"},
+				},
+			},
+			"manual_sql": rawSQL,
+			"execution": map[string]any{
+				"timeout_seconds": 5,
+				"max_retries":     0,
+			},
+		},
+	}
+
+	prev := "start-node"
+	callNode, err := New("call-instance", callConfig, initParams, graph, state, &prev, mockClient)
+	if err != nil {
+		t.Fatalf("call.New error: %v", err)
+	}
+
+	// calldatabase node
+	callResult := runNode(t, ctx, callNode)
+	addOutputsToPool(state, "call-db-node", callResult.Outputs)
+
+	if callResult.Status != shared.SUCCEEDED {
+		t.Fatalf("call node status: %s", callResult.Status)
+	}
+	if callResult.Outputs["row_count"] != 1 {
+		t.Fatalf("unexpected row_count: %v", callResult.Outputs["row_count"])
+	}
+	if mockClient.auditCtx == nil {
+		t.Fatal("audit context should be passed to sql base")
+	}
+	if mockClient.auditCtx.ClientType != audit.ClientTypeWorkflow {
+		t.Fatalf("client type = %s, want %s", mockClient.auditCtx.ClientType, audit.ClientTypeWorkflow)
+	}
+	if mockClient.auditCtx.OrganizationID != "organization-1" {
+		t.Fatalf("organization_id = %s, want organization-1", mockClient.auditCtx.OrganizationID)
+	}
+	if mockClient.auditCtx.WorkspaceID != "workspace-1" {
+		t.Fatalf("workspace_id = %s, want workspace-1", mockClient.auditCtx.WorkspaceID)
+	}
+	if mockClient.auditCtx.WorkflowRunID != state.VariablePool.SystemVariables.WorkflowRunID {
+		t.Fatalf("workflow_run_id = %s, want %s", mockClient.auditCtx.WorkflowRunID, state.VariablePool.SystemVariables.WorkflowRunID)
+	}
+	if mockClient.auditCtx.NodeID != "call-db-node" {
+		t.Fatalf("node_id = %s, want call-db-node", mockClient.auditCtx.NodeID)
+	}
+	if mockClient.auditCtx.RequestID != "call-instance:call-db-node" {
+		t.Fatalf("request_id = %s, want node instance and node id", mockClient.auditCtx.RequestID)
+	}
+	if mockClient.auditCtx.TableID != "table-uuid-1" {
+		t.Fatalf("table_id = %s, want table-uuid-1", mockClient.auditCtx.TableID)
+	}
+	if mockClient.auditCtx.TableName != "Users" {
+		t.Fatalf("table_name = %s, want Users", mockClient.auditCtx.TableName)
+	}
+	if got := callResult.Inputs["sql"]; got != expectedSQL {
+		t.Fatalf("call database input sql = %#v, want executed sql", got)
+	}
+	if _, exists := callResult.Inputs["data_source"]; exists {
+		t.Fatalf("call database inputs should omit data_source: %#v", callResult.Inputs)
+	}
+	if _, exists := callResult.Inputs["table_selection"]; exists {
+		t.Fatalf("call database inputs should omit table_selection: %#v", callResult.Inputs)
+	}
+	if _, exists := callResult.Inputs["schema_tables"]; exists {
+		t.Fatalf("call database inputs should omit schema_tables: %#v", callResult.Inputs)
+	}
+	if _, exists := callResult.Inputs["execution"]; exists {
+		t.Fatalf("call database inputs should omit execution config: %#v", callResult.Inputs)
+	}
+
+	endConfig := map[string]any{
+		"id": "end-node",
+		"data": map[string]any{
+			"outputs": []any{
+				map[string]any{
+					"variable":       "final_rows",
+					"value_selector": []any{"call-db-node", "rows"},
+				},
+				map[string]any{
+					"variable":       "final_count",
+					"value_selector": []any{"call-db-node", "row_count"},
+				},
+			},
+		},
+	}
+	prevEnd := "call-db-node"
+	endNode, err := end.New("end-instance", endConfig, initParams, graph, state, &prevEnd)
+	if err != nil {
+		t.Fatalf("end.New error: %v", err)
+	}
+	endResult := runNode(t, ctx, endNode)
+
+	rows, ok := endResult.Outputs["final_rows"].([]map[string]any)
+	if !ok || len(rows) != 1 {
+		t.Fatalf("unexpected final_rows: %#v", endResult.Outputs["final_rows"])
+	}
+	if rows[0]["email"] != "alice@example.com" {
+		t.Fatalf("unexpected email: %v", rows[0])
+	}
+	callRowCount, _ := callResult.Outputs["row_count"].(int)
+	switch v := endResult.Outputs["final_count"].(type) {
+	case float64:
+		if int(v) != callRowCount {
+			t.Fatalf("final_count mismatch: %v vs %v", v, callRowCount)
+		}
+	case int:
+		if v != callRowCount {
+			t.Fatalf("final_count mismatch: %v vs %v", v, callRowCount)
+		}
+	default:
+		t.Fatalf("unexpected final_count type: %T", v)
+	}
+}
+
+func TestExecuteWithRetryUsesSingleAuditRequestIDAcrossAttempts(t *testing.T) {
+	var calls int
+	mockClient := &fakeSQLBase{
+		executeFunc: func(ctx context.Context, query string, params []any, auditCtx *audit.Context) (*sql_base.QueryResult, error) {
+			calls++
+			if calls < 3 {
+				return nil, fmt.Errorf("temporary database error")
+			}
+			return &sql_base.QueryResult{
+				RowsAffected: 0,
+				Columns:      []string{},
+				Rows:         [][]any{},
+			}, nil
+		},
+	}
+
+	node := &Node{
+		NodeStruct: base.NodeStruct{
+			NodeID:   "call-db-node",
+			NodeType: shared.CallDatabase,
+		},
+		NodeData: NodeData{
+			Execution: ExecutionConfig{MaxRetries: 2},
+		},
+		sqlClient: mockClient,
+	}
+
+	auditCtx := &audit.Context{RequestID: "run-1:call-db-node"}
+	_, attempts, err := node.executeWithRetry(context.Background(), "SELECT 1", auditCtx)
+	if err != nil {
+		t.Fatalf("executeWithRetry returned error: %v", err)
+	}
+	if attempts != 3 {
+		t.Fatalf("attempts = %d, want 3", attempts)
+	}
+	if len(mockClient.auditCtxs) != 3 {
+		t.Fatalf("audit ctx count = %d, want 3", len(mockClient.auditCtxs))
+	}
+	for i, got := range mockClient.auditCtxs {
+		if got.RequestID != "run-1:call-db-node" {
+			t.Fatalf("attempt %d request_id = %s, want shared request id", i+1, got.RequestID)
+		}
+		if got.Attempt != i+1 {
+			t.Fatalf("attempt %d audit attempt = %d, want %d", i+1, got.Attempt, i+1)
+		}
+	}
+}
+
+func TestNewPrefersCanonicalWorkspaceIDForAuditScope(t *testing.T) {
+	mockClient := &fakeSQLBase{
+		executeFunc: func(ctx context.Context, query string, params []any, auditCtx *audit.Context) (*sql_base.QueryResult, error) {
+			return &sql_base.QueryResult{
+				RowsAffected: 0,
+				Columns:      []string{},
+				Rows:         [][]any{},
+			}, nil
+		},
+	}
+
+	nodeConfig := map[string]any{
+		"id": "call-db-node",
+		"data": map[string]any{
+			"data_source": map[string]any{
+				"id":   "pg-main",
+				"name": "main",
+				"type": "postgres",
+			},
+			"manual_sql": "SELECT 1",
+			"execution": map[string]any{
+				"timeout_seconds": 5,
+				"max_retries":     0,
+			},
+		},
+	}
+	initParams := entities.GraphInitParams{
+		TenantID:       "legacy-workspace",
+		WorkspaceID:    "canonical-workspace",
+		OrganizationID: "organization-1",
+		AppID:          "app-1",
+		WorkflowType:   entities.WorkflowTypeWorkflow,
+		WorkflowID:     "workflow-1",
+		GraphConfig:    map[string]any{},
+		UserID:         "user-1",
+		UserFrom:       entities.UserFromAccount,
+		InvokeFrom:     entities.InvokeFromDebugger,
+	}
+
+	node, err := New("call-instance", nodeConfig, initParams, &entities.Graph{}, entities.NewGraphRuntimeStateWithDefaults(), nil, mockClient)
+	if err != nil {
+		t.Fatalf("New error: %v", err)
+	}
+
+	runNode(t, context.Background(), node)
+
+	if mockClient.auditCtx == nil {
+		t.Fatal("audit context should be passed to sql base")
+	}
+	if mockClient.auditCtx.WorkspaceID != "canonical-workspace" {
+		t.Fatalf("workspace_id = %s, want canonical-workspace", mockClient.auditCtx.WorkspaceID)
+	}
+}
+
+func TestEnsureQuotedIdentifiers(t *testing.T) {
+	tableName := "mingyingkeji_base_tbl_183d2908-7e0c-4d14-81a0-d95e7c14fc09"
+	testCases := []struct {
+		name   string
+		sql    string
+		tables []TableRef
+		want   string
+	}{
+		{
+			name: "AddPrefixWithSchema",
+			sql:  "SELECT * FROM public.users LIMIT 10",
+			tables: []TableRef{
+				{Schema: "public", Name: "users"},
+			},
+			want: `SELECT * FROM "public"."mingyingkeji_base_users" LIMIT 10`,
+		},
+		{
+			name: "AddPrefixWithoutSchema",
+			sql:  "SELECT * FROM orders ORDER BY created_time DESC",
+			tables: []TableRef{
+				{Name: "orders"},
+			},
+			want: `SELECT * FROM "mingyingkeji_base_orders" ORDER BY created_time DESC`,
+		},
+		{
+			name: "HyphenatedWithSchema",
+			sql:  fmt.Sprintf("SELECT user_name FROM public.%s WHERE is_vip_customer=true", tableName),
+			tables: []TableRef{
+				{Schema: "public", Name: tableName},
+			},
+			want: fmt.Sprintf(`SELECT user_name FROM "public"."%s" WHERE is_vip_customer=true`, tableName),
+		},
+		{
+			name: "HyphenatedWithoutSchema",
+			sql:  fmt.Sprintf("SELECT * FROM %s ORDER BY created_time DESC", tableName),
+			tables: []TableRef{
+				{Name: tableName},
+			},
+			want: fmt.Sprintf(`SELECT * FROM "%s" ORDER BY created_time DESC`, tableName),
+		},
+		{
+			name: "AlreadyQuoted",
+			sql:  fmt.Sprintf(`SELECT * FROM "public"."%s" WHERE id = 1`, tableName),
+			tables: []TableRef{
+				{Schema: "public", Name: tableName},
+			},
+			want: fmt.Sprintf(`SELECT * FROM "public"."%s" WHERE id = 1`, tableName),
+		},
+		{
+			name: "ColumnQualifiedUsage",
+			sql:  "SELECT orders.total_amount FROM public.orders AS orders",
+			tables: []TableRef{
+				{Schema: "public", Name: "orders"},
+			},
+			want: `SELECT "mingyingkeji_base_orders".total_amount FROM "public"."mingyingkeji_base_orders" AS "mingyingkeji_base_orders"`,
+		},
+		{
+			name: "StringLiteralIgnored",
+			sql:  fmt.Sprintf("SELECT * FROM public.%s WHERE note = 'public.%s'", tableName, tableName),
+			tables: []TableRef{
+				{Schema: "public", Name: tableName},
+			},
+			want: fmt.Sprintf(`SELECT * FROM "public"."%s" WHERE note = 'public.%s'`, tableName, tableName),
+		},
+	}
+
+	for _, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
+			got := ensureQuotedIdentifiers(tc.sql, tc.tables)
+			if got != tc.want {
+				t.Fatalf("unexpected sql:\nwant: %s\ngot:  %s", tc.want, got)
+			}
+		})
+	}
+}
+
+func TestExecuteRunAppliesIdentifierQuoting(t *testing.T) {
+	const tableName = "mingyingkeji_base_tbl_183d2908-7e0c-4d14-81a0-d95e7c14fc09"
+	const rawSQL = "SELECT user_name FROM public." + tableName + " WHERE is_vip_customer=true"
+	const expectedSQL = `SELECT user_name FROM "public"."` + tableName + `" WHERE is_vip_customer=true`
+
+	var executedSQL string
+	mockClient := &fakeSQLBase{
+		executeFunc: func(ctx context.Context, query string, params []any, auditCtx *audit.Context) (*sql_base.QueryResult, error) {
+			executedSQL = query
+			return &sql_base.QueryResult{
+				RowsAffected: 0,
+				Columns:      []string{"user_name"},
+				Rows: [][]any{
+					{"alice"},
+				},
+			}, nil
+		},
+	}
+
+	node := &Node{
+		NodeStruct: base.NodeStruct{
+			InstanceID: "test-instance",
+			NodeID:     "call-db-node",
+			NodeType:   shared.CallDatabase,
+		},
+		NodeData: NodeData{
+			DataSource: DataSourceConfig{
+				ID:   "ds-1",
+				Name: "测试数据库1",
+				Type: "postgres",
+			},
+			TableSelection: []TableRef{
+				{Schema: "public", Name: tableName},
+			},
+			ManualSQL: rawSQL,
+			Execution: ExecutionConfig{
+				TimeoutSeconds: 5,
+				MaxRetries:     0,
+			},
+		},
+		sqlClient: mockClient,
+	}
+
+	_, err := node.executeRun(context.Background())
+	if err != nil {
+		t.Fatalf("executeRun returned error: %v", err)
+	}
+	if executedSQL != expectedSQL {
+		t.Fatalf("unexpected executed sql:\nwant: %s\ngot:  %s", expectedSQL, executedSQL)
+	}
+}
+
+func runNode(t *testing.T, ctx context.Context, node shared.NodeInterface) *shared.NodeRunResult {
+	t.Helper()
+	eventCh := make(chan *shared.NodeEventCh, 10)
+	errCh := make(chan error, 1)
+	go func() {
+		err := node.Run(ctx, eventCh)
+		errCh <- err
+		close(eventCh)
+	}()
+
+	var result *shared.NodeRunResult
+	for event := range eventCh {
+		switch event.Type {
+		case shared.EventTypeRunCompleted:
+			if data, ok := event.Data.(*shared.RunCompletedEvent); ok {
+				result = data.RunResult
+			}
+		case shared.EventTypeRunFailed:
+			t.Fatalf("node run failed: %v", event.Error)
+		}
+	}
+
+	if err := <-errCh; err != nil {
+		t.Fatalf("node.Run returned error: %v", err)
+	}
+	if result == nil {
+		t.Fatalf("no RunCompletedEvent received")
+	}
+	return result
+}
+
+func addOutputsToPool(state *entities.GraphRuntimeState, nodeID string, outputs map[string]any) {
+	for key, value := range outputs {
+		state.VariablePool.Add([]string{nodeID, key}, value)
+	}
+}

@@ -1,0 +1,2126 @@
+package skills
+
+import (
+	"context"
+	"errors"
+	"os"
+	"path/filepath"
+	"strings"
+	"testing"
+
+	"github.com/webb-chen/AgentSystem/api/internal/capabilities/toolgovernance"
+	llmadapter "github.com/webb-chen/AgentSystem/api/internal/modules/llm/protocol/adapters"
+)
+
+func TestKnowledgeSystemSkillsExposeExpectedTools(t *testing.T) {
+	runtime := NewRuntimeWithCatalog(nil, nil, "catalog")
+	resolved, err := runtime.ResolveEnabledSkills(context.Background(), []string{SkillInternalKnowledge, SkillAgentKnowledge})
+	if err != nil {
+		t.Fatalf("ResolveEnabledSkills() error = %v", err)
+	}
+	internal, ok := resolved.Get(SkillInternalKnowledge)
+	if !ok {
+		t.Fatalf("internal knowledge skill was not resolved")
+	}
+	if got := toolNames(internal.Tools); !sameStrings(got, []string{"list_accessible_knowledge_bases", "retrieve_knowledge"}) {
+		t.Fatalf("internal knowledge tools = %v", got)
+	}
+	if internal.Metadata.MaxCallsPerTurn != 20 {
+		t.Fatalf("internal knowledge max calls = %d, want 20", internal.Metadata.MaxCallsPerTurn)
+	}
+	if internal.Metadata.Display.Label["zh_Hans"] != "内部知识库" {
+		t.Fatalf("internal knowledge zh label = %q", internal.Metadata.Display.Label["zh_Hans"])
+	}
+	agent, ok := resolved.Get(SkillAgentKnowledge)
+	if !ok {
+		t.Fatalf("agent knowledge skill was not resolved")
+	}
+	if got := toolNames(agent.Tools); !sameStrings(got, []string{"retrieve_agent_knowledge"}) {
+		t.Fatalf("agent knowledge tools = %v", got)
+	}
+	if agent.Metadata.MaxCallsPerTurn != 20 {
+		t.Fatalf("agent knowledge max calls = %d, want 20", agent.Metadata.MaxCallsPerTurn)
+	}
+	if agent.Metadata.Display.Label["zh_Hans"] != "智能体知识库" {
+		t.Fatalf("agent knowledge zh label = %q", agent.Metadata.Display.Label["zh_Hans"])
+	}
+	if strings.Contains(agent.Metadata.Display.Description["zh_Hans"], "�") || strings.Contains(agent.Metadata.Display.Description["zh_Hans"], "?") {
+		t.Fatalf("agent knowledge zh description looks corrupted: %q", agent.Metadata.Display.Description["zh_Hans"])
+	}
+}
+
+func TestWebSearchIsNotExposedAsASystemSkill(t *testing.T) {
+	runtime := NewRuntimeWithCatalog(nil, nil, "catalog")
+	if runtime.SystemSkillExists("web-search") {
+		t.Fatal("web-search must be exposed only as an external integration Action")
+	}
+	metadata, err := runtime.ListSystemSkillsBestEffort(context.Background())
+	if err != nil {
+		t.Fatalf("ListSystemSkillsBestEffort() error = %v", err)
+	}
+	for _, item := range metadata {
+		if item.ID == "web-search" {
+			t.Fatal("retired web-search Skill is still present in the system catalog")
+		}
+	}
+	if IsUserSelectableSystemSkill("web-search") {
+		t.Fatal("historical web-search config must not remain user selectable")
+	}
+	_, err = runtime.ResolveEnabledSkillsWithCustom(context.Background(), []string{"web-search"}, []CustomSkillCatalogEntry{{
+		SkillID: "web-search",
+		Root:    t.TempDir(),
+	}})
+	if !errors.Is(err, ErrSkillNotFound) {
+		t.Fatalf("retired custom web-search resolution error = %v, want ErrSkillNotFound", err)
+	}
+}
+
+func TestDatabaseSystemSkillsExposeExpectedTools(t *testing.T) {
+	runtime := NewRuntimeWithCatalog(nil, nil, "catalog")
+	resolved, err := runtime.ResolveEnabledSkills(context.Background(), []string{SkillInternalDatabase, SkillAgentDatabase})
+	if err != nil {
+		t.Fatalf("ResolveEnabledSkills() error = %v", err)
+	}
+	expectedTools := []string{
+		"list_accessible_databases",
+		"list_database_tables",
+		"describe_database_table",
+		"query_table_records",
+		"insert_table_records",
+		"update_table_records",
+		"delete_table_records",
+	}
+	internal, ok := resolved.Get(SkillInternalDatabase)
+	if !ok {
+		t.Fatalf("internal database skill was not resolved")
+	}
+	if got := toolNames(internal.Tools); !sameStrings(got, expectedTools) {
+		t.Fatalf("internal database tools = %v", got)
+	}
+	if internal.Metadata.MaxCallsPerTurn != 40 {
+		t.Fatalf("internal database max calls = %d, want 40", internal.Metadata.MaxCallsPerTurn)
+	}
+	agent, ok := resolved.Get(SkillAgentDatabase)
+	if !ok {
+		t.Fatalf("agent database skill was not resolved")
+	}
+	if got := toolNames(agent.Tools); !sameStrings(got, expectedTools) {
+		t.Fatalf("agent database tools = %v", got)
+	}
+	if agent.Metadata.MaxCallsPerTurn != 40 {
+		t.Fatalf("agent database max calls = %d, want 40", agent.Metadata.MaxCallsPerTurn)
+	}
+}
+
+func TestAgentWorkflowSystemSkillExposeExpectedTools(t *testing.T) {
+	runtime := NewRuntimeWithCatalog(nil, nil, "catalog")
+	resolved, err := runtime.ResolveEnabledSkills(context.Background(), []string{SkillAgentWorkflow})
+	if err != nil {
+		t.Fatalf("ResolveEnabledSkills() error = %v", err)
+	}
+	agent, ok := resolved.Get(SkillAgentWorkflow)
+	if !ok {
+		t.Fatalf("agent workflow skill was not resolved")
+	}
+	expectedTools := []string{"get_workflow_run_status", "list_agent_workflows", "run_agent_workflow"}
+	if got := toolNames(agent.Tools); !sameStrings(got, expectedTools) {
+		t.Fatalf("agent workflow tools = %v", got)
+	}
+	if !sameStrings(agent.Metadata.SupportedCallers, []string{SkillCallerAgent}) {
+		t.Fatalf("supported callers = %#v, want agent", agent.Metadata.SupportedCallers)
+	}
+	if !sameStrings(agent.Metadata.RequiredConfig, []string{SkillRequiredConfigAgentWorkflow}) {
+		t.Fatalf("required config = %#v, want agent_workflow", agent.Metadata.RequiredConfig)
+	}
+	if !IsHiddenSystemSkill(SkillAgentWorkflow) {
+		t.Fatal("agent-workflow should be hidden")
+	}
+	got := ExpectedSkillToolArguments(SkillAgentWorkflow, "run_agent_workflow")
+	if got == nil {
+		t.Fatal("run_agent_workflow contract missing")
+	}
+	schema := got["schema"].(map[string]interface{})
+	required := schema["required"].([]string)
+	if !sameStrings(required, []string{"binding_id"}) {
+		t.Fatalf("run_agent_workflow required = %#v, want [binding_id]", required)
+	}
+	if example := got["example"].(map[string]interface{}); example["inputs"] != nil {
+		t.Fatalf("zero-input workflow example should omit inputs: %#v", example)
+	}
+	inputs := schema["properties"].(map[string]interface{})["inputs"].(map[string]interface{})
+	if properties := inputs["properties"].(map[string]interface{}); len(properties) != 0 {
+		t.Fatalf("generic workflow inputs properties = %#v, want binding-specific empty schema", properties)
+	}
+	if required, exists := inputs["required"]; exists {
+		t.Fatalf("generic workflow inputs required = %#v, want no universal query requirement", required)
+	}
+}
+
+func TestConsoleNavigatorSystemSkillMetadata(t *testing.T) {
+	runtime := NewRuntimeWithCatalog(nil, nil, "catalog")
+	resolved, err := runtime.ResolveEnabledSkills(context.Background(), []string{SkillConsoleNavigator})
+	if err != nil {
+		t.Fatalf("ResolveEnabledSkills() error = %v", err)
+	}
+	doc, ok := resolved.Get(SkillConsoleNavigator)
+	if !ok {
+		t.Fatalf("console navigator skill was not resolved")
+	}
+	if got := toolNames(doc.Tools); !sameStrings(got, []string{"navigate"}) {
+		t.Fatalf("console navigator tools = %v, want navigate", got)
+	}
+	if doc.Metadata.RuntimeType != SkillRuntimeTypeTool {
+		t.Fatalf("runtime type = %q, want tool", doc.Metadata.RuntimeType)
+	}
+	if !sameStrings(doc.Metadata.SupportedCallers, []string{SkillCallerAIChat}) {
+		t.Fatalf("supported callers = %#v, want aichat", doc.Metadata.SupportedCallers)
+	}
+	if got := ExpectedSkillToolArguments(SkillConsoleNavigator, "navigate"); got == nil {
+		t.Fatal("console navigator navigate contract missing")
+	}
+}
+
+func TestWorkReportSystemSkillMetadata(t *testing.T) {
+	runtime := NewRuntimeWithCatalog(nil, nil, "catalog")
+	resolved, err := runtime.ResolveEnabledSkills(context.Background(), []string{SkillWorkReport})
+	if err != nil {
+		t.Fatalf("ResolveEnabledSkills() error = %v", err)
+	}
+	doc, ok := resolved.Get(SkillWorkReport)
+	if !ok {
+		t.Fatalf("work report skill was not resolved")
+	}
+	if doc.Metadata.RuntimeType != SkillRuntimeTypeHybrid {
+		t.Fatalf("runtime type = %q, want hybrid", doc.Metadata.RuntimeType)
+	}
+	if got := doc.Metadata.Display.Label["zh_Hans"]; got != "周报月报生成" {
+		t.Fatalf("zh label = %q", got)
+	}
+	if got := doc.Metadata.Display.WhenToUse["zh_Hans"]; got != "当用户需要生成周报、月报、工作总结、项目进展汇报或管理汇报时使用。" {
+		t.Fatalf("zh when_to_use = %q", got)
+	}
+	if got := doc.Metadata.Display.Tags["zh_Hans"]; !sameStrings(got, []string{"周报", "月报", "工作总结"}) {
+		t.Fatalf("zh tags = %v", got)
+	}
+}
+
+func TestPPTSlidePlannerSystemSkillMetadata(t *testing.T) {
+	runtime := NewRuntimeWithCatalog(nil, nil, "catalog")
+	resolved, err := runtime.ResolveEnabledSkills(context.Background(), []string{SkillPPTSlidePlanner})
+	if err != nil {
+		t.Fatalf("ResolveEnabledSkills() error = %v", err)
+	}
+	doc, ok := resolved.Get(SkillPPTSlidePlanner)
+	if !ok {
+		t.Fatalf("ppt slide planner skill was not resolved")
+	}
+	if doc.Metadata.RuntimeType != SkillRuntimeTypePrompt {
+		t.Fatalf("runtime type = %q, want prompt", doc.Metadata.RuntimeType)
+	}
+	if doc.Metadata.HasScripts {
+		t.Fatalf("expected ppt slide planner not to have scripts")
+	}
+	if got := toolNames(doc.Tools); len(got) != 0 {
+		t.Fatalf("tools = %v, want no direct tools", got)
+	}
+	for _, trigger := range []string{"PPT", "PowerPoint", "slide planning", "strict per-slide plan", "generate_pptx"} {
+		if !strings.Contains(doc.Metadata.Description, trigger) && !strings.Contains(doc.Instructions, trigger) {
+			t.Fatalf("metadata/instructions missing trigger %q", trigger)
+		}
+	}
+	for _, required := range []string{
+		"strict per-slide construction plan",
+		"Do not call `generate_pptx` from this skill",
+		"actual editable PPTX file is produced by the separate `file-generator` skill",
+		"Do not generate PPTX files directly from this skill",
+		"image, chart, diagram, or video placeholder",
+		"Do not pass Markdown, HTML, comments, prose, or partial objects as `presentation`",
+		"one complete structured object",
+		"complete `slides` array",
+		"rejects the presentation structure",
+		"body text element over 10 estimated wrapped lines",
+		"text does not fit",
+		"estimated_height * 1.25",
+		"within `0.2` inches of `h`",
+		"4.0 inches estimated height",
+		"4.5 inches estimated height",
+		"`h=5.0` or `h=5.3`",
+		"`min(2.8, h * 0.70)`",
+		"`h <= 3.5`",
+		"`w <= 5.8`",
+		"36-44 pt title",
+		"reserve height from text length and font size",
+		"quality-check.md",
+	} {
+		if !strings.Contains(doc.Instructions, required) {
+			t.Fatalf("instructions missing %q", required)
+		}
+	}
+	if len(doc.Metadata.References) != 6 {
+		t.Fatalf("references = %#v, want 6 ppt slide planner references", doc.Metadata.References)
+	}
+	for _, path := range []string{"deck-brief.md", "slide-plan-contract.md", "slide-layout-contract.md", "media-placeholder-contract.md", "pptx-payload-contract.md", "quality-check.md"} {
+		if !hasReference(doc.Metadata.References, path) {
+			t.Fatalf("references = %#v, missing %s", doc.Metadata.References, path)
+		}
+	}
+}
+
+func TestContractFieldExtractorSystemSkillMetadata(t *testing.T) {
+	runtime := NewRuntimeWithCatalog(nil, nil, "catalog")
+	resolved, err := runtime.ResolveEnabledSkills(context.Background(), []string{SkillContractFieldExtractor})
+	if err != nil {
+		t.Fatalf("ResolveEnabledSkills() error = %v", err)
+	}
+	doc, ok := resolved.Get(SkillContractFieldExtractor)
+	if !ok {
+		t.Fatalf("contract field extractor skill was not resolved")
+	}
+	if doc.Metadata.RuntimeType != SkillRuntimeTypeHybrid {
+		t.Fatalf("runtime type = %q, want hybrid", doc.Metadata.RuntimeType)
+	}
+	if doc.Metadata.HasScripts {
+		t.Fatalf("expected contract field extractor not to have scripts")
+	}
+	if got := toolNames(doc.Tools); !sameStrings(got, []string{"generate_file"}) {
+		t.Fatalf("tools = %v, want generate_file", got)
+	}
+	tool, ok := findSkillTool(*doc, "generate_file")
+	if !ok {
+		t.Fatalf("expected generate_file tool")
+	}
+	if tool.ProviderType != "builtin" || tool.ProviderID != "file_generator" {
+		t.Fatalf("tool provider = %s/%s, want builtin/file_generator", tool.ProviderType, tool.ProviderID)
+	}
+	for _, trigger := range []string{"contract field extraction", "contract ledger", "field list", "confidence"} {
+		if !strings.Contains(doc.Metadata.Description, trigger) && !strings.Contains(doc.Instructions, trigger) {
+			t.Fatalf("metadata/instructions missing trigger %q", trigger)
+		}
+	}
+	for _, required := range []string{
+		"does not read files",
+		"Do not invent",
+		"未提取到",
+		"defaulted",
+		"confidence",
+		"field-templates.md",
+		"field-schema-contract.md",
+		"database-handoff.md",
+	} {
+		if !strings.Contains(doc.Instructions, required) {
+			t.Fatalf("instructions missing %q", required)
+		}
+	}
+	if len(doc.Metadata.References) != 7 {
+		t.Fatalf("references = %#v, want 7 contract field references", doc.Metadata.References)
+	}
+	for _, path := range []string{"field-templates.md", "field-schema-contract.md", "extraction-rules.md", "confidence-rules.md", "output-format.md", "contract-ledger-export.md", "database-handoff.md"} {
+		if !hasReference(doc.Metadata.References, path) {
+			t.Fatalf("references = %#v, missing %s", doc.Metadata.References, path)
+		}
+	}
+}
+
+func TestDefaultRuntimeUsesEmbeddedSystemCatalog(t *testing.T) {
+	previousWorkingDir, err := os.Getwd()
+	if err != nil {
+		t.Fatalf("Getwd() error = %v", err)
+	}
+	tempDir := t.TempDir()
+	t.Cleanup(func() {
+		if err := os.Chdir(previousWorkingDir); err != nil {
+			t.Fatalf("failed to restore working directory: %v", err)
+		}
+	})
+	if err := os.Chdir(tempDir); err != nil {
+		t.Fatalf("Chdir() error = %v", err)
+	}
+
+	runtime := NewRuntime(nil, nil)
+	if !runtime.SystemSkillExists(SkillFileGenerator) {
+		t.Fatalf("expected embedded %s skill to exist", SkillFileGenerator)
+	}
+	resolved, err := runtime.ResolveEnabledSkills(context.Background(), []string{SkillFileGenerator})
+	if err != nil {
+		t.Fatalf("ResolveEnabledSkills() error = %v", err)
+	}
+	doc, ok := resolved.Get(SkillFileGenerator)
+	if !ok {
+		t.Fatalf("file generator skill was not resolved")
+	}
+	if len(doc.Metadata.References) == 0 {
+		t.Fatalf("embedded file generator references are empty")
+	}
+	content, _, err := runtime.ReadReference(context.Background(), resolved, SkillFileGenerator, "format-md.md")
+	if err != nil {
+		t.Fatalf("ReadReference() error = %v", err)
+	}
+	if !strings.Contains(content, "Markdown") {
+		t.Fatalf("embedded reference content looks wrong: %q", content)
+	}
+}
+
+func TestListSystemSkillsBestEffortSkipsInvalidCatalogDirectories(t *testing.T) {
+	catalog := t.TempDir()
+	validRoot := filepath.Join(catalog, "valid-skill")
+	if err := os.MkdirAll(validRoot, 0o755); err != nil {
+		t.Fatalf("MkdirAll(validRoot) error = %v", err)
+	}
+	if err := os.MkdirAll(filepath.Join(catalog, "Invalid_Skill"), 0o755); err != nil {
+		t.Fatalf("MkdirAll(invalidRoot) error = %v", err)
+	}
+	skill := `---
+name: valid-skill
+description: valid test skill
+when_to_use: use this valid test skill
+runtime_type: prompt
+---
+Follow the test instructions.
+`
+	if err := os.WriteFile(filepath.Join(validRoot, "SKILL.md"), []byte(skill), 0o644); err != nil {
+		t.Fatalf("WriteFile(SKILL.md) error = %v", err)
+	}
+
+	runtime := NewRuntimeWithCatalog(nil, nil, catalog)
+	metadata, err := runtime.ListSystemSkillsBestEffort(context.Background())
+	if err == nil {
+		t.Fatalf("ListSystemSkillsBestEffort() error = nil, want invalid directory error")
+	}
+	if !strings.Contains(err.Error(), "Invalid_Skill") {
+		t.Fatalf("ListSystemSkillsBestEffort() error = %q, want invalid directory name", err)
+	}
+	if len(metadata) != 1 || metadata[0].ID != "valid-skill" {
+		t.Fatalf("metadata = %#v, want only valid-skill", metadata)
+	}
+}
+
+func TestSchedulePlannerSystemSkillMetadata(t *testing.T) {
+	runtime := NewRuntimeWithCatalog(nil, nil, "catalog")
+	resolved, err := runtime.ResolveEnabledSkills(context.Background(), []string{SkillSchedulePlanner})
+	if err != nil {
+		t.Fatalf("ResolveEnabledSkills() error = %v", err)
+	}
+	doc, ok := resolved.Get(SkillSchedulePlanner)
+	if !ok {
+		t.Fatalf("schedule planner skill was not resolved")
+	}
+	if doc.Metadata.RuntimeType != SkillRuntimeTypePrompt {
+		t.Fatalf("runtime type = %q, want prompt", doc.Metadata.RuntimeType)
+	}
+	if len(doc.Tools) != 0 {
+		t.Fatalf("tools = %v, want none", doc.Tools)
+	}
+	if got := doc.Metadata.Display.Label["zh_Hans"]; got != "日程规划" {
+		t.Fatalf("zh label = %q", got)
+	}
+	if got := doc.Metadata.Display.WhenToUse["zh_Hans"]; got != "用于规划每日安排、每周计划、任务排期、会议议程、学习计划或工作负载。" {
+		t.Fatalf("zh when_to_use = %q", got)
+	}
+	if got := doc.Metadata.Display.Tags["zh_Hans"]; !sameStrings(got, []string{"日程", "计划", "效率"}) {
+		t.Fatalf("zh tags = %v", got)
+	}
+}
+
+func TestContentSummarySystemSkillMetadata(t *testing.T) {
+	runtime := NewRuntimeWithCatalog(nil, nil, "catalog")
+	resolved, err := runtime.ResolveEnabledSkills(context.Background(), []string{SkillContentSummary})
+	if err != nil {
+		t.Fatalf("ResolveEnabledSkills() error = %v", err)
+	}
+	doc, ok := resolved.Get(SkillContentSummary)
+	if !ok {
+		t.Fatalf("content summary skill was not resolved")
+	}
+	if doc.Metadata.RuntimeType != SkillRuntimeTypePrompt {
+		t.Fatalf("runtime type = %q, want prompt", doc.Metadata.RuntimeType)
+	}
+	if len(doc.Tools) != 0 {
+		t.Fatalf("tools = %v, want none", doc.Tools)
+	}
+	if doc.Metadata.HasScripts {
+		t.Fatalf("expected content summary not to have scripts")
+	}
+	if !strings.Contains(doc.Metadata.Description, "TL;DR") || !strings.Contains(doc.Metadata.Description, "action items") {
+		t.Fatalf("description does not include expected summary triggers: %q", doc.Metadata.Description)
+	}
+	if !strings.Contains(doc.Metadata.WhenToUse, "already available") || !strings.Contains(doc.Metadata.WhenToUse, "file-generator") {
+		t.Fatalf("when_to_use does not include routing boundaries: %q", doc.Metadata.WhenToUse)
+	}
+	if !strings.Contains(doc.Instructions, "Read, parse, extract, or inspect uploaded files directly.") {
+		t.Fatalf("instructions missing uploaded-file boundary")
+	}
+	if !strings.Contains(doc.Instructions, "If the user uploads a file and asks to summarize") {
+		t.Fatalf("instructions missing uploaded-file summary boundary")
+	}
+	if !strings.Contains(doc.Instructions, "Language Rules") || !strings.Contains(doc.Instructions, "For Chinese requests, do not use English structural labels") {
+		t.Fatalf("instructions missing language consistency rules")
+	}
+	if len(doc.Metadata.References) != 5 {
+		t.Fatalf("references = %#v, want 5 content summary references", doc.Metadata.References)
+	}
+	for _, path := range []string{"general-summary.md", "action-items.md", "risks-conclusions.md", "meeting-notes.md", "requirements-summary.md"} {
+		if !hasReference(doc.Metadata.References, path) {
+			t.Fatalf("references = %#v, missing %s", doc.Metadata.References, path)
+		}
+	}
+}
+
+func TestSensitiveRedactionSystemSkillMetadata(t *testing.T) {
+	runtime := NewRuntimeWithCatalog(nil, nil, "catalog")
+	resolved, err := runtime.ResolveEnabledSkills(context.Background(), []string{SkillSensitiveRedaction})
+	if err != nil {
+		t.Fatalf("ResolveEnabledSkills() error = %v", err)
+	}
+	doc, ok := resolved.Get(SkillSensitiveRedaction)
+	if !ok {
+		t.Fatalf("sensitive redaction skill was not resolved")
+	}
+	if doc.Metadata.RuntimeType != SkillRuntimeTypeHybrid {
+		t.Fatalf("runtime type = %q, want hybrid", doc.Metadata.RuntimeType)
+	}
+	if got := toolNames(doc.Tools); !sameStrings(got, []string{"redact_text"}) {
+		t.Fatalf("tools = %v, want redact_text", got)
+	}
+	tool, ok := findSkillTool(*doc, "redact_text")
+	if !ok {
+		t.Fatalf("expected redact_text tool")
+	}
+	if tool.ProviderType != "builtin" || tool.ProviderID != "sensitive_redaction" {
+		t.Fatalf("tool provider = %s/%s, want builtin/sensitive_redaction", tool.ProviderType, tool.ProviderID)
+	}
+	for _, trigger := range []string{"PII redaction", "手机号脱敏", "Token 脱敏", "password redaction", "privacy cleanup"} {
+		if !strings.Contains(doc.Metadata.Description, trigger) {
+			t.Fatalf("description missing trigger %q: %q", trigger, doc.Metadata.Description)
+		}
+	}
+	for _, required := range []string{
+		"Do not directly read, parse, extract, OCR, or inspect uploaded files or images.",
+		"call `redact_text`",
+		"Do not show complete original sensitive values in the final answer.",
+		"pass only the redacted content to `file-generator`",
+		"rule-based redaction may miss context-dependent",
+	} {
+		if !strings.Contains(doc.Instructions, required) {
+			t.Fatalf("instructions missing %q", required)
+		}
+	}
+	if len(doc.Metadata.References) != 5 {
+		t.Fatalf("references = %#v, want 5 sensitive redaction references", doc.Metadata.References)
+	}
+	for _, path := range []string{"personal-identifiers.md", "business-identifiers.md", "secrets-technical.md", "redaction-strategies.md", "document-export.md"} {
+		if !hasReference(doc.Metadata.References, path) {
+			t.Fatalf("references = %#v, missing %s", doc.Metadata.References, path)
+		}
+	}
+}
+
+func TestEmailWritingSystemSkillMetadata(t *testing.T) {
+	runtime := NewRuntimeWithCatalog(nil, nil, "catalog")
+	resolved, err := runtime.ResolveEnabledSkills(context.Background(), []string{SkillEmailWriting})
+	if err != nil {
+		t.Fatalf("ResolveEnabledSkills() error = %v", err)
+	}
+	doc, ok := resolved.Get(SkillEmailWriting)
+	if !ok {
+		t.Fatalf("email writing skill was not resolved")
+	}
+	if doc.Metadata.RuntimeType != SkillRuntimeTypePrompt {
+		t.Fatalf("runtime type = %q, want prompt", doc.Metadata.RuntimeType)
+	}
+	if len(doc.Tools) != 0 {
+		t.Fatalf("tools = %v, want none", doc.Tools)
+	}
+	if doc.Metadata.HasScripts {
+		t.Fatalf("expected email writing not to have scripts")
+	}
+	for _, trigger := range []string{"business emails", "customer follow-up emails", "meeting invitations", "reminders", "email polishing"} {
+		if !strings.Contains(doc.Metadata.Description, trigger) {
+			t.Fatalf("description missing trigger %q: %q", trigger, doc.Metadata.Description)
+		}
+	}
+	for _, boundary := range []string{"Do not send emails", "generate attachments", "invent commitments"} {
+		if !strings.Contains(doc.Metadata.WhenToUse, boundary) {
+			t.Fatalf("when_to_use missing boundary %q: %q", boundary, doc.Metadata.WhenToUse)
+		}
+	}
+	for _, required := range []string{
+		"call `request_user_input` instead of writing a normal Markdown clarification",
+		"Use placeholders for missing non-critical facts instead of inventing them.",
+		"Do not claim the email has been sent, scheduled, saved, or attached.",
+		"Do not invent prices, discounts, refunds, compensation, deadlines, legal statements, contract terms, delivery commitments, or approval status.",
+		"Do not summarize away user-provided requirements.",
+	} {
+		if !strings.Contains(doc.Instructions, required) {
+			t.Fatalf("instructions missing %q", required)
+		}
+	}
+	if len(doc.Metadata.References) != 8 {
+		t.Fatalf("references = %#v, want 8 email writing references", doc.Metadata.References)
+	}
+	for _, path := range []string{"business-email.md", "follow-up-email.md", "meeting-invitation.md", "reminder-email.md", "apology-explanation.md", "announcement-email.md", "report-delivery.md", "polish-existing-draft.md"} {
+		if !hasReference(doc.Metadata.References, path) {
+			t.Fatalf("references = %#v, missing %s", doc.Metadata.References, path)
+		}
+	}
+}
+
+func TestDecisionSupportSystemSkillMetadata(t *testing.T) {
+	runtime := NewRuntimeWithCatalog(nil, nil, "catalog")
+	resolved, err := runtime.ResolveEnabledSkills(context.Background(), []string{SkillDecisionSupport})
+	if err != nil {
+		t.Fatalf("ResolveEnabledSkills() error = %v", err)
+	}
+	doc, ok := resolved.Get(SkillDecisionSupport)
+	if !ok {
+		t.Fatalf("decision support skill was not resolved")
+	}
+	if doc.Metadata.RuntimeType != SkillRuntimeTypePrompt {
+		t.Fatalf("runtime type = %q, want prompt", doc.Metadata.RuntimeType)
+	}
+	if len(doc.Tools) != 0 {
+		t.Fatalf("tools = %v, want none", doc.Tools)
+	}
+	if doc.Metadata.HasScripts {
+		t.Fatalf("expected decision support not to have scripts")
+	}
+	for _, trigger := range []string{"technical choice", "prioritization", "risk-benefit", "option comparison", "decision review"} {
+		if !strings.Contains(doc.Metadata.Description, trigger) {
+			t.Fatalf("description missing trigger %q: %q", trigger, doc.Metadata.Description)
+		}
+	}
+	for _, boundary := range []string{"does not read, write, update, delete, or manage agent memory itself", "structured decision support only"} {
+		if !strings.Contains(doc.Metadata.WhenToUse, boundary) {
+			t.Fatalf("when_to_use missing boundary %q: %q", boundary, doc.Metadata.WhenToUse)
+		}
+	}
+	for _, required := range []string{
+		"call `request_user_input` instead of writing a normal Markdown clarification",
+		"Agent memory is a lower-layer capability.",
+		"Do not read, write, update, delete, or manage memory through this skill.",
+		"Do not invent market data, customer commitments, costs, dates, team capacity, legal terms, financial numbers, security facts, or contract clauses.",
+		"route that downstream task to the appropriate skill",
+	} {
+		if !strings.Contains(doc.Instructions, required) {
+			t.Fatalf("instructions missing %q", required)
+		}
+	}
+	if len(doc.Metadata.References) != 6 {
+		t.Fatalf("references = %#v, want 6 decision support references", doc.Metadata.References)
+	}
+	for _, path := range []string{"product-feature-decision.md", "technical-choice.md", "project-prioritization.md", "customer-solution.md", "management-decision.md", "decision-review.md"} {
+		if !hasReference(doc.Metadata.References, path) {
+			t.Fatalf("references = %#v, missing %s", doc.Metadata.References, path)
+		}
+	}
+}
+
+func TestMultiDocumentCompareSystemSkillMetadata(t *testing.T) {
+	runtime := NewRuntimeWithCatalog(nil, nil, "catalog")
+	resolved, err := runtime.ResolveEnabledSkills(context.Background(), []string{SkillMultiDocumentCompare})
+	if err != nil {
+		t.Fatalf("ResolveEnabledSkills() error = %v", err)
+	}
+	doc, ok := resolved.Get(SkillMultiDocumentCompare)
+	if !ok {
+		t.Fatalf("multi-document compare skill was not resolved")
+	}
+	if doc.Metadata.RuntimeType != SkillRuntimeTypePrompt {
+		t.Fatalf("runtime type = %q, want prompt", doc.Metadata.RuntimeType)
+	}
+	if len(doc.Tools) != 0 {
+		t.Fatalf("tools = %v, want none", doc.Tools)
+	}
+	if doc.Metadata.HasScripts {
+		t.Fatalf("expected multi-document compare not to have scripts")
+	}
+	for _, trigger := range []string{"合同对比", "PRD对比", "供应商方案比较", "新增删除修改", "conflict clauses"} {
+		if !strings.Contains(doc.Metadata.Description, trigger) {
+			t.Fatalf("description missing trigger %q: %q", trigger, doc.Metadata.Description)
+		}
+	}
+	if !strings.Contains(doc.Metadata.WhenToUse, "system document parser") || !strings.Contains(doc.Metadata.WhenToUse, "file-generator") {
+		t.Fatalf("when_to_use does not include parser/export boundaries: %q", doc.Metadata.WhenToUse)
+	}
+	for _, required := range []string{
+		"Directly read, parse, extract, or inspect uploaded files or file bytes.",
+		"system document parser",
+		"Do not replace legal review",
+		"Every comparison conclusion must be grounded in document source text",
+		"Language Rules",
+	} {
+		if !strings.Contains(doc.Instructions, required) {
+			t.Fatalf("instructions missing %q", required)
+		}
+	}
+	if len(doc.Metadata.References) != 6 {
+		t.Fatalf("references = %#v, want 6 multi-document compare references", doc.Metadata.References)
+	}
+	for _, path := range []string{"generic-comparison.md", "version-diff.md", "clause-conflict.md", "vendor-comparison.md", "requirements-diff.md", "policy-comparison.md"} {
+		if !hasReference(doc.Metadata.References, path) {
+			t.Fatalf("references = %#v, missing %s", doc.Metadata.References, path)
+		}
+	}
+}
+
+func TestResumeScreeningSystemSkillMetadata(t *testing.T) {
+	runtime := NewRuntimeWithCatalog(nil, nil, "catalog")
+	resolved, err := runtime.ResolveEnabledSkills(context.Background(), []string{SkillResumeScreening})
+	if err != nil {
+		t.Fatalf("ResolveEnabledSkills() error = %v", err)
+	}
+	doc, ok := resolved.Get(SkillResumeScreening)
+	if !ok {
+		t.Fatalf("resume screening skill was not resolved")
+	}
+	if doc.Metadata.RuntimeType != SkillRuntimeTypePrompt {
+		t.Fatalf("runtime type = %q, want prompt", doc.Metadata.RuntimeType)
+	}
+	if len(doc.Tools) != 0 {
+		t.Fatalf("tools = %v, want none", doc.Tools)
+	}
+	if doc.Metadata.HasScripts {
+		t.Fatalf("expected resume screening not to have scripts")
+	}
+	for _, trigger := range []string{"简历初筛", "JD匹配", "岗位匹配", "面试问题", "resume screening"} {
+		if !strings.Contains(doc.Metadata.Description, trigger) {
+			t.Fatalf("description missing trigger %q: %q", trigger, doc.Metadata.Description)
+		}
+	}
+	if !strings.Contains(doc.Metadata.WhenToUse, "system document parser") || !strings.Contains(doc.Metadata.WhenToUse, "file-generator") {
+		t.Fatalf("when_to_use does not include parser/export boundaries: %q", doc.Metadata.WhenToUse)
+	}
+	for _, required := range []string{
+		"Directly read, parse, extract, or inspect uploaded resume files or file bytes.",
+		"Make final hiring, rejection, compensation, title, or ranking decisions.",
+		"Do not use gender, age, marital or childbearing status",
+		"If no JD is provided, do not output job-fit level",
+		"Mark missing or unclear resume information as `简历未体现`",
+		"Every screening conclusion must be grounded in resume source text",
+		"Language Rules",
+	} {
+		if !strings.Contains(doc.Instructions, required) {
+			t.Fatalf("instructions missing %q", required)
+		}
+	}
+	if len(doc.Metadata.References) != 5 {
+		t.Fatalf("references = %#v, want 5 resume screening references", doc.Metadata.References)
+	}
+	for _, path := range []string{"resume-summary.md", "jd-match.md", "screening-criteria.md", "interview-questions.md", "talent-pool-entry.md"} {
+		if !hasReference(doc.Metadata.References, path) {
+			t.Fatalf("references = %#v, missing %s", doc.Metadata.References, path)
+		}
+	}
+}
+
+func TestResponseTonePolisherSystemSkillMetadata(t *testing.T) {
+	runtime := NewRuntimeWithCatalog(nil, nil, "catalog")
+	resolved, err := runtime.ResolveEnabledSkills(context.Background(), []string{SkillResponseTonePolisher})
+	if err != nil {
+		t.Fatalf("ResolveEnabledSkills() error = %v", err)
+	}
+	doc, ok := resolved.Get(SkillResponseTonePolisher)
+	if !ok {
+		t.Fatalf("response tone polisher skill was not resolved")
+	}
+	if doc.Metadata.RuntimeType != SkillRuntimeTypePrompt {
+		t.Fatalf("runtime type = %q, want prompt", doc.Metadata.RuntimeType)
+	}
+	if len(doc.Tools) != 0 {
+		t.Fatalf("tools = %v, want none", doc.Tools)
+	}
+	if doc.Metadata.HasScripts {
+		t.Fatalf("expected response tone polisher not to have scripts")
+	}
+	for _, trigger := range []string{"polish response", "rewrite tone", "make it natural", "make it less robotic", "humanize this reply"} {
+		if !strings.Contains(doc.Metadata.Description, trigger) {
+			t.Fatalf("description missing trigger %q: %q", trigger, doc.Metadata.Description)
+		}
+	}
+	for _, boundary := range []string{"does not create new facts", "commitments", "file-generator"} {
+		if !strings.Contains(doc.Metadata.WhenToUse, boundary) {
+			t.Fatalf("when_to_use missing boundary %q: %q", boundary, doc.Metadata.WhenToUse)
+		}
+	}
+	for _, required := range []string{
+		"call `request_user_input` instead of writing a plain clarification",
+		"read exactly one relevant reference",
+		"Do not add facts, promises, deadlines, compensation",
+		"Do not remove important caveats, limitations, risks",
+		"Do not imitate a specific living person",
+		"Language Rules",
+	} {
+		if !strings.Contains(doc.Instructions, required) {
+			t.Fatalf("instructions missing %q", required)
+		}
+	}
+	if len(doc.Metadata.References) != 5 {
+		t.Fatalf("references = %#v, want 5 response tone polisher references", doc.Metadata.References)
+	}
+	for _, path := range []string{"customer-service.md", "workplace-professional.md", "empathy-support.md", "general-user.md", "concise-friendly.md"} {
+		if !hasReference(doc.Metadata.References, path) {
+			t.Fatalf("references = %#v, missing %s", doc.Metadata.References, path)
+		}
+	}
+}
+
+func TestFormInteractionSystemSkillMetadata(t *testing.T) {
+	runtime := NewRuntimeWithCatalog(nil, nil, "catalog")
+	resolved, err := runtime.ResolveEnabledSkills(context.Background(), []string{SkillFormInteraction})
+	if err != nil {
+		t.Fatalf("ResolveEnabledSkills() error = %v", err)
+	}
+	doc, ok := resolved.Get(SkillFormInteraction)
+	if !ok {
+		t.Fatalf("form interaction skill was not resolved")
+	}
+	if doc.Metadata.RuntimeType != SkillRuntimeTypePrompt {
+		t.Fatalf("runtime type = %q, want prompt", doc.Metadata.RuntimeType)
+	}
+	if len(doc.Tools) != 0 {
+		t.Fatalf("tools = %v, want none", doc.Tools)
+	}
+	if doc.Metadata.HasScripts {
+		t.Fatalf("expected form interaction not to have scripts")
+	}
+	for _, trigger := range []string{"form interaction", "structured clarification", "user input", "quick replies", "parameter confirmation"} {
+		if !strings.Contains(doc.Metadata.Description, trigger) {
+			t.Fatalf("description missing trigger %q: %q", trigger, doc.Metadata.Description)
+		}
+	}
+	for _, boundary := range []string{"currently supported message/questions/options contract", "does not add new frontend components", "business logic"} {
+		if !strings.Contains(doc.Metadata.WhenToUse, boundary) {
+			t.Fatalf("when_to_use missing boundary %q: %q", boundary, doc.Metadata.WhenToUse)
+		}
+	}
+	for _, required := range []string{
+		"request_user_input",
+		"message/questions/options",
+		"Do not add unsupported fields",
+		"Do not modify or extend `request_user_input`",
+		"Do not promise fixed frontend widgets",
+		"After calling `request_user_input`, stop the turn",
+	} {
+		if !strings.Contains(doc.Instructions, required) {
+			t.Fatalf("instructions missing %q", required)
+		}
+	}
+	if len(doc.Metadata.References) != 5 {
+		t.Fatalf("references = %#v, want 5 form interaction references", doc.Metadata.References)
+	}
+	for _, path := range []string{"question-shapes.md", "option-rules.md", "validation-guidance.md", "multi-step-flow.md", "file-upload-prompt.md"} {
+		if !hasReference(doc.Metadata.References, path) {
+			t.Fatalf("references = %#v, missing %s", doc.Metadata.References, path)
+		}
+	}
+}
+
+func TestImageGeneratorSystemSkillMetadata(t *testing.T) {
+	runtime := NewRuntimeWithCatalog(nil, nil, "catalog")
+	resolved, err := runtime.ResolveEnabledSkills(context.Background(), []string{SkillImageGenerator})
+	if err != nil {
+		t.Fatalf("ResolveEnabledSkills() error = %v", err)
+	}
+	doc, ok := resolved.Get(SkillImageGenerator)
+	if !ok {
+		t.Fatalf("image generator skill was not resolved")
+	}
+	if doc.Metadata.MaxCallsPerTurn != 15 {
+		t.Fatalf("image generator max calls = %d, want 15", doc.Metadata.MaxCallsPerTurn)
+	}
+	if doc.Metadata.RuntimeType != SkillRuntimeTypeTool {
+		t.Fatalf("runtime type = %q, want tool", doc.Metadata.RuntimeType)
+	}
+	if doc.Metadata.HasScripts {
+		t.Fatalf("expected image generator not to have scripts")
+	}
+	if got := toolNames(doc.Tools); !sameStrings(got, []string{"generate_image", "edit_image"}) {
+		t.Fatalf("tools = %v, want generate_image and edit_image", got)
+	}
+	for _, tool := range doc.Tools {
+		if tool.ProviderType != "builtin" || tool.ProviderID != "image_generator" {
+			t.Fatalf("tool provider = %s/%s, want builtin/image_generator", tool.ProviderType, tool.ProviderID)
+		}
+	}
+	for _, trigger := range []string{"generate image", "text to image", "image variant", "image edit", "background change"} {
+		if !strings.Contains(doc.Metadata.Description, trigger) {
+			t.Fatalf("description missing trigger %q: %q", trigger, doc.Metadata.Description)
+		}
+	}
+	for _, required := range []string{
+		"request_user_input",
+		"specific living person's likeness",
+		"copyright, trademark, portrait rights, and brand compliance",
+		"Do not handle OCR, image recognition, table extraction, or screenshot diagnosis",
+		"prompt-plus-reference-URL regeneration",
+		"prompt-professionalizer",
+		"Direct tool calls are allowed only when the prompt and key parameters are already complete",
+	} {
+		if !strings.Contains(doc.Instructions, required) {
+			t.Fatalf("instructions missing %q", required)
+		}
+	}
+	if len(doc.Metadata.References) != 7 {
+		t.Fatalf("references = %#v, want 7 image generator references", doc.Metadata.References)
+	}
+	for _, path := range []string{"text-to-image.md", "reference-variant.md", "image-edit.md", "marketing-material.md", "poster-concept.md", "product-scene.md", "style-guide.md"} {
+		if !hasReference(doc.Metadata.References, path) {
+			t.Fatalf("references = %#v, missing %s", doc.Metadata.References, path)
+		}
+	}
+}
+
+func TestTicketRoutingSystemSkillMetadata(t *testing.T) {
+	runtime := NewRuntimeWithCatalog(nil, nil, "catalog")
+	resolved, err := runtime.ResolveEnabledSkills(context.Background(), []string{SkillTicketRouting})
+	if err != nil {
+		t.Fatalf("ResolveEnabledSkills() error = %v", err)
+	}
+	doc, ok := resolved.Get(SkillTicketRouting)
+	if !ok {
+		t.Fatalf("ticket routing skill was not resolved")
+	}
+	if doc.Metadata.RuntimeType != SkillRuntimeTypePrompt {
+		t.Fatalf("runtime type = %q, want prompt", doc.Metadata.RuntimeType)
+	}
+	if len(doc.Tools) != 0 {
+		t.Fatalf("tools = %v, want none", doc.Tools)
+	}
+	if doc.Metadata.HasScripts {
+		t.Fatalf("expected ticket routing not to have scripts")
+	}
+	for _, trigger := range []string{"ticket routing", "ticket triage", "issue classification", "urgency", "department routing", "workspace routing"} {
+		if !strings.Contains(doc.Metadata.Description, trigger) {
+			t.Fatalf("description missing trigger %q: %q", trigger, doc.Metadata.Description)
+		}
+	}
+	if !strings.Contains(doc.Metadata.WhenToUse, "routing recommendations only") || !strings.Contains(doc.Metadata.WhenToUse, "file-generator") {
+		t.Fatalf("when_to_use does not include routing/export boundaries: %q", doc.Metadata.WhenToUse)
+	}
+	for _, required := range []string{
+		"does not perform real ticket creation, dispatch",
+		"Do not invent workspace IDs",
+		"request_user_input",
+		"需人工确认",
+		"信息不足，需补充确认",
+		"Do not claim a ticket was dispatched",
+		"Language Rules",
+	} {
+		if !strings.Contains(doc.Instructions, required) {
+			t.Fatalf("instructions missing %q", required)
+		}
+	}
+	if len(doc.Metadata.References) != 6 {
+		t.Fatalf("references = %#v, want 6 ticket routing references", doc.Metadata.References)
+	}
+	for _, path := range []string{"generic-routing.md", "property-service.md", "enterprise-department-routing.md", "urgency-level.md", "customer-reply.md", "workspace-mapping.md"} {
+		if !hasReference(doc.Metadata.References, path) {
+			t.Fatalf("references = %#v, missing %s", doc.Metadata.References, path)
+		}
+	}
+}
+
+func TestPromptProfessionalizerSystemSkillMetadata(t *testing.T) {
+	runtime := NewRuntimeWithCatalog(nil, nil, "catalog")
+	resolved, err := runtime.ResolveEnabledSkills(context.Background(), []string{SkillPromptProfessionalizer})
+	if err != nil {
+		t.Fatalf("ResolveEnabledSkills() error = %v", err)
+	}
+	doc, ok := resolved.Get(SkillPromptProfessionalizer)
+	if !ok {
+		t.Fatalf("prompt professionalizer skill was not resolved")
+	}
+	if doc.Metadata.RuntimeType != SkillRuntimeTypePrompt {
+		t.Fatalf("runtime type = %q, want prompt", doc.Metadata.RuntimeType)
+	}
+	if len(doc.Tools) != 0 {
+		t.Fatalf("tools = %v, want none", doc.Tools)
+	}
+	if doc.Metadata.HasScripts {
+		t.Fatalf("expected prompt professionalizer not to have scripts")
+	}
+	for _, trigger := range []string{"optimize prompt", "professional prompt", "image prompt", "video prompt", "architecture diagram prompt", "data visualization prompt", "chart prompt"} {
+		if !strings.Contains(doc.Metadata.Description, trigger) {
+			t.Fatalf("description missing trigger %q: %q", trigger, doc.Metadata.Description)
+		}
+	}
+	if !strings.Contains(doc.Metadata.WhenToUse, "does not directly generate images") || !strings.Contains(doc.Metadata.WhenToUse, "corresponding skill or tool") || !strings.Contains(doc.Metadata.WhenToUse, "required preflight step before professional generation tools") {
+		t.Fatalf("when_to_use does not include downstream tool boundaries: %q", doc.Metadata.WhenToUse)
+	}
+	for _, required := range []string{
+		"Preflight Requirement",
+		"image-generator",
+		"architecture-diagram-generator",
+		"chart-generator",
+		"request_user_input",
+		"Do not directly call downstream generation tools",
+		"Before professional generation tools, use this skill as the required preflight",
+		"Do not invent facts, data fields, metrics, dimensions, technical modules",
+		"默认假设",
+		"Do not simply polish wording",
+		"Language Rules",
+	} {
+		if !strings.Contains(doc.Instructions, required) {
+			t.Fatalf("instructions missing %q", required)
+		}
+	}
+	if len(doc.Metadata.References) != 6 {
+		t.Fatalf("references = %#v, want 6 prompt professionalizer references", doc.Metadata.References)
+	}
+	for _, path := range []string{"image-prompt.md", "video-prompt.md", "architecture-diagram-prompt.md", "data-visualization-prompt.md", "general-prompt-optimization.md", "clarification-rules.md"} {
+		if !hasReference(doc.Metadata.References, path) {
+			t.Fatalf("references = %#v, missing %s", doc.Metadata.References, path)
+		}
+	}
+}
+
+func TestArchitectureDiagramSystemSkillMetadata(t *testing.T) {
+	runtime := NewRuntimeWithCatalog(nil, nil, "catalog")
+	resolved, err := runtime.ResolveEnabledSkills(context.Background(), []string{SkillArchitectureDiagram})
+	if err != nil {
+		t.Fatalf("ResolveEnabledSkills() error = %v", err)
+	}
+	doc, ok := resolved.Get(SkillArchitectureDiagram)
+	if !ok {
+		t.Fatalf("architecture diagram skill was not resolved")
+	}
+	if doc.Metadata.RuntimeType != SkillRuntimeTypeTool {
+		t.Fatalf("runtime type = %q, want tool", doc.Metadata.RuntimeType)
+	}
+	if doc.Metadata.HasScripts {
+		t.Fatalf("expected architecture diagram not to have scripts")
+	}
+	if got := toolNames(doc.Tools); !sameStrings(got, []string{"generate_architecture_diagram"}) {
+		t.Fatalf("tools = %v, want generate_architecture_diagram", got)
+	}
+	tool, ok := findSkillTool(*doc, "generate_architecture_diagram")
+	if !ok {
+		t.Fatalf("expected generate_architecture_diagram tool")
+	}
+	if tool.ProviderType != "builtin" || tool.ProviderID != "architecture_diagram_generator" {
+		t.Fatalf("tool provider = %s/%s, want builtin/architecture_diagram_generator", tool.ProviderType, tool.ProviderID)
+	}
+	if got := doc.Metadata.Display.Label["zh_Hans"]; got != "架构图生成器" {
+		t.Fatalf("zh label = %q", got)
+	}
+	if got := doc.Metadata.Display.Description["zh_Hans"]; got != "适用于设计系统架构、业务流程或数据关系，可将自然语言或结构化数据生成 SVG 和 HTML 架构图、流程图、时序图、状态图或 ER 图。" {
+		t.Fatalf("zh description = %q", got)
+	}
+	if got := doc.Metadata.Display.WhenToUse["zh_Hans"]; got != "当回答需要生成技术架构图文件时使用。" {
+		t.Fatalf("zh when_to_use = %q", got)
+	}
+	if got := doc.Metadata.Display.Tags["zh_Hans"]; !sameStrings(got, []string{"架构图", "技术图", "可视化"}) {
+		t.Fatalf("zh tags = %v", got)
+	}
+	for _, trigger := range []string{"system diagram", "AI Agent architecture", "data flow diagram", "sequence diagram", "ER diagram"} {
+		if !strings.Contains(doc.Metadata.Description, trigger) && !strings.Contains(doc.Metadata.WhenToUse, trigger) {
+			t.Fatalf("metadata missing trigger %q: description=%q when_to_use=%q", trigger, doc.Metadata.Description, doc.Metadata.WhenToUse)
+		}
+	}
+	for _, required := range []string{
+		"request_user_input",
+		"Read exactly one reference document",
+		"Generate SVG and HTML artifacts only",
+		"Do not promise PNG, PDF",
+		"Unsupported diagram types must be reported as unsupported",
+		"prompt-professionalizer",
+		"Direct tool calls are allowed only when the diagram type, content, and key rendering requirements are already complete",
+	} {
+		if !strings.Contains(doc.Instructions, required) {
+			t.Fatalf("instructions missing %q", required)
+		}
+	}
+	if len(doc.Metadata.References) != 8 {
+		t.Fatalf("references = %#v, want 8 architecture diagram references", doc.Metadata.References)
+	}
+	for _, path := range []string{"diagram-system-architecture.md", "diagram-agent-architecture.md", "diagram-data-flow.md", "diagram-flowchart.md", "diagram-comparison-matrix.md", "diagram-sequence.md", "diagram-state.md", "diagram-er.md"} {
+		if !hasReference(doc.Metadata.References, path) {
+			t.Fatalf("references = %#v, missing %s", doc.Metadata.References, path)
+		}
+	}
+}
+
+func TestChartGeneratorSystemSkillMetadata(t *testing.T) {
+	runtime := NewRuntimeWithCatalog(nil, nil, "catalog")
+	resolved, err := runtime.ResolveEnabledSkills(context.Background(), []string{SkillChartGenerator})
+	if err != nil {
+		t.Fatalf("ResolveEnabledSkills() error = %v", err)
+	}
+	doc, ok := resolved.Get(SkillChartGenerator)
+	if !ok {
+		t.Fatalf("chart generator skill was not resolved")
+	}
+	if doc.Metadata.RuntimeType != SkillRuntimeTypeTool {
+		t.Fatalf("runtime type = %q, want tool", doc.Metadata.RuntimeType)
+	}
+	if doc.Metadata.HasScripts {
+		t.Fatalf("expected chart generator not to have scripts")
+	}
+	if doc.Metadata.ScriptsSupported {
+		t.Fatalf("scripts supported = true for builtin chart generator")
+	}
+	tool, ok := findSkillTool(*doc, "generate_chart")
+	if !ok {
+		t.Fatalf("expected generate_chart tool")
+	}
+	if tool.ProviderType != "builtin" || tool.ProviderID != "chart_generator" {
+		t.Fatalf("tool provider = %s/%s, want builtin/chart_generator", tool.ProviderType, tool.ProviderID)
+	}
+	if got := doc.Metadata.Display.Label["zh_Hans"]; got != "图表生成器" {
+		t.Fatalf("zh label = %q", got)
+	}
+	if got := doc.Metadata.Display.WhenToUse["zh_Hans"]; got != "当回答需要生成图表文件时使用。" {
+		t.Fatalf("zh when_to_use = %q", got)
+	}
+	if got := doc.Metadata.Display.Tags["zh_Hans"]; !sameStrings(got, []string{"图表", "可视化", "数据"}) {
+		t.Fatalf("zh tags = %v", got)
+	}
+	for _, required := range []string{
+		"request_user_input",
+		"Read exactly one reference document",
+		"Generate SVG artifacts only",
+		"Unsupported chart types must be reported as unsupported",
+		"prompt-professionalizer",
+		"Direct tool calls are allowed only when the chart type, data mapping, title or purpose, and key rendering requirements are already complete",
+	} {
+		if !strings.Contains(doc.Instructions, required) {
+			t.Fatalf("instructions missing %q", required)
+		}
+	}
+	if len(doc.Metadata.References) != 7 {
+		t.Fatalf("references = %#v, want 7 chart references", doc.Metadata.References)
+	}
+	for _, path := range []string{"chart-radar.md", "chart-bar.md", "chart-line.md", "chart-pie.md", "chart-doughnut.md", "chart-scatter.md", "chart-score-distribution.md"} {
+		if !hasReference(doc.Metadata.References, path) {
+			t.Fatalf("references = %#v, missing %s", doc.Metadata.References, path)
+		}
+	}
+}
+
+func TestIntentRouterSystemSkillMetadata(t *testing.T) {
+	runtime := NewRuntimeWithCatalog(nil, nil, "catalog")
+	resolved, err := runtime.ResolveEnabledSkills(context.Background(), []string{SkillIntentRouter})
+	if err != nil {
+		t.Fatalf("ResolveEnabledSkills() error = %v", err)
+	}
+	doc, ok := resolved.Get(SkillIntentRouter)
+	if !ok {
+		t.Fatalf("intent router skill was not resolved")
+	}
+	if doc.Metadata.RuntimeType != SkillRuntimeTypeHybrid {
+		t.Fatalf("runtime type = %q, want hybrid", doc.Metadata.RuntimeType)
+	}
+	tool, ok := findSkillTool(*doc, "route_intent")
+	if !ok {
+		t.Fatalf("expected route_intent tool")
+	}
+	if tool.ProviderType != "builtin" || tool.ProviderID != "intent_router" {
+		t.Fatalf("tool provider = %s/%s, want builtin/intent_router", tool.ProviderType, tool.ProviderID)
+	}
+	if len(doc.Metadata.References) != 4 {
+		t.Fatalf("references = %#v, want 4 intent router references", doc.Metadata.References)
+	}
+	for _, path := range []string{"taxonomy.md", "routing-rules.md", "clarification-rules.md", "payload-examples.md"} {
+		if !hasReference(doc.Metadata.References, path) {
+			t.Fatalf("references = %#v, missing %s", doc.Metadata.References, path)
+		}
+	}
+}
+
+func TestProfessionalGenerationSkillsAutoIncludePromptProfessionalizer(t *testing.T) {
+	runtime := NewRuntimeWithCatalog(nil, nil, "catalog")
+	for _, skillID := range []string{SkillImageGenerator, SkillArchitectureDiagram, SkillChartGenerator} {
+		t.Run(skillID, func(t *testing.T) {
+			resolved, err := runtime.ResolveEnabledSkills(context.Background(), []string{skillID})
+			if err != nil {
+				t.Fatalf("ResolveEnabledSkills() error = %v", err)
+			}
+			if _, ok := resolved.Get(skillID); !ok {
+				t.Fatalf("requested skill %s was not resolved", skillID)
+			}
+			if _, ok := resolved.Get(SkillPromptProfessionalizer); !ok {
+				t.Fatalf("%s did not auto-include %s", skillID, SkillPromptProfessionalizer)
+			}
+		})
+	}
+}
+
+func TestProfessionalGenerationToolsRequirePromptProfessionalizerPreflight(t *testing.T) {
+	for _, tt := range []struct {
+		skillID  string
+		toolName string
+	}{
+		{SkillImageGenerator, "generate_image"},
+		{SkillImageGenerator, "edit_image"},
+		{SkillArchitectureDiagram, "generate_architecture_diagram"},
+		{SkillChartGenerator, "generate_chart"},
+	} {
+		t.Run(tt.skillID+"/"+tt.toolName, func(t *testing.T) {
+			if !RequiresPromptProfessionalizerPreflight(tt.skillID, tt.toolName) {
+				t.Fatalf("RequiresPromptProfessionalizerPreflight() = false, want true")
+			}
+		})
+	}
+	if RequiresPromptProfessionalizerPreflight(SkillCalculator, "evaluate_expression") {
+		t.Fatalf("calculator should not require prompt professionalizer preflight")
+	}
+}
+
+func TestAgentMemorySystemSkillIsNotLoadable(t *testing.T) {
+	runtime := NewRuntimeWithCatalog(nil, nil, "catalog")
+	_, err := runtime.ResolveEnabledSkills(context.Background(), []string{SkillAgentMemory})
+	if !errors.Is(err, ErrSkillNotFound) {
+		t.Fatalf("ResolveEnabledSkills(agent-memory) error = %v, want ErrSkillNotFound", err)
+	}
+	for _, toolName := range []string{"read_agent_memory", "update_agent_memory", "clear_agent_memory"} {
+		if got := ExpectedSkillToolArguments(SkillAgentMemory, toolName); got != nil {
+			t.Fatalf("ExpectedSkillToolArguments(agent-memory/%s) = %#v, want nil", toolName, got)
+		}
+	}
+}
+
+func TestUserMemorySystemSkillIsNotLoadable(t *testing.T) {
+	runtime := NewRuntimeWithCatalog(nil, nil, "catalog")
+	_, err := runtime.ResolveEnabledSkills(context.Background(), []string{SkillUserMemory})
+	if !errors.Is(err, ErrSkillNotFound) {
+		t.Fatalf("ResolveEnabledSkills(user-memory) error = %v, want ErrSkillNotFound", err)
+	}
+	for _, toolName := range []string{"read_user_memory", "add_user_memory", "update_user_memory", "delete_user_memory", "list_temporary_memories"} {
+		if got := ExpectedSkillToolArguments(SkillUserMemory, toolName); got != nil {
+			t.Fatalf("ExpectedSkillToolArguments(user-memory/%s) = %#v, want nil", toolName, got)
+		}
+	}
+}
+
+func TestCustomSkillCannotDeclareTools(t *testing.T) {
+	root := t.TempDir()
+	content := `---
+name: custom-tool-skill
+description: Invalid custom skill.
+when_to_use: Never.
+provider_type: builtin
+provider_id: knowledge
+runtime_type: prompt
+tools:
+  - retrieve_knowledge
+---
+
+# Invalid
+
+This custom skill should not be allowed to declare tools.
+`
+	if err := os.WriteFile(filepath.Join(root, "SKILL.md"), []byte(content), 0o600); err != nil {
+		t.Fatalf("WriteFile() error = %v", err)
+	}
+	if _, err := LoadCustomSkillDocument(root); err == nil {
+		t.Fatalf("LoadCustomSkillDocument() error = nil, want custom tool declaration rejection")
+	}
+}
+
+func TestCalculatorMetaToolArgumentsExposeRequiredExpressionSchema(t *testing.T) {
+	runtime := NewRuntimeWithCatalog(nil, nil, "catalog")
+	resolved, err := runtime.ResolveEnabledSkills(context.Background(), []string{SkillCalculator})
+	if err != nil {
+		t.Fatalf("ResolveEnabledSkills() error = %v", err)
+	}
+	doc, ok := resolved.Get(SkillCalculator)
+	if !ok {
+		t.Fatalf("calculator skill was not resolved")
+	}
+	if doc.Metadata.MaxCallsPerTurn != 50 {
+		t.Fatalf("calculator max calls = %d, want 50", doc.Metadata.MaxCallsPerTurn)
+	}
+	metaTools := MetaToolsForSkillState(resolved, map[string]struct{}{SkillCalculator: {}})
+	callTool := findMetaTool(metaTools, MetaToolCallSkillTool)
+	if callTool == nil {
+		t.Fatalf("call_skill_tool meta tool not found")
+	}
+	params, ok := callTool.Function.Parameters.(map[string]interface{})
+	if !ok {
+		t.Fatalf("parameters type = %T, want map[string]interface{}", callTool.Function.Parameters)
+	}
+	properties, ok := params["properties"].(map[string]interface{})
+	if !ok {
+		t.Fatalf("parameters.properties missing")
+	}
+	if _, ok := properties["plan_phase_id"].(map[string]interface{}); !ok {
+		t.Fatalf("plan_phase_id schema missing from call_skill_tool: %#v", properties)
+	}
+	if _, ok := properties["arguments"].(map[string]interface{}); !ok {
+		t.Fatalf("arguments schema missing")
+	}
+	argumentSchemas := argumentSchemasFromPairBranches(params)
+	if len(argumentSchemas) == 0 {
+		t.Fatalf("pair branches = %#v, want calculator tool schemas", params["oneOf"])
+	}
+	expressionSchema := findSchemaWithRequired(argumentSchemas, "expression")
+	if expressionSchema == nil {
+		t.Fatalf("evaluate_expression schema requiring expression not found in %#v", argumentSchemas)
+	}
+	expressionProperties, _ := expressionSchema["properties"].(map[string]interface{})
+	if _, ok := expressionProperties["expression"]; !ok {
+		t.Fatalf("expression property missing from %#v", expressionSchema)
+	}
+}
+
+func TestMetaToolsForSkillStateDoesNotOfferAlreadyLoadedSkills(t *testing.T) {
+	runtime := NewRuntimeWithCatalog(nil, nil, "catalog")
+	resolved, err := runtime.ResolveEnabledSkills(context.Background(), []string{SkillCalculator})
+	if err != nil {
+		t.Fatalf("ResolveEnabledSkills() error = %v", err)
+	}
+
+	unloadedTools := MetaToolsForSkillState(resolved, nil)
+	loadTool := findMetaTool(unloadedTools, MetaToolLoadSkill)
+	if loadTool == nil {
+		t.Fatal("load_skill meta tool missing for an unloaded skill")
+	}
+	params, ok := loadTool.Function.Parameters.(map[string]interface{})
+	if !ok {
+		t.Fatalf("parameters type = %T, want map[string]interface{}", loadTool.Function.Parameters)
+	}
+	properties, _ := params["properties"].(map[string]interface{})
+	skillIDSchema, _ := properties["skill_id"].(map[string]interface{})
+	values, _ := skillIDSchema["enum"].([]string)
+	if len(values) != 1 || values[0] != SkillCalculator {
+		t.Fatalf("load_skill skill_id enum = %#v, want [%s]", values, SkillCalculator)
+	}
+
+	loadedTools := MetaToolsForSkillState(resolved, map[string]struct{}{SkillCalculator: {}})
+	if tool := findMetaTool(loadedTools, MetaToolLoadSkill); tool != nil {
+		t.Fatalf("load_skill meta tool = %#v, want omitted when every skill is loaded", tool.Function)
+	}
+	if tool := findMetaTool(loadedTools, MetaToolCallSkillTool); tool == nil {
+		t.Fatal("call_skill_tool meta tool missing for the loaded calculator skill")
+	}
+}
+
+func TestRequestUserInputMetaToolIsAlwaysExposed(t *testing.T) {
+	runtime := NewRuntimeWithCatalog(nil, nil, "catalog")
+	resolved, err := runtime.ResolveEnabledSkills(context.Background(), []string{SkillCalculator})
+	if err != nil {
+		t.Fatalf("ResolveEnabledSkills() error = %v", err)
+	}
+	metaTools := MetaToolsForSkillState(resolved, map[string]struct{}{})
+	tool := findMetaTool(metaTools, MetaToolRequestUserInput)
+	if tool == nil {
+		t.Fatalf("request_user_input meta tool not found")
+	}
+	params, ok := tool.Function.Parameters.(map[string]interface{})
+	if !ok {
+		t.Fatalf("parameters type = %T, want map[string]interface{}", tool.Function.Parameters)
+	}
+	required, _ := params["required"].([]string)
+	if len(required) != 2 || required[0] != "message" || required[1] != "questions" {
+		t.Fatalf("required = %#v, want message and questions", params["required"])
+	}
+	properties, _ := params["properties"].(map[string]interface{})
+	if _, ok := properties["message"]; !ok {
+		t.Fatalf("message property missing from %#v", properties)
+	}
+	if _, ok := properties["questions"]; !ok {
+		t.Fatalf("questions property missing from %#v", properties)
+	}
+}
+
+func TestTurnStateMetaToolIsAlwaysExposed(t *testing.T) {
+	runtime := NewRuntimeWithCatalog(nil, nil, "catalog")
+	resolved, err := runtime.ResolveEnabledSkills(context.Background(), []string{SkillCalculator})
+	if err != nil {
+		t.Fatalf("ResolveEnabledSkills() error = %v", err)
+	}
+	metaTools := MetaToolsForSkillState(resolved, map[string]struct{}{})
+	tool := findMetaTool(metaTools, MetaToolTurnState)
+	if tool == nil {
+		t.Fatalf("submit_turn_state meta tool not found")
+	}
+	params, ok := tool.Function.Parameters.(map[string]interface{})
+	if !ok {
+		t.Fatalf("parameters type = %T, want map[string]interface{}", tool.Function.Parameters)
+	}
+	properties, _ := params["properties"].(map[string]interface{})
+	items, ok := properties["items"].(map[string]interface{})
+	if !ok {
+		t.Fatalf("items property missing from %#v", properties)
+	}
+	itemSchema, _ := items["items"].(map[string]interface{})
+	itemProperties, _ := itemSchema["properties"].(map[string]interface{})
+	if _, ok := itemProperties["kind"]; !ok {
+		t.Fatalf("kind property missing from %#v", itemProperties)
+	}
+	if _, ok := itemProperties["value"]; !ok {
+		t.Fatalf("value property missing from %#v", itemProperties)
+	}
+}
+
+func TestExpectedSkillToolArgumentsForCalculator(t *testing.T) {
+	expected := ExpectedSkillToolArguments(SkillCalculator, "evaluate_expression")
+	if expected == nil {
+		t.Fatalf("ExpectedSkillToolArguments() = nil")
+	}
+	schema, ok := expected["schema"].(map[string]interface{})
+	if !ok {
+		t.Fatalf("schema type = %T, want map[string]interface{}", expected["schema"])
+	}
+	if !hasRequired(schema, "expression") {
+		t.Fatalf("schema does not require expression: %#v", schema)
+	}
+	example, ok := expected["example"].(map[string]interface{})
+	if !ok || example["expression"] == "" {
+		t.Fatalf("example missing expression: %#v", expected["example"])
+	}
+}
+
+func TestSystemToolSkillsExposeArgumentContracts(t *testing.T) {
+	runtime := NewRuntimeWithCatalog(nil, nil, "catalog")
+	skillIDs := []string{
+		SkillAgentKnowledge,
+		SkillAgentDatabase,
+		SkillCalculator,
+		SkillConsoleNavigator,
+		SkillFileGenerator,
+		SkillFileManager,
+		SkillFileReader,
+		SkillPPTSlidePlanner,
+		SkillContractFieldExtractor,
+		SkillSensitiveRedaction,
+		SkillChartGenerator,
+		SkillIntentRouter,
+		SkillArchitectureDiagram,
+		SkillImageGenerator,
+		SkillWorkReport,
+		SkillInternalDatabase,
+		SkillInternalKnowledge,
+		SkillTime,
+	}
+	resolved, err := runtime.ResolveEnabledSkills(context.Background(), skillIDs)
+	if err != nil {
+		t.Fatalf("ResolveEnabledSkills() error = %v", err)
+	}
+	for _, doc := range resolved.Skills {
+		for _, tool := range doc.Tools {
+			if _, ok := SkillToolArgumentContractFor(doc.Metadata.ID, tool.Name); !ok {
+				t.Fatalf("missing argument contract for %s/%s", doc.Metadata.ID, tool.Name)
+			}
+		}
+	}
+}
+
+func TestAgentManagementUsesUnifiedConfigBindingTool(t *testing.T) {
+	runtime := NewRuntimeWithCatalog(nil, nil, "catalog")
+	resolved, err := runtime.ResolveEnabledSkills(context.Background(), []string{SkillAgentManagement})
+	if err != nil {
+		t.Fatalf("ResolveEnabledSkills() error = %v", err)
+	}
+	doc, ok := resolved.Get(SkillAgentManagement)
+	if !ok {
+		t.Fatalf("agent management skill was not resolved")
+	}
+	names := toolNames(doc.Tools)
+	nameSet := map[string]struct{}{}
+	for _, name := range names {
+		nameSet[name] = struct{}{}
+	}
+	if _, ok := nameSet["update_agent_config"]; !ok {
+		t.Fatalf("agent management tools = %v, want update_agent_config", names)
+	}
+	for _, legacy := range []string{
+		"replace_agent_skill_bindings",
+		"replace_agent_knowledge_bindings",
+		"replace_agent_database_bindings",
+		"replace_agent_workflow_bindings",
+	} {
+		if _, ok := nameSet[legacy]; ok {
+			t.Fatalf("agent management tools expose legacy binding tool %q: %v", legacy, names)
+		}
+	}
+}
+
+func TestExpectedSkillToolArgumentsForBuiltInRequiredTools(t *testing.T) {
+	tests := []struct {
+		skillID  string
+		toolName string
+		required []string
+	}{
+		{SkillFileGenerator, "generate_file", []string{"content", "format"}},
+		{SkillFileManager, "delete_file", []string{"file_id"}},
+		{SkillFileManager, "save_file_to_management", []string{"source_type", "filename"}},
+		{SkillFileReader, "read_file", []string{"file_id"}},
+		{SkillFileGenerator, "generate_docx", []string{"document"}},
+		{SkillFileGenerator, "generate_pdf", []string{"html"}},
+		{SkillFileGenerator, "generate_pptx", []string{"presentation"}},
+		{SkillContractFieldExtractor, "generate_file", []string{"content", "format"}},
+		{SkillSensitiveRedaction, "redact_text", []string{"text"}},
+		{SkillChartGenerator, "generate_chart", []string{"chart_type", "data"}},
+		{SkillIntentRouter, "route_intent", []string{"user_input", "intent_id", "task_type", "confidence", "recommended_action", "evidence", "normalized_request"}},
+		{SkillArchitectureDiagram, "generate_architecture_diagram", []string{"diagram_type", "data"}},
+		{SkillImageGenerator, "generate_image", []string{"prompt"}},
+		{SkillImageGenerator, "edit_image", []string{"image", "edit_instruction"}},
+		{SkillWorkReport, "generate_file", []string{"content", "format"}},
+		{SkillInternalKnowledge, "retrieve_knowledge", []string{"query", "dataset_ids"}},
+		{SkillAgentKnowledge, "retrieve_agent_knowledge", []string{"query"}},
+		{SkillInternalDatabase, "query_table_records", []string{"data_source_id", "table_id"}},
+		{SkillAgentDatabase, "insert_table_records", []string{"data_source_id", "table_id", "records"}},
+		{SkillConsoleNavigator, "navigate", []string{"href"}},
+		{SkillAgentManagement, "create_agent", []string{"name"}},
+		{SkillAgentManagement, "update_agent_config", []string{"agent_id"}},
+		{SkillTime, "date_calculate", []string{"operation"}},
+	}
+	for _, tt := range tests {
+		t.Run(tt.skillID+"/"+tt.toolName, func(t *testing.T) {
+			expected := ExpectedSkillToolArguments(tt.skillID, tt.toolName)
+			if expected == nil {
+				t.Fatalf("ExpectedSkillToolArguments() = nil")
+			}
+			schema, ok := expected["schema"].(map[string]interface{})
+			if !ok {
+				t.Fatalf("schema type = %T, want map[string]interface{}", expected["schema"])
+			}
+			for _, required := range tt.required {
+				if !hasRequired(schema, required) {
+					t.Fatalf("schema does not require %s: %#v", required, schema)
+				}
+			}
+			example, ok := expected["example"].(map[string]interface{})
+			if !ok || len(example) == 0 {
+				t.Fatalf("example missing: %#v", expected["example"])
+			}
+		})
+	}
+}
+
+func TestFileGeneratorStructuredContractsExposeObjectsWithoutLegacyTitle(t *testing.T) {
+	tests := []struct {
+		toolName string
+		field    string
+		root     string
+	}{
+		{toolName: "generate_docx", field: "document", root: "blocks"},
+		{toolName: "generate_pptx", field: "presentation", root: "slides"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.toolName, func(t *testing.T) {
+			contract, ok := SkillToolArgumentContractFor(SkillFileGenerator, tt.toolName)
+			if !ok {
+				t.Fatalf("SkillToolArgumentContractFor() missing %s", tt.toolName)
+			}
+			properties, ok := contract.Schema["properties"].(map[string]interface{})
+			if !ok {
+				t.Fatalf("contract properties type = %T", contract.Schema["properties"])
+			}
+			if _, exists := properties["title"]; exists {
+				t.Fatalf("contract properties expose unused title: %#v", properties)
+			}
+			structured, ok := properties[tt.field].(map[string]interface{})
+			if !ok || structured["type"] != "object" {
+				t.Fatalf("%s schema = %#v, want object", tt.field, properties[tt.field])
+			}
+			if !hasRequired(structured, tt.root) {
+				t.Fatalf("%s schema does not require %s: %#v", tt.field, tt.root, structured)
+			}
+			assertSchemaAvoidsCompositionKeywords(t, structured)
+			if tt.toolName == "generate_docx" {
+				structuredProperties := structured["properties"].(map[string]interface{})
+				defaultStyle := structuredProperties["default_style"].(map[string]interface{})
+				underline := defaultStyle["properties"].(map[string]interface{})["underline"].(map[string]interface{})
+				if underline["type"] != "string" || len(underline["enum"].([]string)) == 0 {
+					t.Fatalf("DOCX underline schema = %#v, want non-empty string enum", underline)
+				}
+				blocks := structuredProperties["blocks"].(map[string]interface{})
+				block := blocks["items"].(map[string]interface{})
+				rows := block["properties"].(map[string]interface{})["rows"].(map[string]interface{})
+				row := rows["items"].(map[string]interface{})
+				cell := row["items"].(map[string]interface{})
+				if cell["type"] != "object" {
+					t.Fatalf("DOCX table cell schema = %#v, want object", cell)
+				}
+			}
+
+			example, ok := contract.Example[tt.field].(map[string]interface{})
+			if !ok {
+				t.Fatalf("%s example type = %T, want object", tt.field, contract.Example[tt.field])
+			}
+			if _, exists := example[tt.root]; !exists {
+				t.Fatalf("%s example missing %s: %#v", tt.field, tt.root, example)
+			}
+		})
+	}
+}
+
+func assertSchemaAvoidsCompositionKeywords(t *testing.T, value interface{}) {
+	t.Helper()
+	switch typed := value.(type) {
+	case map[string]interface{}:
+		for key, child := range typed {
+			switch key {
+			case "$ref", "oneOf", "anyOf", "allOf":
+				t.Fatalf("schema contains unsupported composition keyword %q", key)
+			}
+			assertSchemaAvoidsCompositionKeywords(t, child)
+		}
+	case []interface{}:
+		for _, child := range typed {
+			assertSchemaAvoidsCompositionKeywords(t, child)
+		}
+	}
+}
+
+func TestExpectedSkillToolArgumentsForFileReaderListVisibleFiles(t *testing.T) {
+	expected := ExpectedSkillToolArguments(SkillFileReader, "list_visible_files")
+	if expected == nil {
+		t.Fatalf("ExpectedSkillToolArguments() = nil")
+	}
+	schema, ok := expected["schema"].(map[string]interface{})
+	if !ok {
+		t.Fatalf("schema type = %T, want map[string]interface{}", expected["schema"])
+	}
+	required, ok := schema["required"].([]string)
+	if ok && len(required) > 0 {
+		t.Fatalf("required = %#v, want no required arguments", required)
+	}
+	properties, ok := schema["properties"].(map[string]interface{})
+	if !ok || len(properties) != 0 {
+		t.Fatalf("properties = %#v, want no arguments", schema["properties"])
+	}
+}
+
+func TestExpectedSkillToolArgumentsForAgentManagementListAvailableModels(t *testing.T) {
+	expected := ExpectedSkillToolArguments(SkillAgentManagement, "list_available_models")
+	if expected == nil {
+		t.Fatalf("ExpectedSkillToolArguments() = nil")
+	}
+	schema, ok := expected["schema"].(map[string]interface{})
+	if !ok {
+		t.Fatalf("schema type = %T, want map[string]interface{}", expected["schema"])
+	}
+	required, ok := schema["required"].([]string)
+	if ok && len(required) > 0 {
+		t.Fatalf("required = %#v, want no required arguments", required)
+	}
+	properties, ok := schema["properties"].(map[string]interface{})
+	if !ok {
+		t.Fatalf("properties missing from %#v", schema)
+	}
+	for _, property := range []string{"use_case", "provider", "limit"} {
+		if _, ok := properties[property]; !ok {
+			t.Fatalf("property %s missing from %#v", property, properties)
+		}
+	}
+	useCase, ok := properties["use_case"].(map[string]interface{})
+	if !ok {
+		t.Fatalf("use_case schema missing from %#v", properties)
+	}
+	if !schemaEnumContains(useCase, "agent") || !schemaEnumContains(useCase, "workflow") || !schemaEnumContains(useCase, "text-chat") || !schemaEnumContains(useCase, "function-calling") {
+		t.Fatalf("use_case enum = %#v, want agent, workflow, text-chat and function-calling", useCase["enum"])
+	}
+}
+
+func TestAgentManagementSkillConstrainsMissingTargetSearch(t *testing.T) {
+	raw, err := os.ReadFile(filepath.Join(defaultSkillCatalogDir(), SkillAgentManagement, "SKILL.md"))
+	if err != nil {
+		t.Fatalf("read agent-management SKILL.md: %v", err)
+	}
+	content := string(raw)
+	for _, want := range []string{
+		"do at most one exact-name `list_agents` search",
+		"one broader workspace list/check",
+		"stop without requesting governance approval or deleting/modifying anything",
+		"Do not keep retrying with near-duplicate keywords",
+	} {
+		if !strings.Contains(content, want) {
+			t.Fatalf("agent-management SKILL.md missing search convergence guidance %q", want)
+		}
+	}
+}
+
+func TestAgentManagementSystemPromptUpdatesUseFullReplacementOnly(t *testing.T) {
+	expected := ExpectedSkillToolArguments(SkillAgentManagement, "update_agent_config")
+	if expected == nil {
+		t.Fatal("ExpectedSkillToolArguments() = nil")
+	}
+	schema, ok := expected["schema"].(map[string]interface{})
+	if !ok {
+		t.Fatalf("schema type = %T, want map[string]interface{}", expected["schema"])
+	}
+	properties, ok := schema["properties"].(map[string]interface{})
+	if !ok {
+		t.Fatalf("schema.properties missing from %#v", schema)
+	}
+	if _, ok := properties["system_prompt_source"]; ok {
+		t.Fatal("system_prompt_source is exposed in the Skill Loop contract")
+	}
+	if _, ok := properties["system_prompt_patch"]; ok {
+		t.Fatal("system_prompt_patch is exposed in the Skill Loop contract")
+	}
+	prompt, ok := properties["system_prompt"].(map[string]interface{})
+	if !ok {
+		t.Fatalf("system_prompt schema missing from %#v", properties)
+	}
+	description, _ := prompt["description"].(string)
+	for _, required := range []string{"complete replacement", "preserve every unrelated part", "input rather than content to copy by default", "scope and level of detail"} {
+		if !strings.Contains(description, required) {
+			t.Fatalf("system_prompt description missing %q: %q", required, description)
+		}
+	}
+
+	raw, err := os.ReadFile(filepath.Join(defaultSkillCatalogDir(), SkillAgentManagement, "SKILL.md"))
+	if err != nil {
+		t.Fatalf("read agent-management SKILL.md: %v", err)
+	}
+	content := string(raw)
+	for _, hidden := range []string{"system_prompt_source", "system_prompt_patch"} {
+		if strings.Contains(content, hidden) {
+			t.Fatalf("agent-management SKILL.md still exposes deferred parameter %q", hidden)
+		}
+	}
+	for _, required := range []string{
+		"first obtain the complete current `system_prompt`",
+		"preserve the transformation requested by the user",
+		"Treat the source as input, not as content to copy by default",
+		"does not imply permission to copy the source in full",
+		"matches the user's requested transformation, scope, and level of detail",
+	} {
+		if !strings.Contains(content, required) {
+			t.Fatalf("agent-management SKILL.md missing system-prompt safeguard %q", required)
+		}
+	}
+}
+
+func TestChartGeneratorContractSupportsBarAndLinePayloads(t *testing.T) {
+	expected := ExpectedSkillToolArguments(SkillChartGenerator, "generate_chart")
+	if expected == nil {
+		t.Fatalf("ExpectedSkillToolArguments() = nil")
+	}
+	schema, ok := expected["schema"].(map[string]interface{})
+	if !ok {
+		t.Fatalf("schema type = %T, want map[string]interface{}", expected["schema"])
+	}
+	properties, ok := schema["properties"].(map[string]interface{})
+	if !ok {
+		t.Fatalf("schema.properties missing")
+	}
+	dataSchema, ok := properties["data"].(map[string]interface{})
+	if !ok {
+		t.Fatalf("data schema missing")
+	}
+	if hasRequired(dataSchema, "dimensions") {
+		t.Fatalf("top-level data schema should not require dimensions: %#v", dataSchema)
+	}
+	branches, ok := dataSchema["anyOf"].([]interface{})
+	if !ok || len(branches) < 7 {
+		t.Fatalf("data anyOf = %#v, want radar/bar/line/pie/scatter/distribution branches", dataSchema["anyOf"])
+	}
+	for _, required := range []string{"dimensions", "categories", "x_axis", "items", "points", "bands"} {
+		if findSchemaWithRequired(branches, required) == nil {
+			t.Fatalf("data schema branch requiring %s not found: %#v", required, branches)
+		}
+	}
+	if findSchemaWithRequired(branches, "scores") == nil {
+		t.Fatalf("data schema branch requiring scores not found: %#v", branches)
+	}
+	for _, rawBranch := range branches {
+		branch, ok := rawBranch.(map[string]interface{})
+		if !ok || !hasRequired(branch, "bands") {
+			continue
+		}
+		if branchAllowsLabelOnlyBands(branch) {
+			t.Fatalf("score distribution bands schema allows label-only bands: %#v", branch)
+		}
+	}
+}
+
+func TestMetaToolArgumentsExposeAllLoadedSystemToolContracts(t *testing.T) {
+	runtime := NewRuntimeWithCatalog(nil, nil, "catalog")
+	skillIDs := []string{
+		SkillAgentKnowledge,
+		SkillAgentDatabase,
+		SkillCalculator,
+		SkillConsoleNavigator,
+		SkillFileGenerator,
+		SkillFileManager,
+		SkillFileReader,
+		SkillPPTSlidePlanner,
+		SkillContractFieldExtractor,
+		SkillSensitiveRedaction,
+		SkillChartGenerator,
+		SkillIntentRouter,
+		SkillArchitectureDiagram,
+		SkillImageGenerator,
+		SkillWorkReport,
+		SkillInternalDatabase,
+		SkillInternalKnowledge,
+		SkillTime,
+	}
+	resolved, err := runtime.ResolveEnabledSkills(context.Background(), skillIDs)
+	if err != nil {
+		t.Fatalf("ResolveEnabledSkills() error = %v", err)
+	}
+	loaded := map[string]struct{}{}
+	for _, id := range skillIDs {
+		loaded[id] = struct{}{}
+	}
+	metaTools := MetaToolsForSkillState(resolved, loaded)
+	callTool := findMetaTool(metaTools, MetaToolCallSkillTool)
+	if callTool == nil {
+		t.Fatalf("call_skill_tool meta tool not found")
+	}
+	params, ok := callTool.Function.Parameters.(map[string]interface{})
+	if !ok {
+		t.Fatalf("parameters type = %T, want map[string]interface{}", callTool.Function.Parameters)
+	}
+	properties, ok := params["properties"].(map[string]interface{})
+	if !ok {
+		t.Fatalf("parameters.properties missing")
+	}
+	if _, ok := properties["arguments"].(map[string]interface{}); !ok {
+		t.Fatalf("arguments schema missing")
+	}
+	argumentSchemas := argumentSchemasFromPairBranches(params)
+	if len(argumentSchemas) < 7 {
+		t.Fatalf("pair branches = %#v, want built-in tool schemas", params["oneOf"])
+	}
+	for _, required := range []string{"content", "file_id", "query", "operation"} {
+		if findSchemaWithRequired(argumentSchemas, required) == nil {
+			t.Fatalf("schema requiring %s not found in %#v", required, argumentSchemas)
+		}
+	}
+}
+
+func TestSystemSkillToolGovernanceManifestLoadedFromFrontmatter(t *testing.T) {
+	catalog := t.TempDir()
+	root := filepath.Join(catalog, "governance-skill")
+	if err := os.MkdirAll(root, 0o755); err != nil {
+		t.Fatalf("MkdirAll() error = %v", err)
+	}
+	skill := `---
+name: governance-skill
+description: governance test skill
+when_to_use: verify governance manifest parsing
+provider_type: builtin
+provider_id: files
+tools:
+  - file.read
+  - file.delete
+runtime_type: tool
+tool_governance:
+  file.read:
+    tool_id: file.read
+    skill_id: governance-skill
+    domain: files
+    effect: read
+    asset_type: File
+    risk_level: LOW
+    requires_asset_resolution: true
+    permission_scopes:
+      - file:read
+    default_approval_policy: auto_by_permission_tier
+    allowed_permission_tiers:
+      - basic
+      - advanced
+      - full
+    audit_required: true
+    idempotency_required: false
+  file.delete:
+    tool_id: files.delete
+    skill_id: governance-skill
+    domain: files
+    effect: delete
+    asset_type: file
+    risk_level: high
+    requires_asset_resolution: true
+    permission_scopes:
+      - file:manage
+    default_approval_policy: always_ask
+    allowed_permission_tiers:
+      - advanced
+      - full
+    audit_required: true
+    idempotency_required: false
+---
+Use governed tools.
+`
+	if err := os.WriteFile(filepath.Join(root, "SKILL.md"), []byte(skill), 0o644); err != nil {
+		t.Fatalf("WriteFile() error = %v", err)
+	}
+
+	runtime := NewRuntimeWithCatalog(nil, nil, catalog)
+	resolved, err := runtime.ResolveEnabledSkills(context.Background(), []string{"governance-skill"})
+	if err != nil {
+		t.Fatalf("ResolveEnabledSkills() error = %v", err)
+	}
+	doc, ok := resolved.Get("governance-skill")
+	if !ok {
+		t.Fatalf("governance skill was not resolved")
+	}
+	readTool, ok := findSkillTool(*doc, "file.read")
+	if !ok {
+		t.Fatalf("file.read tool not found")
+	}
+	if readTool.Governance == nil {
+		t.Fatalf("file.read governance manifest missing")
+	}
+	if readTool.Governance.ToolID != "file.read" {
+		t.Fatalf("file.read tool_id = %q", readTool.Governance.ToolID)
+	}
+	if readTool.Governance.SkillID != "governance-skill" {
+		t.Fatalf("file.read skill_id = %q", readTool.Governance.SkillID)
+	}
+	if readTool.Governance.Effect != toolgovernance.EffectRead || readTool.Governance.AssetType != "file" || readTool.Governance.RiskLevel != toolgovernance.RiskLevelLow {
+		t.Fatalf("file.read governance not normalized: %#v", readTool.Governance)
+	}
+
+	deleteTool, ok := findSkillTool(*doc, "file.delete")
+	if !ok {
+		t.Fatalf("file.delete tool not found")
+	}
+	if deleteTool.Governance == nil {
+		t.Fatalf("file.delete governance manifest missing")
+	}
+	if deleteTool.Governance.ToolID != "files.delete" {
+		t.Fatalf("file.delete tool_id = %q", deleteTool.Governance.ToolID)
+	}
+	if deleteTool.Governance.DefaultApprovalPolicy != toolgovernance.ApprovalPolicyAlwaysAsk {
+		t.Fatalf("file.delete approval policy = %q", deleteTool.Governance.DefaultApprovalPolicy)
+	}
+	if got := deleteTool.Governance.AllowedPermissionTiers; len(got) != 2 || got[0] != toolgovernance.PermissionTierAdvanced || got[1] != toolgovernance.PermissionTierFull {
+		t.Fatalf("file.delete allowed tiers = %#v", got)
+	}
+}
+
+func TestSystemSkillToolGovernanceManifestFailsClosedOnInvalidFrontmatter(t *testing.T) {
+	tests := []struct {
+		name      string
+		fragment  string
+		wantField string
+	}{
+		{
+			name: "invalid risk",
+			fragment: `risk_level: hgh
+    default_approval_policy: auto_by_permission_tier
+    allowed_permission_tiers:
+      - basic`,
+			wantField: "risk_level",
+		},
+		{
+			name: "invalid approval policy",
+			fragment: `risk_level: low
+    default_approval_policy: always
+    allowed_permission_tiers:
+      - basic`,
+			wantField: "default_approval_policy",
+		},
+		{
+			name: "invalid allowed tier",
+			fragment: `risk_level: low
+    default_approval_policy: auto_by_permission_tier
+    allowed_permission_tiers:
+      - superuser`,
+			wantField: "allowed_permission_tiers",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			catalog := t.TempDir()
+			root := filepath.Join(catalog, "bad-governance")
+			if err := os.MkdirAll(root, 0o755); err != nil {
+				t.Fatalf("MkdirAll() error = %v", err)
+			}
+			skill := `---
+name: bad-governance
+description: governance test skill
+when_to_use: verify governance manifest validation
+provider_type: builtin
+provider_id: files
+tools:
+  - read_file
+runtime_type: tool
+tool_governance:
+  read_file:
+    tool_id: file.read
+    skill_id: bad-governance
+    domain: files
+    effect: read
+    asset_type: file
+    requires_asset_resolution: true
+    permission_scopes:
+      - file:read
+    ` + tt.fragment + `
+    audit_required: true
+    idempotency_required: false
+---
+Use governed tools.
+`
+			if err := os.WriteFile(filepath.Join(root, "SKILL.md"), []byte(skill), 0o644); err != nil {
+				t.Fatalf("WriteFile() error = %v", err)
+			}
+			runtime := NewRuntimeWithCatalog(nil, nil, catalog)
+			_, err := runtime.ResolveEnabledSkills(context.Background(), []string{"bad-governance"})
+			if err == nil {
+				t.Fatalf("ResolveEnabledSkills() error = nil, want invalid governance manifest")
+			}
+			message := err.Error()
+			for _, want := range []string{"bad-governance", "read_file", tt.wantField} {
+				if !strings.Contains(message, want) {
+					t.Fatalf("ResolveEnabledSkills() error = %q, want %q", message, want)
+				}
+			}
+		})
+	}
+}
+
+func toolNames(tools []SkillToolDefinition) []string {
+	out := make([]string, 0, len(tools))
+	for _, tool := range tools {
+		out = append(out, tool.Name)
+	}
+	return out
+}
+
+func findMetaTool(metaTools []llmadapter.Tool, name string) *llmadapter.Tool {
+	for idx := range metaTools {
+		if metaTools[idx].Function.Name == name {
+			return &metaTools[idx]
+		}
+	}
+	return nil
+}
+
+func findSchemaWithRequired(schemas []interface{}, required string) map[string]interface{} {
+	for _, raw := range schemas {
+		schema, ok := raw.(map[string]interface{})
+		if !ok {
+			continue
+		}
+		if hasRequired(schema, required) {
+			return schema
+		}
+	}
+	return nil
+}
+
+func argumentSchemasFromPairBranches(parameters map[string]interface{}) []interface{} {
+	branches, _ := parameters["oneOf"].([]interface{})
+	result := make([]interface{}, 0, len(branches))
+	for _, rawBranch := range branches {
+		branch, _ := rawBranch.(map[string]interface{})
+		properties, _ := branch["properties"].(map[string]interface{})
+		arguments, _ := properties["arguments"].(map[string]interface{})
+		if len(arguments) > 0 {
+			result = append(result, arguments)
+		}
+	}
+	return result
+}
+
+func branchAllowsLabelOnlyBands(branch map[string]interface{}) bool {
+	properties, ok := branch["properties"].(map[string]interface{})
+	if !ok {
+		return false
+	}
+	bands, ok := properties["bands"].(map[string]interface{})
+	if !ok {
+		return false
+	}
+	items, ok := bands["items"].(map[string]interface{})
+	if !ok {
+		return false
+	}
+	required, ok := items["required"].([]string)
+	if !ok {
+		values, ok := items["required"].([]interface{})
+		if !ok {
+			return true
+		}
+		required = make([]string, 0, len(values))
+		for _, value := range values {
+			text, _ := value.(string)
+			if text != "" {
+				required = append(required, text)
+			}
+		}
+	}
+	return len(required) == 1 && required[0] == "label"
+}
+
+func hasReference(references []SkillReference, path string) bool {
+	for _, reference := range references {
+		if reference.Path == path {
+			return true
+		}
+	}
+	return false
+}
+
+func hasRequired(schema map[string]interface{}, required string) bool {
+	values, ok := schema["required"].([]string)
+	if ok {
+		for _, value := range values {
+			if value == required {
+				return true
+			}
+		}
+	}
+	rawValues, ok := schema["required"].([]interface{})
+	if ok {
+		for _, value := range rawValues {
+			if value == required {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+func schemaEnumContains(schema map[string]interface{}, want string) bool {
+	values, ok := schema["enum"].([]string)
+	if ok {
+		for _, value := range values {
+			if value == want {
+				return true
+			}
+		}
+	}
+	rawValues, ok := schema["enum"].([]interface{})
+	if ok {
+		for _, value := range rawValues {
+			if value == want {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+func hasAnyOfRequired(schema map[string]interface{}, required string) bool {
+	rawBranches, ok := schema["anyOf"].([]interface{})
+	if !ok {
+		return false
+	}
+	for _, rawBranch := range rawBranches {
+		branch, ok := rawBranch.(map[string]interface{})
+		if !ok {
+			continue
+		}
+		if hasRequired(branch, required) {
+			return true
+		}
+	}
+	return false
+}
+
+func sameStrings(left []string, right []string) bool {
+	if len(left) != len(right) {
+		return false
+	}
+	counts := map[string]int{}
+	for _, item := range left {
+		counts[item]++
+	}
+	for _, item := range right {
+		counts[item]--
+		if counts[item] < 0 {
+			return false
+		}
+	}
+	return true
+}

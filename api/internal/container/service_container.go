@@ -1,0 +1,1793 @@
+package container
+
+import (
+	"context"
+	"fmt"
+	"strings"
+	"sync"
+	"time"
+
+	"github.com/google/uuid"
+	"github.com/hibiken/asynq"
+	"github.com/webb-chen/AgentSystem/api/config"
+	shortlinkcap "github.com/webb-chen/AgentSystem/api/internal/capabilities/shortlink"
+	"github.com/webb-chen/AgentSystem/api/internal/contracts"
+	"github.com/webb-chen/AgentSystem/api/internal/infra/platform"
+	"github.com/webb-chen/AgentSystem/api/internal/infra/platform/console"
+	"github.com/webb-chen/AgentSystem/api/internal/modules/agentmemory"
+	"github.com/webb-chen/AgentSystem/api/internal/modules/app/workflow/diagnosis"
+	workflow_file "github.com/webb-chen/AgentSystem/api/internal/modules/app/workflow/file"
+	"github.com/webb-chen/AgentSystem/api/internal/modules/app/workflow/graph_engine"
+	workflowruntime "github.com/webb-chen/AgentSystem/api/internal/modules/app/workflow/runtime"
+	"github.com/webb-chen/AgentSystem/api/internal/modules/app/workflow/tool_file"
+	workflowtest "github.com/webb-chen/AgentSystem/api/internal/modules/app/workflowtest"
+	automationaction "github.com/webb-chen/AgentSystem/api/internal/modules/automation/service/action"
+	automationdefinition "github.com/webb-chen/AgentSystem/api/internal/modules/automation/service/definition"
+	contentparsemodule "github.com/webb-chen/AgentSystem/api/internal/modules/contentparse"
+	datalibrarymodule "github.com/webb-chen/AgentSystem/api/internal/modules/datalibrary"
+	"github.com/webb-chen/AgentSystem/api/internal/modules/dataset/graphflow"
+	dataset_repo "github.com/webb-chen/AgentSystem/api/internal/modules/dataset/repository"
+	dataset_service "github.com/webb-chen/AgentSystem/api/internal/modules/dataset/service"
+	"github.com/webb-chen/AgentSystem/api/internal/modules/datasource/repository"
+	"github.com/webb-chen/AgentSystem/api/internal/modules/datasource/service"
+	file_repo "github.com/webb-chen/AgentSystem/api/internal/modules/file_process/repository"
+	file_service "github.com/webb-chen/AgentSystem/api/internal/modules/file_process/service"
+	"github.com/webb-chen/AgentSystem/api/internal/modules/file_process/service/extractor"
+	"github.com/webb-chen/AgentSystem/api/internal/modules/integrations"
+	dingtalk_integration "github.com/webb-chen/AgentSystem/api/internal/modules/integrations/adapters/dingtalk"
+	exa_integration "github.com/webb-chen/AgentSystem/api/internal/modules/integrations/adapters/exa"
+	feishu_integration "github.com/webb-chen/AgentSystem/api/internal/modules/integrations/adapters/feishu"
+	github_integration "github.com/webb-chen/AgentSystem/api/internal/modules/integrations/adapters/github"
+	gmail_integration "github.com/webb-chen/AgentSystem/api/internal/modules/integrations/adapters/gmail"
+	mail_integration "github.com/webb-chen/AgentSystem/api/internal/modules/integrations/adapters/mail"
+	wecom_integration "github.com/webb-chen/AgentSystem/api/internal/modules/integrations/adapters/wecom"
+	x_integration "github.com/webb-chen/AgentSystem/api/internal/modules/integrations/adapters/x"
+	integration_metatools "github.com/webb-chen/AgentSystem/api/internal/modules/integrations/metatools"
+	integration_tools "github.com/webb-chen/AgentSystem/api/internal/modules/integrations/toolprovider"
+	notificationsms "github.com/webb-chen/AgentSystem/api/internal/modules/notification/sms"
+	pluginrunner_client "github.com/webb-chen/AgentSystem/api/internal/modules/pluginrunner/client"
+	pluginrunner_repo "github.com/webb-chen/AgentSystem/api/internal/modules/pluginrunner/repository"
+	pluginrunner_service "github.com/webb-chen/AgentSystem/api/internal/modules/pluginrunner/service"
+	promptsmodule "github.com/webb-chen/AgentSystem/api/internal/modules/prompts"
+	promptservice "github.com/webb-chen/AgentSystem/api/internal/modules/prompts/service"
+	"github.com/webb-chen/AgentSystem/api/internal/modules/shared/adapters"
+	interfaces "github.com/webb-chen/AgentSystem/api/internal/modules/shared/interface"
+	system_repo "github.com/webb-chen/AgentSystem/api/internal/modules/system/repository"
+	system_service "github.com/webb-chen/AgentSystem/api/internal/modules/system/service"
+	"github.com/webb-chen/AgentSystem/api/internal/modules/tools"
+	auth_repo "github.com/webb-chen/AgentSystem/api/internal/modules/user/auth/repository"
+	auth_service "github.com/webb-chen/AgentSystem/api/internal/modules/user/auth/service"
+	workspace_repo "github.com/webb-chen/AgentSystem/api/internal/modules/workspace/repository"
+	workspace_service "github.com/webb-chen/AgentSystem/api/internal/modules/workspace/service"
+
+	// Shared services
+	shared_service "github.com/webb-chen/AgentSystem/api/internal/modules/shared/service"
+
+	// Quota management
+	quota_repo "github.com/webb-chen/AgentSystem/api/internal/modules/quota/repository"
+	quota_service "github.com/webb-chen/AgentSystem/api/internal/modules/quota/service"
+
+	// Payment services
+	payment_service "github.com/webb-chen/AgentSystem/api/internal/modules/payment/service"
+
+	// Provider/model management
+	apikeyrepo "github.com/webb-chen/AgentSystem/api/internal/modules/llm/apikey/repository"
+	channelsvc "github.com/webb-chen/AgentSystem/api/internal/modules/llm/channel/service"
+	llm_client "github.com/webb-chen/AgentSystem/api/internal/modules/llm/client"
+	llmdefaultmodel "github.com/webb-chen/AgentSystem/api/internal/modules/llm/defaultmodel"
+	llmdefaultsvc "github.com/webb-chen/AgentSystem/api/internal/modules/llm/defaultmodel/service"
+	"github.com/webb-chen/AgentSystem/api/internal/modules/llm/gateway"
+	llmmodel "github.com/webb-chen/AgentSystem/api/internal/modules/llm/llmmodel"
+	adapter "github.com/webb-chen/AgentSystem/api/internal/modules/llm/protocol/adapters"
+	"github.com/webb-chen/AgentSystem/api/internal/modules/memory"
+	musicmodule "github.com/webb-chen/AgentSystem/api/internal/modules/music"
+	database_tools "github.com/webb-chen/AgentSystem/api/internal/modules/tools/builtin/database"
+	filegenerator_tools "github.com/webb-chen/AgentSystem/api/internal/modules/tools/builtin/filegenerator"
+	files_tools "github.com/webb-chen/AgentSystem/api/internal/modules/tools/builtin/files"
+	imagegenerator_tools "github.com/webb-chen/AgentSystem/api/internal/modules/tools/builtin/imagegenerator"
+	knowledge_tools "github.com/webb-chen/AgentSystem/api/internal/modules/tools/builtin/knowledge"
+	workflow_tools "github.com/webb-chen/AgentSystem/api/internal/modules/tools/builtin/workflow"
+	helper "github.com/webb-chen/AgentSystem/api/internal/util"
+	"github.com/webb-chen/AgentSystem/api/pkg/logger"
+	"github.com/webb-chen/AgentSystem/api/pkg/queue"
+	redisPkg "github.com/webb-chen/AgentSystem/api/pkg/redis"
+	"github.com/webb-chen/AgentSystem/api/pkg/scheduler"
+	"github.com/webb-chen/AgentSystem/api/pkg/sql_base"
+	"github.com/webb-chen/AgentSystem/api/pkg/sql_base/audit"
+	"github.com/webb-chen/AgentSystem/api/pkg/sql_base/guard"
+	"github.com/webb-chen/AgentSystem/api/pkg/storage"
+	"gorm.io/gorm"
+)
+
+// TaskHandlerRegistrar is a centralized registry for task handlers
+type TaskHandlerRegistrar struct {
+	mu       sync.RWMutex
+	handlers map[string]func(context.Context, *asynq.Task) error
+}
+
+// NewTaskHandlerRegistrar creates a new task handler registrar
+func NewTaskHandlerRegistrar() *TaskHandlerRegistrar {
+	return &TaskHandlerRegistrar{
+		handlers: make(map[string]func(context.Context, *asynq.Task) error),
+	}
+}
+
+// Register registers a task handler for a specific task type
+// Returns true if the handler was newly registered, false if it replaced an existing handler
+func (r *TaskHandlerRegistrar) Register(taskType string, handler func(context.Context, *asynq.Task) error) bool {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+
+	// Check if handler already exists
+	_, exists := r.handlers[taskType]
+	r.handlers[taskType] = handler
+
+	// Return true if it's a new registration, false if it replaced an existing one
+	return !exists
+}
+
+// RegisterAll registers all handlers to the given mux
+func (r *TaskHandlerRegistrar) RegisterAll(mux *asynq.ServeMux) {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	for taskType, handler := range r.handlers {
+		mux.HandleFunc(taskType, func(ctx context.Context, task *asynq.Task) error {
+			return handler(logger.WithTaskContext(ctx, task), task)
+		})
+	}
+}
+
+type SimpleEventBus struct{}
+
+func (e *SimpleEventBus) Publish(ctx context.Context, topic string, payload interface{}) error {
+	return nil
+}
+
+type ServiceContainer struct {
+	db       *gorm.DB
+	tokenMgr *helper.TokenManager
+	config   *config.Config
+
+	// Repositories
+	workspaceRepo       workspace_repo.WorkspaceRepository
+	workspaceMemberRepo workspace_repo.WorkspaceMemberRepository
+
+	accountServiceImpl *auth_service.AccountService
+	tenantServiceImpl  *workspace_service.WorkspaceManagementServiceImpl
+
+	accountService       interfaces.AccountService
+	tenantService        interfaces.WorkspaceManagementService
+	accountTenantService *auth_service.AccountTenantService
+
+	// Service Adapters
+	accountServiceAdapter interfaces.AccountService
+	tenantServiceAdapter  interfaces.WorkspaceManagementService
+
+	organizationManagementService interfaces.OrganizationManagementService
+	organizationService           interfaces.OrganizationService
+	officialRouteBootstrapper     interfaces.OfficialRouteBootstrapper
+	bootstrapService              *system_service.BootstrapService
+	datasetService                dataset_service.DatasetService
+	pluginRunnerService           pluginrunner_service.PluginRunnerService
+	accountInstallationService    pluginrunner_service.AccountInstallationService
+	memberSubscriptionService     pluginrunner_service.MemberSubscriptionService
+	billingService                interfaces.BillingService
+	registerService               interfaces.RegisterService
+	fileService                   interfaces.FileService
+	fileFolderService             file_service.FileFolderService
+	contentExtractor              workflow_file.ContentExtractor
+	contentParseService           contracts.ContentParseService
+	contentParseModule            *contentparsemodule.Module
+
+	// DataSource service
+	dataSourceService service.DataSourceService
+	sqlAuditRecorder  audit.Recorder
+	sqlBase           sql_base.SQLBase
+	promptModule      *promptsmodule.Module
+
+	// Data Library module
+	dataLibraryModule *datalibrarymodule.Module
+
+	// Tenant permission filter service
+	tenantPermissionFilterService workspace_service.WorkspacePermissionFilterService
+
+	departmentService workspace_service.DepartmentService
+
+	// Permission services
+	authorizationService      interfaces.AuthorizationService
+	resourcePermissionService interfaces.ResourcePermissionService
+
+	// Task management
+	taskManager         *queue.TaskManager
+	taskHandlerRegistry *TaskHandlerRegistrar
+
+	// Scheduler
+	scheduler                *scheduler.Scheduler
+	schedulerTasksRegistered bool
+
+	// LLM repositories (lazy-loaded)
+	llmAPIKeyRepo apikeyrepo.APIKeyRepository
+
+	// LLM services (lazy-loaded)
+	llmClient         llm_client.LLMClient
+	llmClientInitOnce sync.Once
+	llmClientInitErr  error
+
+	// Quota service
+	quotaService interfaces.QuotaService
+
+	// Payment services
+	paymentServices *payment_service.PaymentServices
+
+	// Tool manager for builtin and plugin runner tools
+	toolManager *tools.ToolManager
+
+	// Tool engine
+	toolEngine *tools.ToolEngine
+
+	// External integrations
+	integrationRegistry             *integrations.Registry
+	integrationExecutor             *integrations.Executor
+	integrationExecutionRepo        *integrations.GormExecutionRepository
+	integrationOperationReceiptRepo *integrations.GormOperationReceiptRepository
+	integrationConnectionRepo       *integrations.GormConnectionRepository
+	integrationCredentialCipher     integrations.CredentialCipher
+	integrationConnectionResolver   *integrations.DefaultConnectionResolver
+	integrationRuntimeResolver      integrations.ConnectionResolver
+	integrationConnectionService    *integrations.DefaultConnectionService
+	integrationConnectionTester     *integrations.AuditedConnectionTester
+	integrationConnectionGrantRepo  *integrations.GormConnectionGrantRepository
+	integrationConnectionAccess     *integrations.DefaultConnectionAccessService
+	integrationAIChatPreferenceRepo *integrations.GormAIChatIntegrationPreferenceRepository
+	integrationAIChatPreferences    *integrations.DefaultAIChatIntegrationPreferenceService
+	integrationActionProjections    *integration_metatools.ActionProjectionService
+	integrationConnectionHealthRepo *integrations.GormConnectionHealthRepository
+	integrationConnectionHealth     *integrations.DefaultConnectionHealthService
+	integrationActionPolicyRepo     *integrations.GormActionPolicyRepository
+	integrationActionPolicy         *integrations.DefaultActionPolicyService
+	integrationDailyQuota           integrations.DailyQuota
+	integrationOAuthClientRepo      *integrations.GormOAuthClientConfigRepository
+	integrationOAuthClients         *integrations.OAuthClientConfigService
+	integrationOAuthStateRepo       *integrations.GormOAuthStateRepository
+	integrationOAuthStates          *integrations.OAuthStateService
+	integrationOAuthFlowRepo        *integrations.GormOAuthFlowRepository
+	integrationOAuthFlows           *integrations.OAuthFlowService
+	integrationOAuthRevoker         *integrations.OAuthConnectionRevoker
+	integrationOAuthRecoveryOutbox  *integrations.SplitOAuthRecoveryOutbox
+	integrationOAuthRecovery        *integrations.OAuthRecoveryService
+
+	// Account memory
+	memoryService      *memory.Service
+	agentMemoryService *agentmemory.Service
+
+	// Knowledge retrieval for builtin knowledge tools
+	knowledgeRetrievalService *dataset_service.KnowledgeRetrievalService
+
+	// Platform container
+	platformContainer *platform.Container
+
+	// Default model service
+	defaultModelModule  *llmdefaultmodel.Module
+	defaultModelService llmdefaultsvc.DefaultModelService
+
+	// GraphFlow service
+	graphFlowService       *graphflow.Service
+	graphLifecycleService  *graphflow.LifecycleService
+	graphVisibilityService *graphflow.VisibilityService
+	graphRuntimeHealth     *system_service.GraphRuntimeHealthService
+
+	// Automation definition service
+	automationDefinitionService automationdefinition.Service
+	automationWorkflowRunner    automationaction.AutomationWorkflowRunner
+	notificationSMSService      notificationsms.Service
+	shortLinkService            shortlinkcap.Service
+
+	// Workflow engine factory
+	workflowEngineFactory *graph_engine.EngineFactory
+	workflowTestService   *workflowtest.Service
+
+	// Workflow Diagnoser
+	workflowDiagnoser *diagnosis.Diagnoser
+}
+
+func (c *ServiceContainer) GetEnterpriseGroupService() interfaces.OrganizationManagementService {
+	if c.organizationManagementService == nil {
+		var cp console.ConsoleProvider
+		if c.platformContainer != nil {
+			cp = c.platformContainer.Console
+		}
+		c.organizationManagementService = workspace_service.NewOrganizationManagementService(c.db, cp)
+	}
+	return c.organizationManagementService
+}
+
+func (c *ServiceContainer) GetBillingService() interfaces.BillingService {
+	if c.billingService == nil {
+		c.billingService = auth_service.NewBillingService()
+	}
+	return c.billingService
+}
+
+func (c *ServiceContainer) GetPaymentServices() *payment_service.PaymentServices {
+	if c.paymentServices == nil {
+		c.paymentServices = payment_service.NewPaymentServices(c.db)
+	}
+	return c.paymentServices
+}
+
+func (c *ServiceContainer) GetDB() *gorm.DB {
+	return c.db
+}
+
+func (c *ServiceContainer) GetTaskManager() *queue.TaskManager {
+	if c.taskManager == nil {
+		taskManager, err := queue.NewTaskManager(c.config)
+		if err != nil {
+			panic("failed to create task manager: " + err.Error())
+		}
+		c.taskManager = taskManager
+	}
+	return c.taskManager
+}
+
+func (c *ServiceContainer) GetTaskHandlerRegistry() *TaskHandlerRegistrar {
+	if c.taskHandlerRegistry == nil {
+		c.taskHandlerRegistry = NewTaskHandlerRegistrar()
+	}
+	return c.taskHandlerRegistry
+}
+
+func (c *ServiceContainer) GetWorkflowTestService() *workflowtest.Service {
+	if c.workflowTestService == nil {
+		c.workflowTestService = workflowtest.NewService(workflowtest.NewRepository(c.db))
+		c.workflowTestService.SetFileService(c.GetFileService())
+	}
+	return c.workflowTestService
+}
+
+func (c *ServiceContainer) GetTenantService() interfaces.WorkspaceManagementService {
+	if c.tenantService == nil {
+		c.tenantService = workspace_service.NewWorkspaceManagementService(
+			c.db,
+			c.workspaceRepo,
+			c.workspaceMemberRepo,
+			nil, // accountService will be set later via SetAccountService
+			c.GetQuotaService(),
+			nil, // enterpriseService will be set later to avoid circular dependency
+		)
+	}
+	return c.tenantService
+}
+
+func (c *ServiceContainer) GetAccountServiceImpl() *auth_service.AccountService {
+	if c.accountServiceImpl == nil {
+		accountRepo := auth_repo.NewAccountRepository(c.db)
+
+		c.accountServiceImpl = auth_service.NewAccountService(
+			accountRepo,
+			c.db,
+			c.tokenMgr,
+			c.GetTenantService(),
+			c.GetBillingService(),
+			nil,
+			c.GetEnterpriseGroupService(),
+			nil,
+			system_service.NewSystemConfigService(),
+			&SimpleEventBus{},
+			c.GetConsoleProvider(),
+		)
+		c.accountServiceImpl.SetRegistrationSetupScopeResolver(c.GetBootstrapService())
+		c.accountServiceImpl.SetOfficialRouteBootstrapper(c.GetOfficialRouteBootstrapper())
+	}
+	return c.accountServiceImpl
+}
+
+func (c *ServiceContainer) GetAccountServiceAdapter() interfaces.AccountService {
+	if c.accountServiceAdapter == nil {
+		c.accountServiceAdapter = adapters.NewAccountServiceAdapter(c.GetAccountServiceImpl(), nil)
+	}
+	return c.accountServiceAdapter
+}
+
+func (c *ServiceContainer) GetAccountService() interfaces.AccountService {
+	if c.accountService == nil {
+		accountServiceImpl := c.GetAccountServiceImpl()
+		c.accountService = adapters.NewAccountServiceAdapter(accountServiceImpl, nil)
+	}
+	return c.accountService
+}
+
+func (c *ServiceContainer) GetWorkspacePermissionFilterService() workspace_service.WorkspacePermissionFilterService {
+	if c.tenantPermissionFilterService == nil {
+		enterpriseRepo := workspace_repo.NewOrganizationRepository(c.db)
+		c.tenantPermissionFilterService = workspace_service.NewWorkspacePermissionFilterService(
+			enterpriseRepo,
+			c.workspaceRepo,
+			c.workspaceMemberRepo,
+		)
+	}
+	return c.tenantPermissionFilterService
+}
+
+func (c *ServiceContainer) GetDepartmentService() workspace_service.DepartmentService {
+	if c.departmentService == nil {
+		enterpriseRepo := workspace_repo.NewOrganizationRepository(c.db)
+		deptRepo := workspace_repo.NewDepartmentRepository(c.db)
+		c.departmentService = workspace_service.NewDepartmentService(deptRepo, enterpriseRepo)
+	}
+	return c.departmentService
+}
+
+func (c *ServiceContainer) InitializeDependencies() {
+	c.initializeCoreServices()
+	c.wireAccountDependencies()
+	c.wireWorkspaceDependencies()
+	c.initializeWorkflowFileDependencies()
+}
+
+func (c *ServiceContainer) initializeCoreServices() {
+	_ = c.GetQuotaService()
+	_ = c.GetTenantService()
+	_ = c.GetAccountServiceImpl()
+	_ = c.GetOrganizationService()
+}
+
+func (c *ServiceContainer) wireAccountDependencies() {
+	accountServiceImpl := c.GetAccountServiceImpl()
+	if accountServiceImpl != nil {
+		accountServiceImpl.SetRegisterService(c.GetRegisterService())
+		accountServiceImpl.SetOrganizationService(c.GetOrganizationService())
+	}
+
+	c.wireRegisterServiceForAccountAdapter(c.GetAccountService())
+	c.wireRegisterServiceForAccountAdapter(c.GetAccountServiceAdapter())
+}
+
+func (c *ServiceContainer) wireWorkspaceDependencies() {
+	if c.tenantService == nil {
+		return
+	}
+
+	tenantServiceImpl, ok := c.tenantService.(*workspace_service.WorkspaceManagementServiceImpl)
+	if !ok {
+		return
+	}
+
+	tenantServiceImpl.SetAccountService(c.GetAccountServiceAdapter())
+	// Set enterprise service after initialization to break circular dependency.
+	tenantServiceImpl.SetOrganizationService(c.GetOrganizationService())
+}
+
+func (c *ServiceContainer) wireRegisterServiceForAccountAdapter(accountService interfaces.AccountService) {
+	if adapter, ok := accountService.(*adapters.AccountServiceAdapter); ok {
+		adapter.SetRegisterService(c.GetRegisterService())
+	}
+}
+
+func (c *ServiceContainer) initializeWorkflowFileDependencies() {
+	// Rebuild FileService after quota and organization dependencies have been wired.
+	c.fileService = nil
+	fileService := c.GetFileService()
+
+	storageClient := storage.GetStorage()
+	extractProcessor := extractor.NewExtractProcessor(storageClient)
+	workflow_file.InitGlobalContentExtractor(
+		fileService,
+		extractProcessor,
+		workflow_file.WithContentParseService(c.GetContentParseService()),
+	)
+}
+
+func (c *ServiceContainer) GetRegisterService() interfaces.RegisterService {
+	if c.registerService == nil {
+		accountRepo := auth_repo.NewAccountRepository(c.db)
+		invitationRepo := auth_repo.NewInvitationRepository(c.db)
+
+		registerService := auth_service.NewRegisterService(
+			c.db,
+			accountRepo,
+			invitationRepo,
+			c.GetTenantService(),
+			c.GetEnterpriseGroupService(),
+			c.tokenMgr,
+			c.GetBillingService(),
+		)
+		registerService.SetOfficialRouteBootstrapper(c.GetOfficialRouteBootstrapper())
+		c.registerService = registerService
+	}
+	return c.registerService
+}
+
+func (c *ServiceContainer) GetTenantServiceAdapter() interfaces.WorkspaceManagementService {
+	if c.tenantServiceAdapter == nil {
+		tenantService := c.GetTenantService()
+		if tenantServiceImpl, ok := tenantService.(*workspace_service.WorkspaceManagementServiceImpl); ok {
+			c.tenantServiceAdapter = adapters.NewTenantServiceAdapter(tenantServiceImpl)
+		}
+	}
+	return c.tenantServiceAdapter
+}
+
+func (c *ServiceContainer) GetAccountTenantService() *auth_service.AccountTenantService {
+	if c.accountTenantService == nil {
+		accountRepo := auth_repo.NewAccountRepository(c.db)
+		c.accountTenantService = auth_service.NewAccountTenantService(
+			accountRepo,
+			c.GetTenantService(),
+		)
+	}
+	return c.accountTenantService
+}
+
+func NewServiceContainer(
+	db *gorm.DB,
+	tokenMgr *helper.TokenManager,
+	cfg *config.Config,
+	workspaceRepo workspace_repo.WorkspaceRepository,
+	workspaceMemberRepo workspace_repo.WorkspaceMemberRepository,
+	platformContainer *platform.Container,
+) *ServiceContainer {
+	storageClient := storage.GetStorage()
+	tool_file.InitToolFileManager(db, storageClient)
+	tool_file.InitFileSignature(cfg)
+
+	return &ServiceContainer{
+		db:                  db,
+		tokenMgr:            tokenMgr,
+		config:              cfg,
+		workspaceRepo:       workspaceRepo,
+		workspaceMemberRepo: workspaceMemberRepo,
+		platformContainer:   platformContainer,
+	}
+}
+
+func (c *ServiceContainer) GetOrganizationService() interfaces.OrganizationService {
+	if c.organizationService == nil {
+		organizationRepo := workspace_repo.NewOrganizationRepository(c.db)
+		systemConfigService := system_service.NewSystemConfigService()
+		featureService := system_service.NewFeatureService()
+
+		c.organizationService = workspace_service.NewOrganizationService(
+			organizationRepo,
+			c.GetAccountService(),
+			c.workspaceRepo,
+			c.GetTenantService(),
+			featureService,
+			systemConfigService,
+			c.GetDatasetService(),
+			c.db,
+			c.getConsoleProvider(),
+			c.GetOfficialRouteBootstrapper(),
+		)
+		c.GetDatasetService().SetOrganizationService(c.organizationService)
+	}
+	return c.organizationService
+}
+
+func (c *ServiceContainer) GetOfficialRouteBootstrapper() interfaces.OfficialRouteBootstrapper {
+	if c.officialRouteBootstrapper == nil {
+		c.officialRouteBootstrapper = channelsvc.NewOfficialRouteBootstrapper(c.db, c.getConsoleProvider())
+	}
+	return c.officialRouteBootstrapper
+}
+
+func (c *ServiceContainer) GetBootstrapService() *system_service.BootstrapService {
+	if c.bootstrapService == nil {
+		setupRepo := system_repo.NewSetupRepository(c.db)
+		lockRepo := system_repo.NewBootstrapLockRepository(c.db)
+		accountRepo := auth_repo.NewAccountRepository(c.db)
+
+		c.bootstrapService = system_service.NewBootstrapService(
+			setupRepo,
+			lockRepo,
+			accountRepo,
+			c.db,
+			c.GetTenantService(),
+			c.GetEnterpriseGroupService(),
+			system_service.NewSystemConfigService(),
+			func(ctx context.Context, tx *gorm.DB, accountID, organizationID string) error {
+				_, err := auth_service.EnqueueRegistrationProvisioningOutbox(ctx, tx, accountID, organizationID)
+				return err
+			},
+		)
+	}
+
+	return c.bootstrapService
+}
+
+func (c *ServiceContainer) getConsoleProvider() console.ConsoleProvider {
+	if c.platformContainer == nil {
+		return nil
+	}
+	return c.platformContainer.Console
+}
+
+func (c *ServiceContainer) GetDatasetService() dataset_service.DatasetService {
+	if c.datasetService == nil {
+		datasetRepo := dataset_repo.NewDatasetRepository(c.db)
+		documentRepo := dataset_repo.NewDocumentRepository(c.db)
+		chunkRepo := dataset_repo.NewChunkRepository(c.db)
+
+		tenantService := c.GetTenantService()
+		storageInstance := storage.GetStorage()
+		quotaService := c.GetQuotaService()
+		llmClient := c.GetLLMClient()
+
+		c.datasetService = dataset_service.NewDatasetService(
+			datasetRepo,
+			documentRepo,
+			chunkRepo,
+			tenantService,
+			nil,
+			nil,
+			nil,
+			nil,
+			storageInstance,
+			c.db,
+			quotaService,
+			nil,
+			llmClient,
+			c.GetTaskManager(),
+		)
+		if c.organizationService != nil {
+			c.datasetService.SetOrganizationService(c.organizationService)
+		}
+	}
+	return c.datasetService
+}
+
+func (c *ServiceContainer) GetFileService() interfaces.FileService {
+	if c.fileService == nil {
+		fileRepo := file_repo.NewFileRepository(c.db)
+		storageClient := storage.GetStorage()
+		quotaService := c.GetQuotaService()
+		logger.Info("GetFileService: quotaService is nil?", "is_nil", quotaService == nil)
+		enterpriseService := c.GetOrganizationService()
+		logger.Info("GetFileService: enterpriseService is nil?", "is_nil", enterpriseService == nil)
+		c.fileService = file_service.NewFileServiceWithVision(fileRepo, storageClient, c.db, quotaService, enterpriseService, c.GetLLMClient(), c.GetDefaultModelService())
+	}
+	return c.fileService
+}
+
+func (c *ServiceContainer) GetFileFolderService() file_service.FileFolderService {
+	if c.fileFolderService == nil {
+		fileFolderRepo := file_repo.NewFileFolderRepository(c.db)
+		fileRepo := file_repo.NewFileRepository(c.db)
+		documentRepo := dataset_repo.NewDocumentRepository(c.db)
+		datasetRepo := dataset_repo.NewDatasetRepository(c.db)
+		c.fileFolderService = file_service.NewFileResourceService(fileFolderRepo, fileRepo, documentRepo, datasetRepo, c.GetAccountService())
+	}
+	return c.fileFolderService
+}
+
+func (c *ServiceContainer) GetContentParseService() contracts.ContentParseService {
+	if c.contentParseService == nil {
+		c.contentParseService = c.GetContentParseModule().ContentParseService
+	}
+	return c.contentParseService
+}
+
+func (c *ServiceContainer) GetContentParseModule() *contentparsemodule.Module {
+	if c.contentParseModule == nil {
+		c.contentParseModule = contentparsemodule.NewModule(
+			c.db,
+			contentparsemodule.WithAccountService(c.GetAccountService()),
+			contentparsemodule.WithOrganizationService(c.GetOrganizationService()),
+			contentparsemodule.WithSystemVisionModel(c.GetLLMClient(), c.GetDefaultModelService()),
+		)
+	}
+	return c.contentParseModule
+}
+
+func (c *ServiceContainer) GetContentExtractor() workflow_file.ContentExtractor {
+	if c.contentExtractor == nil {
+		// Get FileService dependency
+		fileService := c.GetFileService()
+
+		// Get storage instance
+		storageClient := storage.GetStorage()
+
+		// Create ExtractProcessor with storage
+		extractProcessor := extractor.NewExtractProcessor(storageClient)
+
+		// Get content extractor configuration
+		config := workflow_file.GetContentExtractorConfig()
+
+		// Create ContentExtractor with FileService, ExtractProcessor, and Config
+		c.contentExtractor = workflow_file.NewContentExtractor(
+			fileService,
+			extractProcessor,
+			config,
+			workflow_file.WithContentParseService(c.GetContentParseService()),
+		)
+	}
+	return c.contentExtractor
+}
+
+func (c *ServiceContainer) GetDataSourceService() service.DataSourceService {
+	if c.dataSourceService == nil {
+		dataSourceRepo := repository.NewPostgresDataSourceRepository(c.db)
+		tableRepo := repository.NewPostgresTableRepository(c.db)
+		promptRepo := repository.NewPostgresPromptRepository(c.db)
+		sqlOperationRepo := repository.NewPostgresSQLOperationRepository(c.db)
+		c.dataSourceService = service.NewDataSourceService(
+			dataSourceRepo,
+			tableRepo,
+			promptRepo,
+			sqlOperationRepo,
+			c.GetAccountService(),
+			c.GetFileService(),
+			c.GetOrganizationService(),
+			c.GetAuthorizationService(),
+			c.GetResourcePermissionService(),
+			c.GetQuotaService(),
+			c.GetLLMClient(),
+			c.GetDefaultModelService(),
+			c.db,
+			service.WithContentParseService(c.GetContentParseService()),
+		)
+	}
+
+	return c.dataSourceService
+}
+
+func (c *ServiceContainer) GetSQLAuditRecorder() audit.Recorder {
+	if c.sqlAuditRecorder == nil {
+		store := repository.NewPostgresSQLOperationRepository(c.db)
+		c.sqlAuditRecorder = audit.NewAsyncRecorder(store)
+	}
+	return c.sqlAuditRecorder
+}
+
+func (c *ServiceContainer) CloseSQLAuditRecorder(ctx context.Context) error {
+	if c == nil || c.sqlAuditRecorder == nil {
+		return nil
+	}
+	return c.sqlAuditRecorder.Close(ctx)
+}
+
+func (c *ServiceContainer) CloseDataSourceSQLAuditRecorder(ctx context.Context) error {
+	if c == nil || c.dataSourceService == nil {
+		return nil
+	}
+	closer, ok := c.dataSourceService.(interface {
+		Close(context.Context) error
+	})
+	if !ok {
+		return nil
+	}
+	return closer.Close(ctx)
+}
+
+func (c *ServiceContainer) GetSQLBase() sql_base.SQLBase {
+	if c.sqlBase == nil {
+		dataSourceRepo := repository.NewPostgresDataSourceRepository(c.db)
+		client, err := sql_base.NewSQLBaseClient(
+			sql_base.WithAuditRecorder(c.GetSQLAuditRecorder()),
+			sql_base.WithGuardPolicyProvider(func(ctx context.Context, dataSourceID string) (*guard.Policy, error) {
+				dataSource, err := dataSourceRepo.FindByID(ctx, dataSourceID)
+				if err != nil || dataSource == nil {
+					return nil, err
+				}
+				policy, err := guard.ParsePolicyJSON([]byte(dataSource.GuardPolicy))
+				if err != nil {
+					return nil, err
+				}
+				return &policy, nil
+			}),
+		)
+		if err != nil {
+			panic("failed to create sql base client: " + err.Error())
+		}
+		c.sqlBase = client
+	}
+	return c.sqlBase
+}
+
+func (c *ServiceContainer) GetDataLibraryModule() *datalibrarymodule.Module {
+	if c.dataLibraryModule == nil {
+		c.dataLibraryModule = datalibrarymodule.NewModuleWithContentParseModule(
+			c.db,
+			storage.GetStorage(),
+			c.GetContentParseModule(),
+			c.GetLLMClient(),
+			c.GetDefaultModelService(),
+		)
+	}
+	return c.dataLibraryModule
+}
+
+func (c *ServiceContainer) GetPromptService() promptservice.PromptService {
+	if c.promptModule == nil {
+		c.promptModule = promptsmodule.NewModule(
+			c.db,
+			c.GetAccountService(),
+			c.GetOrganizationService(),
+			c.GetLLMClient(),
+			c.GetDefaultModelService(),
+		)
+	}
+	return c.promptModule.PromptService
+}
+
+// LLM Repository Getters
+
+func (c *ServiceContainer) GetLLMAPIKeyRepository() apikeyrepo.APIKeyRepository {
+	if c.llmAPIKeyRepo == nil {
+		c.llmAPIKeyRepo = apikeyrepo.NewAPIKeyRepository(c.db)
+	}
+	return c.llmAPIKeyRepo
+}
+
+func (c *ServiceContainer) GetAuthorizationService() interfaces.AuthorizationService {
+	if c.authorizationService == nil {
+		c.authorizationService = shared_service.NewAuthorizationService(c.GetOrganizationService())
+	}
+	return c.authorizationService
+}
+
+func (c *ServiceContainer) GetResourcePermissionService() interfaces.ResourcePermissionService {
+	if c.resourcePermissionService == nil {
+		c.resourcePermissionService = shared_service.NewResourcePermissionService(c.GetAuthorizationService())
+	}
+	return c.resourcePermissionService
+}
+
+// GetScheduler returns the scheduler instance
+func (c *ServiceContainer) GetScheduler() *scheduler.Scheduler {
+	if c.scheduler == nil {
+		s, err := scheduler.NewScheduler(c.config)
+		if err != nil {
+			panic("failed to create scheduler: " + err.Error())
+		}
+		c.scheduler = s
+	}
+	return c.scheduler
+}
+
+// SetScheduler sets the scheduler instance
+func (c *ServiceContainer) SetScheduler(s *scheduler.Scheduler) {
+	c.scheduler = s
+}
+
+// StartScheduler starts the scheduler with all registered tasks
+// This should be called after all modules have registered their tasks
+func (c *ServiceContainer) StartScheduler() error {
+	if c.scheduler == nil {
+		return nil // No scheduler configured
+	}
+	return c.scheduler.Start()
+}
+
+// StopScheduler stops the scheduler
+func (c *ServiceContainer) StopScheduler() {
+	if c.scheduler != nil {
+		c.scheduler.Stop()
+	}
+}
+
+// GetLLMClient returns the LLM client for internal modules
+// This client can be used by workflows, knowledge base, and other internal modules
+// to access LLM capabilities without managing API keys manually.
+func (c *ServiceContainer) GetLLMClient() llm_client.LLMClient {
+	c.initLLMClient()
+	return c.llmClient
+}
+
+// GetMusicGenerator returns the model generation capability consumed by Music.
+func (c *ServiceContainer) GetMusicGenerator() musicmodule.Generator {
+	c.initLLMClient()
+	generator, ok := c.llmClient.(musicmodule.Generator)
+	if !ok {
+		panic("llm client does not support music generation")
+	}
+	return generator
+}
+
+// GetMusicLyricsGenerator returns the Console-backed structured lyrics capability.
+func (c *ServiceContainer) GetMusicLyricsGenerator() musicmodule.LyricsGenerator {
+	c.initLLMClient()
+	generator, ok := c.llmClient.(musicmodule.LyricsGenerator)
+	if !ok {
+		panic("llm client does not support lyrics generation")
+	}
+	return generator
+}
+
+// GetMusicDeliveryCompensator returns the billing resolution capability consumed by Music.
+func (c *ServiceContainer) GetMusicDeliveryCompensator() musicmodule.DeliveryCompensator {
+	c.initLLMClient()
+	compensator, ok := c.llmClient.(musicmodule.DeliveryCompensator)
+	if !ok {
+		panic("llm client does not support music delivery compensation")
+	}
+	return compensator
+}
+
+// EnsureLLMClient initializes LLM client once and enforces fail-fast in CLOUD mode.
+func (c *ServiceContainer) EnsureLLMClient() error {
+	c.initLLMClient()
+
+	consoleProvider := c.GetConsoleProvider()
+	if consoleProvider != nil && consoleProvider.GetMode() == "CLOUD" && c.llmClientInitErr != nil {
+		return fmt.Errorf("cloud llm client initialization failed: %w", c.llmClientInitErr)
+	}
+	return nil
+}
+
+func (c *ServiceContainer) initLLMClient() {
+	c.llmClientInitOnce.Do(func() {
+		gatewayService, err := gateway.NewLLMGatewayService(
+			c.db,
+			c.GetLLMAPIKeyRepository(),
+			adapter.GlobalFactory,
+		)
+		if err != nil {
+			c.llmClientInitErr = fmt.Errorf("failed to initialize gateway service for llm client: %w", err)
+			return
+		}
+
+		// Set config cache if Redis is available.
+		redisClient := redisPkg.GetClient()
+		if redisClient != nil {
+			configCache := gateway.NewConfigCache(redisClient, c.db, nil)
+			gatewayService.SetConfigCache(configCache)
+		}
+
+		c.llmClient = llm_client.New(
+			gatewayService,
+			c.GetLLMAPIKeyRepository(),
+			c.db,
+		)
+	})
+}
+
+// GetQuotaService returns the quota service for quota management
+func (c *ServiceContainer) GetQuotaService() interfaces.QuotaService {
+	if c.quotaService == nil {
+		logger.Debug("GetQuotaService: creating new quota service instance")
+		quotaRepo := quota_repo.NewQuotaRepository(c.db)
+		c.quotaService = quota_service.NewQuotaService(quotaRepo, c.db)
+		logger.Info("GetQuotaService: quota service created successfully")
+	}
+	return c.quotaService
+}
+
+// GetPluginRunnerService returns the plugin runner service for managing plugins
+func (c *ServiceContainer) GetPluginRunnerService() pluginrunner_service.PluginRunnerService {
+	if c.pluginRunnerService == nil {
+		if !c.config.PluginRunner.Enabled {
+			return nil // Plugin runner is disabled
+		}
+
+		cfg := &pluginrunner_client.Config{
+			BaseURL: c.config.PluginRunner.BaseURL,
+			APIKey:  c.config.PluginRunner.APIKey,
+			Timeout: time.Duration(c.config.PluginRunner.Timeout) * time.Second,
+		}
+
+		// Create repos for database writes during installation
+		installRepo := pluginrunner_repo.NewAccountInstallationRepository(c.db)
+		infoRepo := pluginrunner_repo.NewInstalledPluginInfoRepository(c.db)
+
+		c.pluginRunnerService = pluginrunner_service.NewPluginRunnerServiceWithRepos(cfg, installRepo, infoRepo)
+	}
+	return c.pluginRunnerService
+}
+
+// GetAccountInstallationService returns the account installation service for reading plugin declarations
+func (c *ServiceContainer) GetAccountInstallationService() pluginrunner_service.AccountInstallationService {
+	if c.accountInstallationService == nil {
+		infoRepo := pluginrunner_repo.NewInstalledPluginInfoRepository(c.db)
+		installRepo := pluginrunner_repo.NewAccountInstallationRepository(c.db)
+		c.accountInstallationService = pluginrunner_service.NewAccountInstallationService(installRepo, infoRepo)
+	}
+	return c.accountInstallationService
+}
+
+// GetToolManager returns the tool manager for builtin, connector, and plugin runner tools.
+func (c *ServiceContainer) GetToolManager() *tools.ToolManager {
+	if c.toolManager == nil {
+		// Create plugin runner adapter if plugin runner is enabled
+		var pluginRunnerAdapter tools.PluginRunnerToolManagerInterface
+		pluginRunnerService := c.GetPluginRunnerService()
+		if pluginRunnerService != nil {
+			pluginRunnerAdapter = tools.NewPluginRunnerToolAdapter(
+				pluginRunnerService,
+				c.GetAccountInstallationService(),
+			)
+		}
+
+		// Create tool manager
+		c.toolManager = tools.NewToolManager(pluginRunnerAdapter)
+
+		// Register builtin tool providers
+		c.toolManager.RegisterBuiltinProviders(getBuiltinToolProviders())
+		_ = c.toolManager.RegisterProvider(filegenerator_tools.NewProvider())
+		_ = c.toolManager.RegisterProvider(knowledge_tools.NewProvider(c.GetKnowledgeRetrievalService()))
+		_ = c.toolManager.RegisterProvider(database_tools.NewProvider(c.GetDataSourceService(), c.GetOrganizationService()))
+		_ = c.toolManager.RegisterProvider(files_tools.NewProvider(c.GetFileService(), c.GetContentExtractor(), c.GetOrganizationService(), files_tools.WithFileListService(c.GetFileFolderService())))
+		_ = c.toolManager.RegisterProvider(workflow_tools.NewProvider(c.GetAutomationWorkflowRunner))
+		_ = c.toolManager.RegisterProvider(imagegenerator_tools.NewProvider(c.GetFileService(), c.GetLLMClient(), c.GetDefaultModelService()))
+		if c.externalIntegrationsEnabled() {
+			providers, err := integration_tools.NewProviders(c.GetIntegrationRegistry(), c.GetIntegrationExecutor())
+			if err != nil {
+				panic(fmt.Sprintf("initialize external integration tool providers: %v", err))
+			}
+			for _, provider := range providers {
+				if err := c.toolManager.RegisterProvider(provider); err != nil {
+					panic(fmt.Sprintf("register external integration tool provider %s: %v", provider.IntegrationID(), err))
+				}
+			}
+			metaProvider, err := integration_metatools.NewProvider(
+				c.GetIntegrationRegistry(),
+				c.GetIntegrationExecutor(),
+				c.GetIntegrationConnectionRepository(),
+				c.GetIntegrationConnectionAccessService(),
+				c.GetIntegrationActionPolicyService(),
+			)
+			if err != nil {
+				panic(fmt.Sprintf("initialize external integration meta tools: %v", err))
+			}
+			if err := c.toolManager.RegisterProvider(metaProvider); err != nil {
+				panic(fmt.Sprintf("register external integration meta tools: %v", err))
+			}
+		}
+
+		logger.Info("ToolManager initialized with registered providers")
+	}
+	return c.toolManager
+}
+
+func (c *ServiceContainer) GetIntegrationRegistry() *integrations.Registry {
+	if c.integrationRegistry != nil {
+		return c.integrationRegistry
+	}
+	registry := integrations.NewRegistry()
+	if c.config != nil && c.config.ExternalIntegrations.Enabled {
+		adapter, err := exa_integration.New(exa_integration.Config{
+			Timeout:              time.Duration(c.config.WebSearch.Exa.TimeoutSeconds) * time.Second,
+			MaxResults:           c.config.WebSearch.Exa.MaxResults,
+			DefaultSearchType:    c.config.WebSearch.Exa.DefaultSearchType,
+			MaxFetchURLs:         c.config.WebSearch.Exa.MaxFetchURLs,
+			MaxContentCharacters: c.config.WebSearch.Exa.MaxContentCharacters,
+		}, nil)
+		if err != nil {
+			panic(fmt.Sprintf("initialize Exa adapter: %v", err))
+		}
+		if err := registry.Register(integrations.Registration{
+			Definition: exa_integration.ProviderDefinition(c.config.WebSearch.Exa.DefaultSearchType),
+			Adapter:    adapter,
+		}); err != nil {
+			panic(fmt.Sprintf("register Exa web search integration: %v", err))
+		}
+	}
+	if c.config != nil && c.config.ExternalIntegrations.Enabled {
+		adapter, err := github_integration.New(nil)
+		if err != nil {
+			panic(fmt.Sprintf("initialize GitHub adapter: %v", err))
+		}
+		if err := registry.Register(integrations.Registration{
+			Definition:       github_integration.ProviderDefinition(),
+			Adapter:          adapter,
+			ConnectionTester: adapter,
+			HealthProbe:      adapter,
+		}); err != nil {
+			panic(fmt.Sprintf("register GitHub integration: %v", err))
+		}
+		gmailAdapter, err := gmail_integration.New(nil)
+		if err != nil {
+			panic(fmt.Sprintf("initialize Gmail adapter: %v", err))
+		}
+		if err := registry.Register(integrations.Registration{
+			Definition:       gmail_integration.ProviderDefinition(),
+			Adapter:          gmailAdapter,
+			ConnectionTester: gmailAdapter,
+			HealthProbe:      gmailAdapter,
+			OAuth2Provider:   gmailAdapter,
+		}); err != nil {
+			panic(fmt.Sprintf("register Gmail integration: %v", err))
+		}
+		feishuAdapter, err := feishu_integration.New(nil)
+		if err != nil {
+			panic(fmt.Sprintf("initialize Feishu adapter: %v", err))
+		}
+		if err := registry.Register(integrations.Registration{
+			Definition:       feishu_integration.ProviderDefinition(),
+			Adapter:          feishuAdapter,
+			ConnectionTester: feishuAdapter,
+			HealthProbe:      feishuAdapter,
+			OAuth2Provider:   feishuAdapter,
+		}); err != nil {
+			panic(fmt.Sprintf("register Feishu integration: %v", err))
+		}
+		xAdapter, err := x_integration.New(nil)
+		if err != nil {
+			panic(fmt.Sprintf("initialize X adapter: %v", err))
+		}
+		if err := registry.Register(integrations.Registration{
+			Definition:       x_integration.ProviderDefinition(),
+			Adapter:          xAdapter,
+			ConnectionTester: xAdapter,
+			HealthProbe:      xAdapter,
+			OAuth2Provider:   xAdapter,
+		}); err != nil {
+			panic(fmt.Sprintf("register X integration: %v", err))
+		}
+		mailAdapter := mail_integration.New()
+		for _, definition := range mail_integration.ProviderDefinitions() {
+			if err := registry.Register(integrations.Registration{
+				Definition:          definition,
+				Adapter:             mailAdapter,
+				ConnectionTester:    mailAdapter,
+				CredentialValidator: mailAdapter,
+				HealthProbe:         mailAdapter,
+			}); err != nil {
+				panic(fmt.Sprintf("register %s mail integration: %v", definition.ID, err))
+			}
+		}
+		wecomAdapter, err := wecom_integration.New(nil)
+		if err != nil {
+			panic(fmt.Sprintf("initialize WeCom adapter: %v", err))
+		}
+		if err := registry.Register(integrations.Registration{
+			Definition:          wecom_integration.ProviderDefinition(),
+			Adapter:             wecomAdapter,
+			ConnectionTester:    wecomAdapter,
+			CredentialValidator: wecomAdapter,
+			HealthProbe:         wecomAdapter,
+		}); err != nil {
+			panic(fmt.Sprintf("register WeCom integration: %v", err))
+		}
+		dingtalkAdapter, err := dingtalk_integration.New(nil)
+		if err != nil {
+			panic(fmt.Sprintf("initialize DingTalk adapter: %v", err))
+		}
+		if err := registry.Register(integrations.Registration{
+			Definition:          dingtalk_integration.ProviderDefinition(),
+			Adapter:             dingtalkAdapter,
+			ConnectionTester:    dingtalkAdapter,
+			CredentialValidator: dingtalkAdapter,
+			HealthProbe:         dingtalkAdapter,
+		}); err != nil {
+			panic(fmt.Sprintf("register DingTalk integration: %v", err))
+		}
+	}
+	c.integrationRegistry = registry
+	return c.integrationRegistry
+}
+
+func (c *ServiceContainer) externalIntegrationsEnabled() bool {
+	return c != nil && c.config != nil && c.config.ExternalIntegrations.Enabled
+}
+
+func (c *ServiceContainer) integrationOAuthDeploymentClients() ([]integrations.OAuthDeploymentClient, error) {
+	if c == nil || c.config == nil || len(c.config.ExternalIntegrations.OAuth.Clients) == 0 {
+		return nil, nil
+	}
+	registry := c.GetIntegrationRegistry()
+	clients := make([]integrations.OAuthDeploymentClient, 0, len(c.config.ExternalIntegrations.OAuth.Clients))
+	seen := make(map[string]struct{}, len(c.config.ExternalIntegrations.OAuth.Clients))
+	for rawKey, configured := range c.config.ExternalIntegrations.OAuth.Clients {
+		integrationID, authMethodID, err := parseIntegrationOAuthClientKey(rawKey)
+		if err != nil {
+			return nil, err
+		}
+		definition, ok := registry.ProviderDefinition(integrationID)
+		if !ok {
+			return nil, fmt.Errorf("OAuth deployment client %q references an unavailable provider", rawKey)
+		}
+		canonicalID := ""
+		for _, method := range definition.AuthMethods {
+			if method.Type != integrations.AuthMethodTypeOAuth2 || method.OAuth == nil {
+				continue
+			}
+			if method.ID == authMethodID || method.OAuth.ClientConfigID == authMethodID {
+				canonicalID = method.OAuth.ClientConfigID
+				if canonicalID == "" {
+					canonicalID = method.ID
+				}
+				break
+			}
+		}
+		if canonicalID == "" {
+			return nil, fmt.Errorf("OAuth deployment client %q references an unavailable auth configuration", rawKey)
+		}
+		identity := integrationID + "\x00" + canonicalID
+		if _, duplicate := seen[identity]; duplicate {
+			return nil, fmt.Errorf("OAuth deployment client %q duplicates another OAuth client configuration", rawKey)
+		}
+		seen[identity] = struct{}{}
+		values := make(map[string]any, len(configured.Config))
+		for key, value := range configured.Config {
+			values[strings.ToLower(strings.TrimSpace(key))] = strings.TrimSpace(value)
+		}
+		clients = append(clients, integrations.OAuthDeploymentClient{
+			IntegrationID: integrationID,
+			DriverID:      definition.DriverID,
+			AuthMethodID:  canonicalID,
+			ClientID:      configured.ClientID,
+			ClientSecret:  configured.ClientSecret,
+			Config:        values,
+		})
+	}
+	return clients, nil
+}
+
+func parseIntegrationOAuthClientKey(raw string) (string, string, error) {
+	value := strings.ToLower(strings.TrimSpace(raw))
+	if value == "" {
+		return "", "", fmt.Errorf("OAuth deployment client key is empty")
+	}
+	normalized := strings.ReplaceAll(value, "/", ":")
+	parts := strings.Split(normalized, ":")
+	if len(parts) == 1 {
+		parts = []string{parts[0], parts[0]}
+	}
+	if len(parts) != 2 || strings.TrimSpace(parts[0]) == "" || strings.TrimSpace(parts[1]) == "" {
+		return "", "", fmt.Errorf("OAuth deployment client key %q must use integration_id:client_config_id", raw)
+	}
+	return strings.TrimSpace(parts[0]), strings.TrimSpace(parts[1]), nil
+}
+
+func (c *ServiceContainer) authorizeIntegrationOAuthCallback(
+	ctx context.Context,
+	request integrations.OAuthCallbackAuthorizationRequest,
+) error {
+	if c == nil || c.db == nil || request.OrganizationID == uuid.Nil || request.AccountID == uuid.Nil {
+		return integrations.NewError(integrations.ErrorCodeAccessDenied, "integration OAuth callback is not authorized", nil)
+	}
+	var activeMembers int64
+	if err := c.db.WithContext(ctx).
+		Table("members").
+		Where(
+			"organization_id = ? AND account_id = ? AND status = ?",
+			request.OrganizationID.String(),
+			request.AccountID.String(),
+			"active",
+		).
+		Count(&activeMembers).Error; err != nil || activeMembers != 1 {
+		return integrations.NewError(integrations.ErrorCodeAccessDenied, "integration OAuth callback is not authorized", err)
+	}
+	switch request.CredentialSource {
+	case integrations.ConnectionCredentialSourceAccount:
+		return nil
+	case integrations.ConnectionCredentialSourceOrganization:
+		allowed, err := c.GetAccountServiceAdapter().IsOrganizationAdminOrOwner(
+			ctx,
+			request.OrganizationID.String(),
+			request.AccountID.String(),
+		)
+		if err != nil || !allowed {
+			return integrations.NewError(integrations.ErrorCodeAccessDenied, "integration OAuth callback requires an organization administrator", err)
+		}
+		return nil
+	default:
+		return integrations.NewError(integrations.ErrorCodeAccessDenied, "integration OAuth credential scope is unsupported", nil)
+	}
+}
+
+func (c *ServiceContainer) GetIntegrationExecutionRepository() *integrations.GormExecutionRepository {
+	if c.integrationExecutionRepo == nil {
+		c.integrationExecutionRepo = integrations.NewGormExecutionRepository(c.db)
+	}
+	return c.integrationExecutionRepo
+}
+
+func (c *ServiceContainer) GetIntegrationOperationReceiptRepository() *integrations.GormOperationReceiptRepository {
+	if c.integrationOperationReceiptRepo == nil {
+		c.integrationOperationReceiptRepo = integrations.NewGormOperationReceiptRepository(c.db)
+	}
+	return c.integrationOperationReceiptRepo
+}
+
+func (c *ServiceContainer) GetIntegrationConnectionRepository() *integrations.GormConnectionRepository {
+	if c.integrationConnectionRepo == nil {
+		c.integrationConnectionRepo = integrations.NewGormConnectionRepository(c.db)
+	}
+	return c.integrationConnectionRepo
+}
+
+func (c *ServiceContainer) GetIntegrationConnectionGrantRepository() *integrations.GormConnectionGrantRepository {
+	if c.integrationConnectionGrantRepo == nil {
+		c.integrationConnectionGrantRepo = integrations.NewGormConnectionGrantRepository(c.db)
+	}
+	return c.integrationConnectionGrantRepo
+}
+
+func (c *ServiceContainer) GetIntegrationConnectionAccessService() *integrations.DefaultConnectionAccessService {
+	if c.integrationConnectionAccess == nil {
+		c.integrationConnectionAccess = integrations.NewConnectionAccessService(
+			c.GetIntegrationConnectionRepository(),
+			c.GetIntegrationConnectionGrantRepository(),
+		)
+	}
+	return c.integrationConnectionAccess
+}
+
+func (c *ServiceContainer) GetIntegrationAIChatPreferenceRepository() *integrations.GormAIChatIntegrationPreferenceRepository {
+	if c.integrationAIChatPreferenceRepo == nil {
+		c.integrationAIChatPreferenceRepo = integrations.NewGormAIChatIntegrationPreferenceRepository(c.db)
+	}
+	return c.integrationAIChatPreferenceRepo
+}
+
+func (c *ServiceContainer) GetIntegrationAIChatPreferenceService() *integrations.DefaultAIChatIntegrationPreferenceService {
+	if c.integrationAIChatPreferences == nil {
+		c.integrationAIChatPreferences = integrations.NewAIChatIntegrationPreferenceService(
+			c.GetIntegrationAIChatPreferenceRepository(),
+			c.GetIntegrationConnectionRepository(),
+			c.GetIntegrationConnectionAccessService(),
+		)
+	}
+	return c.integrationAIChatPreferences
+}
+
+func (c *ServiceContainer) GetIntegrationActionProjectionService() *integration_metatools.ActionProjectionService {
+	if c.integrationActionProjections == nil {
+		service, err := integration_metatools.NewActionProjectionService(
+			c.GetIntegrationRegistry(),
+			c.GetIntegrationConnectionRepository(),
+			c.GetIntegrationConnectionAccessService(),
+			c.GetIntegrationActionPolicyService(),
+		)
+		if err != nil {
+			panic(fmt.Sprintf("initialize integration Action projection service: %v", err))
+		}
+		c.integrationActionProjections = service
+	}
+	return c.integrationActionProjections
+}
+
+func (c *ServiceContainer) GetIntegrationConnectionHealthRepository() *integrations.GormConnectionHealthRepository {
+	if c.integrationConnectionHealthRepo == nil {
+		c.integrationConnectionHealthRepo = integrations.NewGormConnectionHealthRepository(c.db)
+	}
+	return c.integrationConnectionHealthRepo
+}
+
+func (c *ServiceContainer) GetIntegrationConnectionHealthService() *integrations.DefaultConnectionHealthService {
+	if c.integrationConnectionHealth == nil {
+		failureThreshold := 3
+		if c.config != nil && c.config.ExternalIntegrations.Health.FailureThreshold > 0 {
+			failureThreshold = c.config.ExternalIntegrations.Health.FailureThreshold
+		}
+		c.integrationConnectionHealth = integrations.NewConnectionHealthService(c.GetIntegrationConnectionHealthRepository()).
+			WithFailureThreshold(failureThreshold)
+	}
+	return c.integrationConnectionHealth
+}
+
+func (c *ServiceContainer) GetIntegrationCredentialCipher() integrations.CredentialCipher {
+	if c.integrationCredentialCipher == nil {
+		activeKeyID := "legacy"
+		keys := map[string]string{}
+		if c.config != nil {
+			activeKeyID = strings.TrimSpace(c.config.ExternalIntegrations.CredentialActiveKeyID)
+			for keyID, key := range c.config.ExternalIntegrations.CredentialKeys {
+				keys[keyID] = key
+			}
+			if len(keys) == 0 && strings.TrimSpace(c.config.Encryption.APIKeyEncryptionKey) != "" {
+				keys["legacy"] = c.config.Encryption.APIKeyEncryptionKey
+				activeKeyID = "legacy"
+			}
+		}
+		cipher, err := integrations.NewCredentialKeyring(activeKeyID, keys)
+		if err != nil {
+			panic(fmt.Sprintf("initialize integration credential cipher: %v", err))
+		}
+		c.integrationCredentialCipher = cipher
+	}
+	return c.integrationCredentialCipher
+}
+
+func (c *ServiceContainer) GetIntegrationConnectionResolver() *integrations.DefaultConnectionResolver {
+	if c.integrationConnectionResolver == nil {
+		c.integrationConnectionResolver = integrations.NewConnectionResolver(
+			c.GetIntegrationConnectionRepository(),
+			c.GetIntegrationCredentialCipher(),
+		)
+	}
+	return c.integrationConnectionResolver
+}
+
+func (c *ServiceContainer) GetIntegrationOAuthClientRepository() *integrations.GormOAuthClientConfigRepository {
+	if c.integrationOAuthClientRepo == nil {
+		c.integrationOAuthClientRepo = integrations.NewGormOAuthClientConfigRepository(c.db)
+	}
+	return c.integrationOAuthClientRepo
+}
+
+func (c *ServiceContainer) GetIntegrationOAuthClientService() *integrations.OAuthClientConfigService {
+	if c.integrationOAuthClients == nil {
+		deploymentClients, err := c.integrationOAuthDeploymentClients()
+		if err != nil {
+			panic(fmt.Sprintf("initialize integration OAuth deployment clients: %v", err))
+		}
+		c.integrationOAuthClients = integrations.NewOAuthClientConfigService(
+			c.GetIntegrationOAuthClientRepository(),
+			c.GetIntegrationCredentialCipher(),
+			c.GetIntegrationRegistry(),
+			deploymentClients,
+		).
+			WithConnectionRepository(c.GetIntegrationConnectionRepository()).
+			WithFlowImpactRepository(c.GetIntegrationOAuthFlowRepository()).
+			WithRecoveryImpactRepository(c.GetIntegrationOAuthRecoveryOutbox())
+	}
+	return c.integrationOAuthClients
+}
+
+func (c *ServiceContainer) GetIntegrationOAuthStateRepository() *integrations.GormOAuthStateRepository {
+	if c.integrationOAuthStateRepo == nil {
+		c.integrationOAuthStateRepo = integrations.NewGormOAuthStateRepository(c.db)
+	}
+	return c.integrationOAuthStateRepo
+}
+
+func (c *ServiceContainer) GetIntegrationOAuthStateService() *integrations.OAuthStateService {
+	if c.integrationOAuthStates == nil {
+		ttl := 10 * time.Minute
+		callbackURL := ""
+		if c.config != nil {
+			if c.config.ExternalIntegrations.OAuth.FlowTTLSeconds > 0 {
+				ttl = time.Duration(c.config.ExternalIntegrations.OAuth.FlowTTLSeconds) * time.Second
+			}
+			callbackURL = strings.TrimSpace(c.config.ExternalIntegrations.OAuth.CallbackURL)
+		}
+		c.integrationOAuthStates = integrations.NewOAuthStateService(
+			c.GetIntegrationOAuthStateRepository(),
+			c.GetIntegrationCredentialCipher(),
+			ttl,
+		).WithAllowedRedirectURIs([]string{callbackURL})
+	}
+	return c.integrationOAuthStates
+}
+
+func (c *ServiceContainer) GetIntegrationOAuthFlowRepository() *integrations.GormOAuthFlowRepository {
+	if c.integrationOAuthFlowRepo == nil {
+		c.integrationOAuthFlowRepo = integrations.NewGormOAuthFlowRepository(c.db)
+	}
+	return c.integrationOAuthFlowRepo
+}
+
+func (c *ServiceContainer) GetIntegrationOAuthFlowService() *integrations.OAuthFlowService {
+	if c.integrationOAuthFlows == nil {
+		ttl := 10 * time.Minute
+		if c.config != nil && c.config.ExternalIntegrations.OAuth.FlowTTLSeconds > 0 {
+			ttl = time.Duration(c.config.ExternalIntegrations.OAuth.FlowTTLSeconds) * time.Second
+		}
+		c.integrationOAuthFlows = integrations.NewOAuthFlowService(
+			c.GetIntegrationOAuthFlowRepository(),
+			c.GetIntegrationOAuthStateService(),
+			c.GetIntegrationRegistry(),
+			c.GetIntegrationOAuthClientService(),
+			c.GetIntegrationConnectionRepository(),
+			c.GetIntegrationCredentialCipher(),
+		).
+			WithFlowTTL(ttl).
+			WithOAuthRecovery(c.GetIntegrationOAuthRecoveryService()).
+			WithCallbackAuthorizer(integrations.OAuthCallbackAuthorizerFunc(c.authorizeIntegrationOAuthCallback))
+	}
+	return c.integrationOAuthFlows
+}
+
+func (c *ServiceContainer) GetIntegrationOAuthRevoker() *integrations.OAuthConnectionRevoker {
+	if c.integrationOAuthRevoker == nil {
+		c.integrationOAuthRevoker = integrations.NewOAuthConnectionRevoker(
+			c.GetIntegrationCredentialCipher(),
+			c.GetIntegrationRegistry(),
+			c.GetIntegrationOAuthClientService(),
+		)
+	}
+	return c.integrationOAuthRevoker
+}
+
+func (c *ServiceContainer) GetIntegrationOAuthRecoveryOutbox() *integrations.SplitOAuthRecoveryOutbox {
+	if c.integrationOAuthRecoveryOutbox == nil {
+		durableOutbox := integrations.NewDatabaseOAuthRecoveryOutbox(c.GetDB())
+		refreshOutbox := integrations.NewRedisOAuthRecoveryOutbox(redisPkg.GetClient())
+		c.integrationOAuthRecoveryOutbox = integrations.NewSplitOAuthRecoveryOutbox(durableOutbox, refreshOutbox)
+	}
+	return c.integrationOAuthRecoveryOutbox
+}
+
+func (c *ServiceContainer) GetIntegrationOAuthRecoveryService() *integrations.OAuthRecoveryService {
+	if c.integrationOAuthRecovery == nil {
+		c.integrationOAuthRecovery = integrations.NewOAuthRecoveryService(
+			c.GetIntegrationOAuthRecoveryOutbox(),
+			c.GetIntegrationConnectionRepository(),
+			c.GetIntegrationOAuthRevoker(),
+			c.GetIntegrationCredentialCipher(),
+		).WithFlowRepository(c.GetIntegrationOAuthFlowRepository())
+	}
+	return c.integrationOAuthRecovery
+}
+
+func (c *ServiceContainer) GetIntegrationRuntimeConnectionResolver() integrations.ConnectionResolver {
+	if c.integrationRuntimeResolver == nil {
+		refreshWindow := 10 * time.Minute
+		if c.config != nil && c.config.ExternalIntegrations.OAuth.RefreshWindowSeconds > 0 {
+			refreshWindow = time.Duration(c.config.ExternalIntegrations.OAuth.RefreshWindowSeconds) * time.Second
+		}
+		c.integrationRuntimeResolver = integrations.NewOAuthRefreshingConnectionResolver(
+			c.GetIntegrationConnectionResolver(),
+			c.GetIntegrationConnectionRepository(),
+			c.GetIntegrationCredentialCipher(),
+			c.GetIntegrationRegistry(),
+			c.GetIntegrationOAuthClientService(),
+			integrations.NewRedisOAuthRefreshLocker(redisPkg.GetClient()),
+			refreshWindow,
+		).WithOAuthRecovery(c.GetIntegrationOAuthRecoveryService())
+	}
+	return c.integrationRuntimeResolver
+}
+
+func (c *ServiceContainer) GetIntegrationActionPolicyService() *integrations.DefaultActionPolicyService {
+	if c.integrationActionPolicy == nil {
+		if c.integrationActionPolicyRepo == nil {
+			c.integrationActionPolicyRepo = integrations.NewGormActionPolicyRepository(c.db)
+		}
+		c.integrationActionPolicy = integrations.NewActionPolicyService(c.integrationActionPolicyRepo, c.GetIntegrationRegistry())
+	}
+	return c.integrationActionPolicy
+}
+
+func (c *ServiceContainer) GetIntegrationConnectionTester() *integrations.AuditedConnectionTester {
+	if c.integrationConnectionTester == nil {
+		timeout := 20 * time.Second
+		if c.config != nil && c.config.ExternalIntegrations.TimeoutSeconds > 0 {
+			timeout = time.Duration(c.config.ExternalIntegrations.TimeoutSeconds) * time.Second
+		}
+		c.integrationConnectionTester = integrations.NewAuditedConnectionTester(
+			c.GetIntegrationRegistry(),
+			c.GetIntegrationExecutionRepository(),
+			timeout,
+		).
+			WithDailyQuota(c.getIntegrationDailyQuota()).
+			WithCompletionOutbox(integrations.NewRedisExecutionCompletionOutbox(redisPkg.GetClient()))
+	}
+	return c.integrationConnectionTester
+}
+
+func (c *ServiceContainer) GetIntegrationConnectionService() *integrations.DefaultConnectionService {
+	if c.integrationConnectionService == nil {
+		failureThreshold := 3
+		if c.config != nil {
+			if c.config.ExternalIntegrations.Health.FailureThreshold > 0 {
+				failureThreshold = c.config.ExternalIntegrations.Health.FailureThreshold
+			}
+		}
+		c.integrationConnectionService = integrations.NewConnectionService(
+			c.GetIntegrationConnectionRepository(),
+			c.GetIntegrationCredentialCipher(),
+			c.GetIntegrationRegistry(),
+			c.GetIntegrationRuntimeConnectionResolver(),
+			c.GetIntegrationConnectionTester(),
+		).
+			WithHealthRecorder(c.GetIntegrationConnectionHealthService()).
+			WithHealthFailureThreshold(failureThreshold).
+			WithConnectionRevoker(c.GetIntegrationOAuthRevoker()).
+			WithOAuthRecovery(c.GetIntegrationOAuthRecoveryService())
+	}
+	return c.integrationConnectionService
+}
+
+func (c *ServiceContainer) getIntegrationDailyQuota() integrations.DailyQuota {
+	if c.integrationDailyQuota == nil {
+		limit := 1000
+		if c.config != nil && c.config.ExternalIntegrations.OrgDailyLimit > 0 {
+			limit = c.config.ExternalIntegrations.OrgDailyLimit
+		}
+		c.integrationDailyQuota = integrations.NewRedisDailyQuota(redisPkg.GetClient(), limit)
+	}
+	return c.integrationDailyQuota
+}
+
+func (c *ServiceContainer) GetIntegrationExecutor() *integrations.Executor {
+	if c.integrationExecutor == nil {
+		timeout := 20 * time.Second
+		masterKey := ""
+		if c.config != nil {
+			if c.config.ExternalIntegrations.TimeoutSeconds > 0 {
+				timeout = time.Duration(c.config.ExternalIntegrations.TimeoutSeconds) * time.Second
+			}
+			masterKey = c.config.ExternalIntegrations.CredentialKeys[c.config.ExternalIntegrations.CredentialActiveKeyID]
+			if masterKey == "" {
+				masterKey = c.config.Encryption.APIKeyEncryptionKey
+			}
+		}
+		c.integrationExecutor = integrations.NewExecutor(
+			c.GetIntegrationRegistry(),
+			c.GetIntegrationExecutionRepository(),
+			c.getIntegrationDailyQuota(),
+			integrations.DefaultSafetyChecker{},
+			integrations.DeriveAuditHMACKey(masterKey),
+			timeout,
+		).
+			WithOperationReceiptRepository(c.GetIntegrationOperationReceiptRepository()).
+			WithCompletionOutbox(integrations.NewRedisExecutionCompletionOutbox(redisPkg.GetClient())).
+			WithConnectionResolver(c.GetIntegrationRuntimeConnectionResolver()).
+			WithActionPolicyResolver(c.GetIntegrationActionPolicyService()).
+			WithConnectionAccessAuthorizer(c.GetIntegrationConnectionAccessService()).
+			WithConnectionHealthSignalSink(c.GetIntegrationConnectionHealthService())
+	}
+	return c.integrationExecutor
+}
+
+// GetToolEngine returns the tool engine
+func (c *ServiceContainer) GetToolEngine() *tools.ToolEngine {
+	if c.toolEngine == nil {
+		c.toolEngine = tools.NewToolEngine(c.GetToolManager())
+	}
+	return c.toolEngine
+}
+
+func (c *ServiceContainer) GetMemoryService() *memory.Service {
+	if c.memoryService == nil {
+		c.memoryService = memory.NewService(c.db)
+	}
+	return c.memoryService
+}
+
+func (c *ServiceContainer) GetKnowledgeRetrievalService() *dataset_service.KnowledgeRetrievalService {
+	if c.knowledgeRetrievalService == nil {
+		c.knowledgeRetrievalService = dataset_service.NewKnowledgeRetrievalService(
+			c.db,
+			c.config,
+			c.GetLLMClient(),
+			c.GetDefaultModelService(),
+			c.GetGraphFlowService(),
+		)
+	}
+	return c.knowledgeRetrievalService
+}
+
+func (c *ServiceContainer) GetAgentMemoryService() *agentmemory.Service {
+	if c.agentMemoryService == nil {
+		c.agentMemoryService = agentmemory.NewService(c.db)
+	}
+	return c.agentMemoryService
+}
+
+func (c *ServiceContainer) GetConsoleProvider() console.ConsoleProvider {
+	if c.platformContainer != nil {
+		return c.platformContainer.Console
+	}
+	return console.NewStandalone()
+}
+
+func (c *ServiceContainer) GetPlatformChannels() (platform.Container, error) {
+	if c.platformContainer == nil {
+		return platform.Container{}, fmt.Errorf("platform container not initialized")
+	}
+	return *c.platformContainer, nil
+}
+
+// GetMemberSubscriptionService returns the member subscription service
+func (c *ServiceContainer) GetMemberSubscriptionService() pluginrunner_service.MemberSubscriptionService {
+	if c.memberSubscriptionService == nil {
+		subRepo := pluginrunner_repo.NewMemberSubscriptionRepository(c.db)
+		installRepo := pluginrunner_repo.NewAccountInstallationRepository(c.db)
+		infoRepo := pluginrunner_repo.NewInstalledPluginInfoRepository(c.db)
+		c.memberSubscriptionService = pluginrunner_service.NewMemberSubscriptionService(subRepo, installRepo, infoRepo)
+	}
+	return c.memberSubscriptionService
+}
+
+func (c *ServiceContainer) GetDefaultModelService() llmdefaultsvc.DefaultModelService {
+	if c.defaultModelService == nil {
+		modelModule := llmmodel.NewModule(c.db)
+		c.defaultModelModule = llmdefaultmodel.NewModule(c.db, modelModule.AvailableModelsSvc, modelModule.GlobalRepo, modelModule.CustomRepo)
+		c.defaultModelService = c.defaultModelModule.Service
+	}
+	return c.defaultModelService
+}
+
+// GetGraphFlowService returns the GraphFlow service
+func (c *ServiceContainer) GetGraphFlowService() *graphflow.Service {
+	if c.graphFlowService == nil {
+		// Initialize dependencies for GraphFlow service
+		documentRepo := dataset_repo.NewDocumentRepository(c.db)
+		datasetRepo := dataset_repo.NewDatasetRepository(c.db)
+
+		c.graphFlowService = graphflow.NewService(
+			c.config,
+			c.db,
+			documentRepo,
+			datasetRepo,
+			c.GetLLMClient(),
+			c.GetDefaultModelService(),
+			c.GetTaskManager(),
+		)
+	}
+	return c.graphFlowService
+}
+
+// GetGraphLifecycleService returns the durable GraphFlow lifecycle service.
+func (c *ServiceContainer) GetGraphLifecycleService() *graphflow.LifecycleService {
+	if c.graphLifecycleService == nil {
+		c.graphLifecycleService = graphflow.NewLifecycleService(c.db)
+	}
+	return c.graphLifecycleService
+}
+
+// GetGraphVisibilityService returns the GraphFlow visibility service.
+func (c *ServiceContainer) GetGraphVisibilityService() *graphflow.VisibilityService {
+	if c.graphVisibilityService == nil {
+		c.graphVisibilityService = graphflow.NewVisibilityService(c.db)
+	}
+	return c.graphVisibilityService
+}
+
+// GetGraphRuntimeHealthService returns the sanitized graph runtime health service.
+func (c *ServiceContainer) GetGraphRuntimeHealthService() *system_service.GraphRuntimeHealthService {
+	if c.graphRuntimeHealth == nil {
+		graphService := c.GetGraphFlowService()
+		c.graphRuntimeHealth = system_service.NewGraphRuntimeHealthService(graphService.Neo4jClient)
+	}
+	return c.graphRuntimeHealth
+}
+
+func (c *ServiceContainer) SetAutomationDefinitionService(service automationdefinition.Service) {
+	c.automationDefinitionService = service
+}
+
+func (c *ServiceContainer) GetAutomationDefinitionService() automationdefinition.Service {
+	return c.automationDefinitionService
+}
+
+func (c *ServiceContainer) GetNotificationSMSService() notificationsms.Service {
+	if c.notificationSMSService == nil {
+		cfg := notificationsms.ConfigFromLookup(config.Lookup)
+		c.notificationSMSService = notificationsms.NewService(
+			cfg,
+			notificationsms.NewAliyunProvider(cfg.Aliyun),
+			notificationsms.NewChuanglanProvider(cfg.Chuanglan),
+		)
+	}
+	return c.notificationSMSService
+}
+
+func (c *ServiceContainer) GetShortLinkService() shortlinkcap.Service {
+	if c.shortLinkService == nil {
+		c.shortLinkService = shortlinkcap.NewServiceWithDB(c.db)
+	}
+	return c.shortLinkService
+}
+
+func (c *ServiceContainer) SetAutomationWorkflowRunner(runner automationaction.AutomationWorkflowRunner) {
+	c.automationWorkflowRunner = runner
+}
+
+func (c *ServiceContainer) GetAutomationWorkflowRunner() automationaction.AutomationWorkflowRunner {
+	return c.automationWorkflowRunner
+}
+
+func (c *ServiceContainer) SetWorkflowEngineFactory(factory *graph_engine.EngineFactory) {
+	c.workflowEngineFactory = factory
+}
+
+func (c *ServiceContainer) GetWorkflowEngineFactory() *graph_engine.EngineFactory {
+	if c.workflowEngineFactory == nil {
+		nodeRunner := workflowruntime.NewNodeRunner(workflowruntime.Dependencies{
+			ContentExtractor:            c.GetContentExtractor(),
+			LLMClient:                   c.GetLLMClient(),
+			ToolEngine:                  c.GetToolEngine(),
+			GraphFlowService:            c.GetGraphFlowService(),
+			FileService:                 c.GetFileService(),
+			PromptResolver:              c.GetPromptService(),
+			AutomationDefinitionService: c.GetAutomationDefinitionService(),
+			NotificationSMSService:      c.GetNotificationSMSService(),
+			SQLBase:                     c.GetSQLBase(),
+		})
+		c.workflowEngineFactory = graph_engine.NewEngineFactory(10, nodeRunner)
+	}
+	return c.workflowEngineFactory
+}
+
+func (c *ServiceContainer) GetWorkflowDiagnoser() *diagnosis.Diagnoser {
+	if c.workflowDiagnoser == nil {
+		c.workflowDiagnoser = diagnosis.NewDiagnoser(context.Background(), c.GetLLMClient())
+	}
+	return c.workflowDiagnoser
+}

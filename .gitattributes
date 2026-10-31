@@ -1,0 +1,16 @@
+*.sh text eol=lf
+Dockerfile text eol=lf
+Dockerfile* text eol=lf
+
+# Extensionless bash scripts must use LF even on Windows checkout.
+# Without this, CRLF leaks into the shebang line and Linux reports
+# "/usr/bin/env: 'bashr': No such file or directory".
+/dev/bootstrap text eol=lf
+/dev/start-docker text eol=lf
+/dev/start-api text eol=lf
+/dev/start-web text eol=lf
+/dev/setup text eol=lf
+/dev/check-env text eol=lf
+/dev/status text eol=lf
+/dev/install-git-hooks text eol=lf
+/docker/generate_docker_compose text eol=lf

@@ -1,0 +1,1752 @@
+'use client';
+
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
+import { useQueries, useQuery, useQueryClient } from '@tanstack/react-query';
+import { toast } from 'sonner';
+import { createAgentDraftTransport, useAIChatController } from '@/components/chat';
+import { buildOpeningGuideBrand } from '@/components/chat/utils/opening-guide-brand';
+import { findAIChatModelProps } from '@/components/chat/variants/aichat/model-props';
+import { getAIChatSkillDisplayInfo } from '@/components/chat/variants/aichat/skill-display';
+import { normalizeAIChatSkillIds } from '@/components/chat/variants/aichat/skill-identity';
+import type {
+  ModelSelectorModelProps,
+  ModelSelectorParameterValue,
+  ModelSelectorValue,
+} from '@/components/common/model-selector';
+import { useAgent, useAgentConfig } from '@/hooks/agent/use-agents';
+import { useAvailableModels } from '@/hooks/model/use-model';
+import { useDefaultModelByUseCase } from '@/hooks/model/use-default-model-by-use-case';
+import { useAccountPermissions } from '@/hooks/organization/use-account-permissions';
+import { AGENT_KEYS, DATASET_KEYS } from '@/hooks/query-keys';
+import { useLocale } from '@/hooks/use-locale';
+import { useAutoProfile } from '@/hooks/use-profile';
+import { useSystemFeatures } from '@/hooks/auth/use-system-features';
+import { useT } from '@/i18n';
+import { SUGGESTED_QUESTIONS_LIMIT } from '@/constants/suggested-questions';
+import {
+  AGENT_PERMISSION_ACTIONS,
+  KNOWLEDGE_BASE_READ_PERMISSION_CODES,
+} from '@/constants/permissions';
+import agentService, {
+  getAgentBindingConflict,
+  getAgentBindingRevisionConflict,
+  getAgentRollbackImpactChanged,
+} from '@/services/agent.service';
+import { datasetService } from '@/services';
+import { getTemplateAwareCharacterCount } from '@/components/workflow/common/workflow-value-editor/utils/value-transform';
+import type { OpeningStatementDialogValue } from '@/components/workflow/ui/features-panel/opening-statement-dialog';
+import type {
+  AgentDetail,
+  AgentBindingHealth,
+  AgentDatabaseBinding,
+  AgentMemorySlotConfig,
+  AgentRuntimeConfig,
+  AgentWorkflowBinding,
+  AgentWorkflowBindingCandidate,
+  AgentPublishedVersionRollbackPreview,
+  UpdateAgentRuntimeConfigRequest,
+} from '@/services/types/agent';
+import type {
+  AgentIntegrationConnectionBinding,
+  AgentIntegrationConnectionCandidate,
+} from '@/services/types/integration';
+import type { AIChatSkillMetadata } from '@/services/types/aichat';
+import type { Dataset } from '@/services/types/dataset';
+import { getErrorMessage } from '@/utils/error-notifications';
+import type {
+  AgentConfigSection,
+  AgentPublishVersionDetails,
+  AgentPublishedVersionListItem,
+  AgentRuntimeSelectedSkillItem,
+} from '../types';
+import { buildAgentRuntimeSignature, toModelParams, validateAgentMemorySlots } from '../utils';
+import { useAgentRuntimeDraftPersistence } from '../use-agent-runtime-draft-persistence';
+import { useAgentRuntimeLeaveGuard } from '../use-agent-runtime-leave-guard';
+import { getAgentRuntimeSaveText, type VersionPreviewBackup } from './page-model-utils';
+import { AGENT_SYSTEM_PROMPT_MAX_LENGTH } from '../prompt-limits';
+import { buildAgentRuntimeAIChatContext } from '../aichat-context';
+import { normalizeAgentDatabaseBindings } from '../database-binding-draft';
+import {
+  mergeSupersededAgentRuntimePayload,
+  normalizeAgentIntegrationBindings,
+  normalizeAgentWorkflowBindings,
+} from '../binding-rebase-merge';
+import { agentSkillCandidateToMetadata, normalizeAgentSkillCandidates } from '../skill-candidates';
+
+type AgentKnowledgeDataset = Dataset & { load_error?: boolean };
+
+const EMPTY_PUBLISH_VERSION_DETAILS: AgentPublishVersionDetails = {
+  name: '',
+  description: '',
+};
+
+class AgentMemoryRevisionChangedError extends Error {
+  constructor() {
+    super('Agent memory configuration changed during binding conflict recovery');
+    this.name = 'AgentMemoryRevisionChangedError';
+  }
+}
+
+function describeBindingChanges(
+  local: UpdateAgentRuntimeConfigRequest,
+  server: Partial<AgentRuntimeConfig>,
+  labels: {
+    skill: string;
+    knowledge: string;
+    database: string;
+    databaseTable: string;
+    writableDatabaseTable: string;
+    workflow: string;
+    integrationConnection: string;
+    integrationAction: string;
+  }
+) {
+  const collect = (value: Partial<AgentRuntimeConfig | UpdateAgentRuntimeConfigRequest>) => {
+    const out = new Map<string, string>();
+    const add = (identity: string, display = identity) => out.set(identity, display);
+    for (const id of value.enabled_skill_ids ?? []) add(`Skill:${id}`, labels.skill);
+    for (const id of value.knowledge_dataset_ids ?? []) add(`Knowledge:${id}`, labels.knowledge);
+    for (const binding of value.database_bindings ?? []) {
+      add(`Database:${binding.data_source_id}`, labels.database);
+      for (const id of binding.table_ids ?? []) add(`Table:${id}`, labels.databaseTable);
+      for (const id of binding.writable_table_ids ?? []) {
+        add(`Writable table:${id}`, labels.writableDatabaseTable);
+      }
+    }
+    for (const binding of value.workflow_bindings ?? []) {
+      add(`Workflow:${binding.binding_id}`, labels.workflow);
+    }
+    for (const binding of value.integration_bindings ?? []) {
+      add(
+        `Integration:${binding.integration_id}:${binding.connection_id}`,
+        labels.integrationConnection
+      );
+      for (const id of binding.allowed_action_ids) {
+        add(
+          `Integration Action:${binding.integration_id}:${binding.connection_id}:${id}`,
+          labels.integrationAction
+        );
+      }
+    }
+    return out;
+  };
+  const localBindings = collect(local);
+  const serverBindings = collect(server);
+  const changedIdentities = new Set([...localBindings.keys(), ...serverBindings.keys()]);
+  return Array.from(
+    new Set(
+      [...changedIdentities]
+        .filter(identity => localBindings.has(identity) !== serverBindings.has(identity))
+        .map(identity => localBindings.get(identity) ?? serverBindings.get(identity) ?? '')
+        .filter(Boolean)
+    )
+  );
+}
+
+function createAgentKnowledgeDatasetFallback(
+  id: string,
+  name: string,
+  description: string,
+  loadError: boolean
+): AgentKnowledgeDataset {
+  return {
+    id,
+    name,
+    description,
+    provider: '',
+    data_source_type: '',
+    indexing_technique: '',
+    word_count: 0,
+    created_by: '',
+    created_at: '',
+    updated_by: null,
+    updated_at: '',
+    embedding_model: '',
+    embedding_model_provider: '',
+    embedding_available: false,
+    retrieval_config: {
+      search_method: 'hybrid_search',
+      reranking_enable: true,
+      top_k: 0,
+      score_threshold_enabled: false,
+      score_threshold: 0,
+    },
+    tags: null,
+    icon: '',
+    icon_type: 'text',
+    icon_background: '',
+    app_count: 0,
+    document_count: 0,
+    available_document_count: 0,
+    available_segment_count: 0,
+    collection_binding_id: null,
+    owner: null,
+    owner_account: null,
+    is_editor: false,
+    can_edit: false,
+    load_error: loadError,
+  };
+}
+
+function compactSuggestedQuestionContextRef(value: string, maxLength = 180): string {
+  const text = value.replace(/\s+/g, ' ').trim();
+  if (text.length <= maxLength) return text;
+  return `${text.slice(0, maxLength).trim()}...`;
+}
+
+function agentDetailWorkspaceID(agent: AgentDetail | undefined): string {
+  return agent?.workspace?.id || agent?.workspace_id || agent?.tenant?.id || agent?.tenant_id || '';
+}
+
+function buildSuggestedQuestionContextRefs(params: {
+  selectedKnowledgeDatasets: AgentKnowledgeDataset[];
+  databaseBindings: AgentDatabaseBinding[];
+  workflowBindings: AgentWorkflowBinding[];
+  workflowCandidatesByBindingID: Map<string, AgentWorkflowBindingCandidate>;
+  fileUploadEnabled: boolean;
+  agentMemoryEnabled: boolean;
+}): string[] {
+  const refs: string[] = [];
+  params.selectedKnowledgeDatasets.forEach(dataset => {
+    const name = dataset.name?.trim();
+    if (!name) return;
+    refs.push(
+      compactSuggestedQuestionContextRef(
+        `Knowledge: ${name}${dataset.description ? ` - ${dataset.description}` : ''}`
+      )
+    );
+  });
+  params.databaseBindings.forEach(binding => {
+    const dataSourceID = binding.data_source_id.trim();
+    if (!dataSourceID || binding.table_ids.length === 0) return;
+    refs.push(
+      compactSuggestedQuestionContextRef(
+        `Database: ${dataSourceID} (${binding.table_ids.length} selected tables${
+          (binding.writable_table_ids ?? []).length > 0 ? ', writable tables enabled' : ''
+        })`
+      )
+    );
+  });
+  params.workflowBindings.forEach(binding => {
+    const candidate = params.workflowCandidatesByBindingID.get(binding.binding_id);
+    const label = binding.label || candidate?.label || binding.binding_id;
+    const description = binding.description || candidate?.description || '';
+    if (!label.trim()) return;
+    refs.push(
+      compactSuggestedQuestionContextRef(
+        `Workflow: ${label}${description ? ` - ${description}` : ''}`
+      )
+    );
+  });
+  if (params.fileUploadEnabled) {
+    refs.push('File upload: enabled');
+  }
+  if (params.agentMemoryEnabled) {
+    refs.push('Memory: enabled');
+  }
+  return Array.from(new Set(refs)).slice(0, 12);
+}
+
+export function useAgentRuntimePageModel(agentId: string) {
+  const queryClient = useQueryClient();
+  const { locale } = useLocale();
+  const t = useT('agents.agentRuntime');
+  const tRoot = useT();
+  const systemFeatures = useSystemFeatures();
+  const externalIntegrationsEnabled = Boolean(systemFeatures.data?.enable_external_integrations);
+  const {
+    permissions,
+    organizationRole,
+    workspaceRole,
+    workspaceRoleName,
+    hasAnyPermission,
+    isLoading: isPermissionsLoading,
+  } = useAccountPermissions();
+  const canCreateAgent = hasAnyPermission(AGENT_PERMISSION_ACTIONS.create);
+  const canImportAgent = hasAnyPermission(AGENT_PERMISSION_ACTIONS.import);
+  const canUpdateAgent = hasAnyPermission(AGENT_PERMISSION_ACTIONS.update);
+  const canConfigureAgentRuntime = hasAnyPermission(AGENT_PERMISSION_ACTIONS.runtimeConfigManage);
+  const canPublishAgent = hasAnyPermission(AGENT_PERMISSION_ACTIONS.publish);
+  const canManageAgentRuntimeAccess = hasAnyPermission(
+    AGENT_PERMISSION_ACTIONS.runtimeAccessManage
+  );
+  const canManageAgent =
+    canUpdateAgent || canConfigureAgentRuntime || canPublishAgent || canManageAgentRuntimeAccess;
+  const canOpenAgentRuntimeEditor =
+    canCreateAgent ||
+    canImportAgent ||
+    canUpdateAgent ||
+    canConfigureAgentRuntime ||
+    canPublishAgent ||
+    canManageAgentRuntimeAccess;
+  const { agent, isLoading: isAgentLoading } = useAgent(agentId, canOpenAgentRuntimeEditor);
+  const canBindKnowledge = hasAnyPermission(KNOWLEDGE_BASE_READ_PERMISSION_CODES);
+  const { data: profile } = useAutoProfile({ staleTime: 1_800_000 });
+  const { value: voiceDefaultModel } = useDefaultModelByUseCase('speech-to-text');
+  const { value: speechDefaultModel } = useDefaultModelByUseCase('text-to-speech');
+  const { data: configResponse, isLoading: isConfigLoading } = useAgentConfig(
+    agentId,
+    canOpenAgentRuntimeEditor
+  );
+  const {
+    data: skillCandidatesResponse,
+    isLoading: isSkillCandidatesLoading,
+    isFetching: isSkillCandidatesFetching,
+  } = useQuery({
+    queryKey: AGENT_KEYS.skillBindingCandidates(agentId),
+    queryFn: () => agentService.getAgentSkillBindingCandidates(agentId, { page: 1, limit: 100 }),
+    enabled: Boolean(agentId) && canConfigureAgentRuntime,
+    staleTime: 60_000,
+  });
+  const { data: workflowCandidatesResponse, isLoading: isWorkflowCandidatesLoading } = useQuery({
+    queryKey: AGENT_KEYS.workflowBindingCandidates(agentId),
+    queryFn: () => agentService.getAgentWorkflowBindingCandidates(agentId),
+    enabled: Boolean(agentId) && canConfigureAgentRuntime,
+    staleTime: 60_000,
+  });
+  const { data: integrationCandidatesResponse, isLoading: isIntegrationCandidatesLoading } =
+    useQuery({
+      queryKey: AGENT_KEYS.integrationConnectionCandidates(agentId),
+      queryFn: () =>
+        agentService.getAgentIntegrationConnectionCandidates(agentId, {
+          page: 1,
+          limit: 100,
+          include_selected: true,
+        }),
+      enabled: Boolean(agentId) && canConfigureAgentRuntime && externalIntegrationsEnabled,
+      staleTime: 60_000,
+    });
+  const config = configResponse?.data;
+  const voiceInputEnabled = Boolean(voiceDefaultModel?.model);
+  const speechEnabled =
+    Boolean(speechDefaultModel?.model) &&
+    typeof speechDefaultModel?.params.default_voice === 'string' &&
+    Boolean(speechDefaultModel.params.default_voice.trim());
+  const workflowCandidates = useMemo<AgentWorkflowBindingCandidate[]>(
+    () => (workflowCandidatesResponse?.data.data ?? []) as AgentWorkflowBindingCandidate[],
+    [workflowCandidatesResponse?.data.data]
+  );
+  const integrationCandidates = useMemo<AgentIntegrationConnectionCandidate[]>(
+    () => integrationCandidatesResponse?.data.data ?? [],
+    [integrationCandidatesResponse?.data.data]
+  );
+  const {
+    models: availableAgentRuntimeModels,
+    isLoading: isAgentModelsLoading,
+    error: agentModelsError,
+  } = useAvailableModels({ use_case: 'agent-runtime' });
+  const agentDetail = agent?.data;
+  const agentWorkspaceId = agentDetailWorkspaceID(agentDetail);
+  const defaultHomeTitle = agentDetail?.name?.trim() || t('defaultHomeTitle');
+  const defaultInputPlaceholder = t('defaultInputPlaceholder');
+
+  const draftTransport = useMemo(() => createAgentDraftTransport(agentId), [agentId]);
+  const chatController = useAIChatController({ transport: draftTransport });
+  const initChatController = chatController.init;
+
+  const [systemPrompt, setSystemPrompt] = useState('');
+  const [modelValue, setModelValue] = useState<ModelSelectorParameterValue>({
+    provider: '',
+    model: '',
+    params: {},
+  });
+  const [selectedSkillIds, setSelectedSkillIds] = useState<string[]>([]);
+  const [agentMemoryEnabled, setAgentMemoryEnabled] = useState(false);
+  const [agentMemoryAutoExtractionEnabled, setAgentMemoryAutoExtractionEnabled] = useState(false);
+  const [agentMemoryConfigRevision, setAgentMemoryConfigRevision] = useState('');
+  const [agentMemorySlots, setAgentMemorySlots] = useState<AgentMemorySlotConfig[]>([]);
+  const [fileUploadEnabled, setFileUploadEnabled] = useState(false);
+  const [homeTitle, setHomeTitle] = useState(defaultHomeTitle);
+  const [openingStatement, setOpeningStatement] = useState('');
+  const [inputPlaceholder, setInputPlaceholder] = useState(defaultInputPlaceholder);
+  const [suggestedQuestions, setSuggestedQuestions] = useState<string[]>([]);
+  const [knowledgeDatasetIds, setKnowledgeDatasetIds] = useState<string[]>([]);
+  const [databaseBindings, setDatabaseBindings] = useState<AgentDatabaseBinding[]>([]);
+  const [workflowBindings, setWorkflowBindings] = useState<AgentWorkflowBinding[]>([]);
+  const [integrationBindings, setIntegrationBindings] = useState<
+    AgentIntegrationConnectionBinding[]
+  >([]);
+  const [bindingRevision, setBindingRevision] = useState('');
+  const [bindingHealth, setBindingHealth] = useState<AgentBindingHealth>();
+  const [isAbnormalSkillCleanupPending, setIsAbnormalSkillCleanupPending] = useState(false);
+  const [skillDialogOpen, setSkillDialogOpen] = useState(false);
+  const [knowledgeDialogOpen, setKnowledgeDialogOpen] = useState(false);
+  const [workflowDialogOpen, setWorkflowDialogOpen] = useState(false);
+  const [integrationDialogOpen, setIntegrationDialogOpen] = useState(false);
+  const [promptOptimizerOpen, setPromptOptimizerOpen] = useState(false);
+  const [memoryValuesOpen, setMemoryValuesOpen] = useState(false);
+  const [isGeneratingSuggestions, setIsGeneratingSuggestions] = useState(false);
+  const [publishedVersionsOpen, setPublishedVersionsOpen] = useState(false);
+  const [previewSheetOpen, setPreviewSheetOpen] = useState(false);
+  const [publishedVersions, setPublishedVersions] = useState<AgentPublishedVersionListItem[]>([]);
+  const [isLoadingVersions, setIsLoadingVersions] = useState(false);
+  const [isRollingBackVersion, setIsRollingBackVersion] = useState(false);
+  const [isLoadingRollbackPreview, setIsLoadingRollbackPreview] = useState(false);
+  const [rollbackPreview, setRollbackPreview] = useState<AgentPublishedVersionRollbackPreview>();
+  const [selectedPublishedVersionId, setSelectedPublishedVersionId] = useState('');
+  const [isVersionPreviewing, setIsVersionPreviewing] = useState(false);
+  const [isPublishing, setIsPublishing] = useState(false);
+  const [publishVersionDialogOpen, setPublishVersionDialogOpen] = useState(false);
+  const [publishVersionDetails, setPublishVersionDetails] = useState<AgentPublishVersionDetails>(
+    EMPTY_PUBLISH_VERSION_DETAILS
+  );
+  const [suspendedBindingsDialogOpen, setSuspendedBindingsDialogOpen] = useState(false);
+  const [cleanupSkillsDialogOpen, setCleanupSkillsDialogOpen] = useState(false);
+  const [openSections, setOpenSections] = useState<Record<AgentConfigSection, boolean>>({
+    experience: true,
+    model: true,
+    skills: true,
+    knowledge: true,
+    databases: true,
+    workflows: true,
+    integrations: true,
+    files: true,
+    memory: true,
+  });
+  const hydratedAgentIdRef = useRef<string | null>(null);
+  const hydratedConfigSignatureRef = useRef<string | null>(null);
+  const versionPreviewBackupRef = useRef<VersionPreviewBackup | null>(null);
+  const rollbackPreviewRequestRef = useRef(0);
+  const lastSaveBindingHealthRef = useRef<AgentBindingHealth>();
+  const bindingRevisionRef = useRef('');
+
+  const isAgentModelUnavailable = useMemo(() => {
+    if (isAgentModelsLoading || agentModelsError || !modelValue.provider || !modelValue.model) {
+      return false;
+    }
+    return !availableAgentRuntimeModels.some(
+      item => item.provider === modelValue.provider && item.model === modelValue.model
+    );
+  }, [
+    agentModelsError,
+    availableAgentRuntimeModels,
+    isAgentModelsLoading,
+    modelValue.model,
+    modelValue.provider,
+  ]);
+
+  const isAgentModelRecommended = useMemo(() => {
+    if (isAgentModelsLoading || agentModelsError || !modelValue.provider || !modelValue.model) {
+      return true;
+    }
+    return availableAgentRuntimeModels.some(
+      item =>
+        item.provider === modelValue.provider &&
+        item.model === modelValue.model &&
+        item.use_cases?.includes('agent')
+    );
+  }, [
+    agentModelsError,
+    availableAgentRuntimeModels,
+    isAgentModelsLoading,
+    modelValue.model,
+    modelValue.provider,
+  ]);
+
+  const selectableSkills = useMemo(() => {
+    return normalizeAgentSkillCandidates(skillCandidatesResponse?.data.data).map(
+      agentSkillCandidateToMetadata
+    );
+  }, [skillCandidatesResponse?.data.data]);
+  const selectedDatasetQueries = useQueries({
+    queries: knowledgeDatasetIds.map(datasetId => ({
+      queryKey: DATASET_KEYS.detail(datasetId),
+      queryFn: () => datasetService.getDataset(datasetId),
+      enabled: Boolean(datasetId) && canBindKnowledge,
+      staleTime: 5 * 60 * 1000,
+      retry: false,
+    })),
+  });
+  const selectedKnowledgeDatasets = useMemo(() => {
+    const byID = new Map<string, AgentKnowledgeDataset>();
+    selectedDatasetQueries.forEach(query => {
+      const dataset = query.data?.data;
+      if (dataset?.id) {
+        byID.set(dataset.id, dataset);
+      }
+    });
+    return knowledgeDatasetIds.map((id, index) => {
+      const dataset = byID.get(id);
+      if (dataset) return dataset;
+      const query = selectedDatasetQueries[index];
+      const hasLoadError = !canBindKnowledge || Boolean(query?.isError);
+      return createAgentKnowledgeDatasetFallback(
+        id,
+        t('knowledge.loadFailedName'),
+        !canBindKnowledge
+          ? t('knowledge.bindingPermissionRequired')
+          : hasLoadError
+            ? t('knowledge.loadFailedDescription')
+            : '',
+        hasLoadError
+      );
+    });
+  }, [canBindKnowledge, knowledgeDatasetIds, selectedDatasetQueries, t]);
+  const isSelectedDatasetsLoading = selectedDatasetQueries.some(query => query.isLoading);
+  const workflowCandidatesByBindingID = useMemo<Map<string, AgentWorkflowBindingCandidate>>(
+    () => new Map(workflowCandidates.map(candidate => [candidate.binding_id, candidate])),
+    [workflowCandidates]
+  );
+  const integrationCandidatesByConnectionID = useMemo<
+    Map<string, AgentIntegrationConnectionCandidate>
+  >(
+    () => new Map(integrationCandidates.map(candidate => [candidate.connection_id, candidate])),
+    [integrationCandidates]
+  );
+  const normalizedSelectedSkillIds = useMemo(
+    () => normalizeAIChatSkillIds(selectedSkillIds),
+    [selectedSkillIds]
+  );
+  const selectedSkills = useMemo(
+    () =>
+      normalizedSelectedSkillIds
+        .map(id => selectableSkills.find(skill => skill.skill_id === id))
+        .filter((skill): skill is AIChatSkillMetadata => Boolean(skill)),
+    [normalizedSelectedSkillIds, selectableSkills]
+  );
+  const selectedSkillItems = useMemo<AgentRuntimeSelectedSkillItem[]>(
+    () =>
+      normalizedSelectedSkillIds.map(skillId => {
+        const metadata = selectableSkills.find(skill => skill.skill_id === skillId);
+        if (!metadata) {
+          return {
+            skillId,
+            label: t('skills.unavailableName'),
+            description: t('skills.unavailableDescription'),
+          };
+        }
+        const display = getAIChatSkillDisplayInfo(metadata, locale);
+        return {
+          skillId,
+          label: display.label,
+          description: display.description || metadata.description || t('skills.noDescription'),
+          icon: display.icon,
+          metadata,
+        };
+      }),
+    [locale, normalizedSelectedSkillIds, selectableSkills, t]
+  );
+  const agentMemorySlotValidationErrors = useMemo(
+    () => validateAgentMemorySlots(agentMemorySlots),
+    [agentMemorySlots]
+  );
+  const hasAgentMemorySlotErrors =
+    agentMemoryEnabled && agentMemorySlotValidationErrors.some(Boolean);
+  const systemPromptEffectiveLength = useMemo(
+    () => getTemplateAwareCharacterCount(systemPrompt, { templateBlocksEnabled: true }),
+    [systemPrompt]
+  );
+  const isSystemPromptTooLong = systemPromptEffectiveLength > AGENT_SYSTEM_PROMPT_MAX_LENGTH;
+
+  const modelSelectorValue = useMemo(
+    () => ({
+      provider: modelValue.provider,
+      model: modelValue.model,
+      params: modelValue.params,
+    }),
+    [modelValue]
+  );
+  const selectedModelProps = useMemo<ModelSelectorModelProps | null>(
+    () => findAIChatModelProps(availableAgentRuntimeModels, modelSelectorValue),
+    [availableAgentRuntimeModels, modelSelectorValue]
+  );
+  const currentPayload = useMemo<UpdateAgentRuntimeConfigRequest>(
+    () => ({
+      system_prompt: systemPrompt,
+      model_provider: modelValue.provider,
+      model: modelValue.model,
+      model_parameters: modelValue.params,
+      enabled_skill_ids: normalizedSelectedSkillIds,
+      use_memory: false,
+      agent_memory_enabled: agentMemoryEnabled,
+      agent_memory_auto_extraction_enabled: agentMemoryAutoExtractionEnabled,
+      agent_memory_slots: agentMemorySlots.slice(0, 5).map((slot, index) => ({
+        ...slot,
+        description: slot.description.slice(0, 200),
+        max_chars: 2000,
+        sort_order: index,
+      })),
+      file_upload_enabled: fileUploadEnabled,
+      home_title: homeTitle.trim() || defaultHomeTitle,
+      opening_statement: openingStatement,
+      input_placeholder: inputPlaceholder.trim() || defaultInputPlaceholder,
+      theme_color: 'default',
+      suggested_questions: suggestedQuestions
+        .map(item => item.trim())
+        .filter(Boolean)
+        .slice(0, SUGGESTED_QUESTIONS_LIMIT),
+      knowledge_dataset_ids: knowledgeDatasetIds,
+      knowledge_retrieval_config: {},
+      database_bindings: databaseBindings,
+      workflow_bindings: workflowBindings,
+      integration_bindings: integrationBindings,
+      binding_revision: bindingRevision || undefined,
+    }),
+    [
+      defaultHomeTitle,
+      defaultInputPlaceholder,
+      fileUploadEnabled,
+      agentMemoryEnabled,
+      agentMemoryAutoExtractionEnabled,
+      agentMemorySlots,
+      homeTitle,
+      openingStatement,
+      inputPlaceholder,
+      modelValue,
+      normalizedSelectedSkillIds,
+      suggestedQuestions,
+      knowledgeDatasetIds,
+      databaseBindings,
+      workflowBindings,
+      integrationBindings,
+      bindingRevision,
+      systemPrompt,
+    ]
+  );
+  const agentOpeningGuideBrand = useMemo(
+    () =>
+      buildOpeningGuideBrand({
+        title: agentDetail?.name,
+        iconType: agentDetail?.icon_type,
+        icon: agentDetail?.icon,
+        iconUrl: agentDetail?.icon_url,
+      }),
+    [agentDetail?.icon, agentDetail?.icon_type, agentDetail?.icon_url, agentDetail?.name]
+  );
+
+  useEffect(() => {
+    initChatController(null);
+  }, [initChatController]);
+
+  const applyRuntimePayload = useCallback((payload: UpdateAgentRuntimeConfigRequest) => {
+    setSystemPrompt(payload.system_prompt);
+    setModelValue({
+      provider: payload.model_provider,
+      model: payload.model,
+      params: toModelParams(payload.model_parameters),
+    });
+    setSelectedSkillIds(payload.enabled_skill_ids);
+    setAgentMemoryEnabled(payload.agent_memory_enabled ?? false);
+    setAgentMemoryAutoExtractionEnabled(payload.agent_memory_auto_extraction_enabled ?? false);
+    setAgentMemorySlots(payload.agent_memory_slots ?? []);
+    setFileUploadEnabled(payload.file_upload_enabled);
+    setHomeTitle(payload.home_title);
+    setOpeningStatement(payload.opening_statement ?? '');
+    setInputPlaceholder(payload.input_placeholder);
+    setSuggestedQuestions(payload.suggested_questions);
+    setKnowledgeDatasetIds(payload.knowledge_dataset_ids ?? []);
+    setDatabaseBindings(normalizeAgentDatabaseBindings(payload.database_bindings ?? []));
+    setWorkflowBindings(normalizeAgentWorkflowBindings(payload.workflow_bindings ?? []));
+    setIntegrationBindings(normalizeAgentIntegrationBindings(payload.integration_bindings ?? []));
+    const nextBindingRevision = payload.binding_revision ?? '';
+    setBindingRevision(nextBindingRevision);
+    bindingRevisionRef.current = nextBindingRevision;
+  }, []);
+
+  const payloadFromRuntimeConfig = useCallback(
+    (runtimeConfig: AgentRuntimeConfig): UpdateAgentRuntimeConfigRequest => ({
+      system_prompt: runtimeConfig.system_prompt ?? '',
+      model_provider: runtimeConfig.model_provider ?? '',
+      model: runtimeConfig.model ?? '',
+      model_parameters: toModelParams(runtimeConfig.model_parameters),
+      enabled_skill_ids: runtimeConfig.enabled_skill_ids ?? [],
+      use_memory: runtimeConfig.use_memory ?? false,
+      agent_memory_enabled: runtimeConfig.agent_memory_enabled ?? false,
+      agent_memory_auto_extraction_enabled:
+        runtimeConfig.agent_memory_auto_extraction_enabled ?? false,
+      agent_memory_slots: runtimeConfig.agent_memory_slots ?? [],
+      file_upload_enabled: runtimeConfig.file_upload_enabled ?? false,
+      home_title:
+        !runtimeConfig.home_title || runtimeConfig.home_title === 'title'
+          ? defaultHomeTitle
+          : runtimeConfig.home_title,
+      opening_statement: runtimeConfig.opening_statement ?? '',
+      input_placeholder: runtimeConfig.input_placeholder ?? defaultInputPlaceholder,
+      theme_color: 'default',
+      suggested_questions: runtimeConfig.suggested_questions ?? [],
+      knowledge_dataset_ids: runtimeConfig.knowledge_dataset_ids ?? [],
+      knowledge_retrieval_config: runtimeConfig.knowledge_retrieval_config ?? {},
+      database_bindings: normalizeAgentDatabaseBindings(runtimeConfig.database_bindings ?? []),
+      workflow_bindings: normalizeAgentWorkflowBindings(runtimeConfig.workflow_bindings ?? []),
+      integration_bindings: normalizeAgentIntegrationBindings(
+        runtimeConfig.integration_bindings ?? []
+      ),
+      binding_revision: runtimeConfig.binding_revision,
+    }),
+    [defaultHomeTitle, defaultInputPlaceholder]
+  );
+
+  const applySavedBindingMetadata = useCallback(
+    (payload: UpdateAgentRuntimeConfigRequest, health?: AgentBindingHealth) => {
+      const nextBindingRevision = payload.binding_revision ?? '';
+      setBindingRevision(nextBindingRevision);
+      bindingRevisionRef.current = nextBindingRevision;
+      setBindingHealth(health);
+      lastSaveBindingHealthRef.current = health;
+    },
+    []
+  );
+
+  const applyServerBindingPayload = useCallback(
+    (payload: UpdateAgentRuntimeConfigRequest, health?: AgentBindingHealth) => {
+      setSelectedSkillIds(payload.enabled_skill_ids);
+      setKnowledgeDatasetIds(payload.knowledge_dataset_ids ?? []);
+      setDatabaseBindings(normalizeAgentDatabaseBindings(payload.database_bindings ?? []));
+      setWorkflowBindings(normalizeAgentWorkflowBindings(payload.workflow_bindings ?? []));
+      setIntegrationBindings(normalizeAgentIntegrationBindings(payload.integration_bindings ?? []));
+      applySavedBindingMetadata(payload, health);
+    },
+    [applySavedBindingMetadata]
+  );
+
+  const saveRuntimePayload = useCallback(
+    async (payload: UpdateAgentRuntimeConfigRequest) => {
+      const payloadMemorySlotErrors = validateAgentMemorySlots(
+        payload.agent_memory_slots ?? []
+      ).some(Boolean);
+      if (payloadMemorySlotErrors) throw new Error('Invalid Agent Memory slot configuration');
+      let configPayload: UpdateAgentRuntimeConfigRequest = {
+        ...payload,
+        agent_memory_config_revision: agentMemoryConfigRevision || undefined,
+      };
+      let wasBindingRevisionRebased = false;
+      let rebasedBindingHealth: AgentBindingHealth | undefined;
+      let response: Awaited<ReturnType<typeof agentService.updateAgentConfig>>;
+      try {
+        response = await agentService.updateAgentConfig(agentId, configPayload);
+      } catch (error) {
+        const conflict = getAgentBindingRevisionConflict(error);
+        if (conflict?.bindingHealth) setBindingHealth(conflict.bindingHealth);
+        const serverConfig = conflict?.currentConfig;
+        if (!serverConfig?.binding_revision) throw error;
+        const serverMemoryRevision = serverConfig.agent_memory_config_revision?.trim() ?? '';
+        const submittedMemoryRevision = configPayload.agent_memory_config_revision?.trim() ?? '';
+        if (serverMemoryRevision && serverMemoryRevision !== submittedMemoryRevision) {
+          throw new AgentMemoryRevisionChangedError();
+        }
+        const changedBindings = describeBindingChanges(payload, serverConfig, {
+          skill: t('bindingHealth.types.skill'),
+          knowledge: t('bindingHealth.types.knowledge_dataset'),
+          database: t('bindingHealth.types.database'),
+          databaseTable: t('bindingHealth.types.database_table'),
+          writableDatabaseTable: t('bindingHealth.types.writable_database_table'),
+          workflow: t('bindingHealth.types.workflow'),
+          integrationConnection: t('bindingHealth.types.integration_connection'),
+          integrationAction: t('bindingHealth.types.integration_action'),
+        });
+        if (changedBindings.length > 0) {
+          toast.warning(
+            t('toasts.bindingRevisionRebased', {
+              resources: changedBindings.slice(0, 6).join(', '),
+            })
+          );
+        }
+        configPayload = {
+          ...payload,
+          enabled_skill_ids: serverConfig.enabled_skill_ids ?? [],
+          knowledge_dataset_ids: serverConfig.knowledge_dataset_ids ?? [],
+          database_bindings: normalizeAgentDatabaseBindings(serverConfig.database_bindings ?? []),
+          workflow_bindings: normalizeAgentWorkflowBindings(serverConfig.workflow_bindings ?? []),
+          integration_bindings: normalizeAgentIntegrationBindings(
+            serverConfig.integration_bindings ?? []
+          ),
+          binding_revision: serverConfig.binding_revision,
+          agent_memory_config_revision:
+            serverConfig.agent_memory_config_revision ?? configPayload.agent_memory_config_revision,
+        };
+        wasBindingRevisionRebased = true;
+        rebasedBindingHealth = conflict?.bindingHealth;
+        response = await agentService.updateAgentConfig(agentId, configPayload);
+      }
+      const updatedAt = response.data.updated_at ?? Math.floor(Date.now() / 1000);
+      const savedPayload = {
+        ...configPayload,
+        binding_revision: response.data.binding_revision ?? configPayload.binding_revision,
+        agent_memory_slots: response.data.agent_memory_slots ?? payload.agent_memory_slots,
+        agent_memory_config_revision:
+          response.data.agent_memory_config_revision ??
+          configPayload.agent_memory_config_revision,
+      };
+      setAgentMemoryConfigRevision(savedPayload.agent_memory_config_revision ?? '');
+
+      queryClient.setQueryData(AGENT_KEYS.config(agentId), {
+        ...response,
+        data: {
+          ...response.data,
+          agent_memory_enabled: payload.agent_memory_enabled,
+          agent_memory_auto_extraction_enabled:
+            response.data.agent_memory_auto_extraction_enabled ??
+            payload.agent_memory_auto_extraction_enabled,
+          agent_memory_slots: savedPayload.agent_memory_slots,
+          agent_memory_config_revision: savedPayload.agent_memory_config_revision,
+        },
+      });
+      queryClient.invalidateQueries({ queryKey: AGENT_KEYS.detail(agentId) });
+
+      return {
+        savedPayload,
+        updatedAt,
+        bindingPayloadRebased: wasBindingRevisionRebased,
+        bindingHealth: response.data.binding_health ?? rebasedBindingHealth,
+      };
+    },
+    [agentId, agentMemoryConfigRevision, queryClient, t]
+  );
+
+  const {
+    saveState,
+    lastSavedAt,
+    isDirty,
+    isSaving,
+    saveNow,
+    markHydrated,
+    markServerSaved,
+    setPreviewing,
+    getSnapshot,
+    restoreSnapshot,
+  } = useAgentRuntimeDraftPersistence({
+    currentPayload,
+    enabled: !isVersionPreviewing,
+    canSave: () =>
+      canConfigureAgentRuntime &&
+      Boolean(modelValue.provider && modelValue.model) &&
+      !isAgentModelUnavailable &&
+      !hasAgentMemorySlotErrors &&
+      !isSystemPromptTooLong,
+    savePayload: saveRuntimePayload,
+    onSaveCommitted: result => {
+      if (result.bindingPayloadRebased) {
+        applyServerBindingPayload(result.savedPayload, result.bindingHealth);
+      } else {
+        applySavedBindingMetadata(result.savedPayload, result.bindingHealth);
+      }
+      setIsAbnormalSkillCleanupPending(false);
+      setAgentMemorySlots(result.savedPayload.agent_memory_slots ?? []);
+    },
+    onSaveSuperseded: (result, submittedPayload, latestPayload) => {
+      const mergedPayload = mergeSupersededAgentRuntimePayload(
+        submittedPayload,
+        latestPayload,
+        result.savedPayload
+      );
+      applyServerBindingPayload(mergedPayload, result.bindingHealth);
+    },
+    onSaveFailed: (error, options) => {
+      if (!options.silent) {
+        const bindingConflict = getAgentBindingConflict(error);
+        toast.error(
+          error instanceof AgentMemoryRevisionChangedError
+            ? t('toasts.memoryRevisionChanged')
+            : bindingConflict?.code === 'agent_bindings_invalid'
+            ? t('toasts.saveBindingsInvalid')
+            : t('toasts.saveFailedDraftKept')
+        );
+      }
+    },
+  });
+
+  useEffect(() => {
+    if (!config || !agentDetail) return;
+
+    const nextPayload = payloadFromRuntimeConfig(config);
+    const nextSignature = `${agentId}:${config.updated_at ?? ''}:${buildAgentRuntimeSignature(nextPayload)}`;
+    if (hydratedConfigSignatureRef.current === nextSignature) return;
+
+    const isFirstHydrationForAgent = hydratedAgentIdRef.current !== agentId;
+    const canApplyServerConfig =
+      isFirstHydrationForAgent || (!isDirty && saveState !== 'saving' && !isVersionPreviewing);
+    if (!canApplyServerConfig) return;
+
+    applyRuntimePayload(nextPayload);
+    setAgentMemoryConfigRevision(config.agent_memory_config_revision ?? '');
+    setBindingHealth(config.binding_health);
+    setIsAbnormalSkillCleanupPending(false);
+    hydratedAgentIdRef.current = agentId;
+    hydratedConfigSignatureRef.current = nextSignature;
+    markHydrated(nextPayload, config.updated_at ?? null);
+  }, [
+    agentDetail,
+    agentId,
+    applyRuntimePayload,
+    config,
+    isDirty,
+    isVersionPreviewing,
+    markHydrated,
+    payloadFromRuntimeConfig,
+    saveState,
+  ]);
+
+  const handleModelChange = useCallback((value: ModelSelectorValue) => {
+    setModelValue(current => ({
+      provider: value.provider,
+      model: value.model,
+      params: current.params,
+    }));
+  }, []);
+
+  const handleToggleSkill = useCallback((skillId: string, checked: boolean) => {
+    setSelectedSkillIds(current =>
+      checked ? Array.from(new Set([...current, skillId])) : current.filter(id => id !== skillId)
+    );
+  }, []);
+
+  const handleToggleKnowledgeDataset = useCallback((datasetId: string, checked: boolean) => {
+    setKnowledgeDatasetIds(current =>
+      checked
+        ? Array.from(new Set([...current, datasetId]))
+        : current.filter(id => id !== datasetId)
+    );
+  }, []);
+
+  const handleConfirmSkills = useCallback((skillIds: string[]) => {
+    setSelectedSkillIds(Array.from(new Set(skillIds)));
+  }, []);
+
+  const handleConfirmKnowledgeDatasets = useCallback((datasetIds: string[]) => {
+    setKnowledgeDatasetIds(Array.from(new Set(datasetIds)));
+  }, []);
+
+  const handleConfirmWorkflows = useCallback((bindings: AgentWorkflowBinding[]) => {
+    setWorkflowBindings(normalizeAgentWorkflowBindings(bindings));
+  }, []);
+
+  const handleConfirmIntegrations = useCallback((bindings: AgentIntegrationConnectionBinding[]) => {
+    setIntegrationBindings(normalizeAgentIntegrationBindings(bindings));
+  }, []);
+
+  const handleRemoveAbnormalSkills = useCallback(() => {
+    const abnormalSkillIds = new Set(
+      bindingHealth?.items
+        .filter(item => item.binding_type === 'skill' && item.status !== 'active')
+        .map(item => item.resource_id.trim()) ?? []
+    );
+    if (abnormalSkillIds.size === 0) return;
+
+    setSelectedSkillIds(current => current.filter(id => !abnormalSkillIds.has(id.trim())));
+    setIsAbnormalSkillCleanupPending(true);
+    setCleanupSkillsDialogOpen(false);
+    toast.success(t('toasts.abnormalSkillsRemoved'));
+  }, [bindingHealth, t]);
+
+  const handleGenerateSuggestedQuestions = useCallback(
+    async (value: OpeningStatementDialogValue) => {
+      if (isGeneratingSuggestions) return undefined;
+      setIsGeneratingSuggestions(true);
+      try {
+        const skills = selectedSkills.map(skill => {
+          const display = getAIChatSkillDisplayInfo(skill, locale);
+          return {
+            id: skill.skill_id,
+            name: display.label,
+            description: display.description || skill.description || '',
+          };
+        });
+        const response = await agentService.generateSuggestedQuestions(agentId, {
+          locale,
+          count: SUGGESTED_QUESTIONS_LIMIT,
+          provider: modelValue.provider,
+          model: modelValue.model,
+          system_prompt: systemPrompt,
+          home_title: value.title,
+          opening_statement: value.message,
+          existing_questions: value.suggestedQuestions,
+          skills,
+          knowledge_refs: buildSuggestedQuestionContextRefs({
+            selectedKnowledgeDatasets,
+            databaseBindings,
+            workflowBindings,
+            workflowCandidatesByBindingID,
+            fileUploadEnabled,
+            agentMemoryEnabled,
+          }),
+        });
+        const generated = (response.data.questions ?? [])
+          .map(item => item.text.trim())
+          .filter(Boolean)
+          .slice(0, SUGGESTED_QUESTIONS_LIMIT);
+        if (generated.length === 0) {
+          toast.info(t('toasts.noGeneratedSuggestions'));
+          return undefined;
+        }
+        toast.success(t('toasts.suggestionsGenerated'));
+        return { questions: generated };
+      } catch (error) {
+        toast.error(getErrorMessage(error) || t('toasts.generateSuggestionsFailed'));
+        return undefined;
+      } finally {
+        setIsGeneratingSuggestions(false);
+      }
+    },
+    [
+      agentId,
+      databaseBindings,
+      fileUploadEnabled,
+      agentMemoryEnabled,
+      isGeneratingSuggestions,
+      locale,
+      modelValue.model,
+      modelValue.provider,
+      selectedSkills,
+      selectedKnowledgeDatasets,
+      systemPrompt,
+      t,
+      workflowBindings,
+      workflowCandidatesByBindingID,
+    ]
+  );
+
+  const handleCopyWebAppUrl = useCallback(async () => {
+    const webAppID = agentDetail?.web_app_id;
+    if (!webAppID) {
+      toast.error(t('toasts.noWebAppUrl'));
+      return;
+    }
+    try {
+      await navigator.clipboard.writeText(`${window.location.origin}/webapp/${webAppID}/chat`);
+      toast.success(t('toasts.webAppLinkCopied'));
+    } catch {
+      toast.error(t('toasts.webAppLinkCopyFailed'));
+    }
+  }, [agentDetail?.web_app_id, t]);
+
+  const handleOpenPublishedVersions = useCallback(async () => {
+    setPublishedVersionsOpen(true);
+    setIsLoadingVersions(true);
+    try {
+      const response = await agentService.getPublishedVersions(agentId);
+      setPublishedVersions(response.data.data ?? []);
+    } catch (error) {
+      toast.error(getErrorMessage(error) || t('toasts.loadPublishedVersionsFailed'));
+    } finally {
+      setIsLoadingVersions(false);
+    }
+  }, [agentId, t]);
+
+  const handleCancelVersionPreview = useCallback(() => {
+    rollbackPreviewRequestRef.current += 1;
+    const backup = versionPreviewBackupRef.current;
+    if (backup) {
+      applyRuntimePayload(backup.payload);
+      restoreSnapshot(backup.persistence);
+      setBindingHealth(backup.bindingHealth);
+    }
+    versionPreviewBackupRef.current = null;
+    setRollbackPreview(undefined);
+    setIsLoadingRollbackPreview(false);
+    setSelectedPublishedVersionId('');
+    setIsVersionPreviewing(false);
+  }, [applyRuntimePayload, restoreSnapshot]);
+
+  const handlePublishedVersionsOpenChange = useCallback(
+    (open: boolean) => {
+      if (open) {
+        void handleOpenPublishedVersions();
+        return;
+      }
+      handleCancelVersionPreview();
+      setPublishedVersionsOpen(false);
+    },
+    [handleCancelVersionPreview, handleOpenPublishedVersions]
+  );
+
+  const handleSelectPublishedVersion = useCallback(
+    async (versionId: string) => {
+      const version = publishedVersions.find(item => item.id === versionId);
+      if (!version) return;
+      if (!versionPreviewBackupRef.current) {
+        versionPreviewBackupRef.current = {
+          payload: currentPayload,
+          persistence: getSnapshot(),
+          bindingHealth,
+        };
+      }
+      setSelectedPublishedVersionId(version.id);
+      setRollbackPreview(undefined);
+      setIsLoadingRollbackPreview(true);
+      const requestId = rollbackPreviewRequestRef.current + 1;
+      rollbackPreviewRequestRef.current = requestId;
+      try {
+        const response = await agentService.getPublishedVersionRollbackPreview(agentId, versionId);
+        if (rollbackPreviewRequestRef.current !== requestId) return;
+        const preview = response.data;
+        const nextPayload = payloadFromRuntimeConfig(preview.config_snapshot);
+        applyRuntimePayload(nextPayload);
+        setBindingHealth(preview.binding_health);
+        setRollbackPreview(preview);
+        setIsVersionPreviewing(true);
+        setPreviewing();
+      } catch (error) {
+        if (rollbackPreviewRequestRef.current !== requestId) return;
+        handleCancelVersionPreview();
+        toast.error(getErrorMessage(error) || t('toasts.loadRollbackPreviewFailed'));
+      } finally {
+        if (rollbackPreviewRequestRef.current === requestId) {
+          setIsLoadingRollbackPreview(false);
+        }
+      }
+    },
+    [
+      agentId,
+      applyRuntimePayload,
+      bindingHealth,
+      currentPayload,
+      getSnapshot,
+      handleCancelVersionPreview,
+      payloadFromRuntimeConfig,
+      publishedVersions,
+      setPreviewing,
+      t,
+    ]
+  );
+
+  const handleConfirmVersionRollback = useCallback(async () => {
+    if (!canPublishAgent) {
+      toast.error(tRoot('common.unauthorizedDescription'));
+      return;
+    }
+    if (!selectedPublishedVersionId || !rollbackPreview?.impact_token || isRollingBackVersion) {
+      return;
+    }
+    setIsRollingBackVersion(true);
+    try {
+      const response = await agentService.rollbackPublishedVersion(agentId, {
+        version_id: selectedPublishedVersionId,
+        impact_token: rollbackPreview.impact_token,
+        binding_action: 'remove_all_abnormal',
+      });
+      const nextPayload = payloadFromRuntimeConfig(response.data);
+      applyRuntimePayload(nextPayload);
+      setAgentMemoryConfigRevision(response.data.agent_memory_config_revision ?? '');
+      markServerSaved(nextPayload, response.data.updated_at ?? Math.floor(Date.now() / 1000));
+      setBindingHealth(response.data.binding_health);
+      setIsAbnormalSkillCleanupPending(false);
+      queryClient.setQueryData(AGENT_KEYS.config(agentId), response);
+      versionPreviewBackupRef.current = null;
+      setIsVersionPreviewing(false);
+      setSelectedPublishedVersionId('');
+      setRollbackPreview(undefined);
+      setPublishedVersionsOpen(false);
+      toast.success(t('toasts.rollbackSuccess'));
+    } catch (error) {
+      const changedPreview = getAgentRollbackImpactChanged(error);
+      if (changedPreview) {
+        setRollbackPreview(changedPreview);
+        setBindingHealth(changedPreview.binding_health);
+        toast.warning(t('toasts.rollbackImpactChanged'));
+        return;
+      }
+      toast.error(getErrorMessage(error) || t('toasts.rollbackFailed'));
+    } finally {
+      setIsRollingBackVersion(false);
+    }
+  }, [
+    applyRuntimePayload,
+    agentId,
+    canPublishAgent,
+    isRollingBackVersion,
+    markServerSaved,
+    payloadFromRuntimeConfig,
+    queryClient,
+    rollbackPreview,
+    selectedPublishedVersionId,
+    t,
+    tRoot,
+  ]);
+
+  const handleApplyOptimizedPrompt = useCallback((payload: { text: string }) => {
+    setSystemPrompt(payload.text);
+    setPromptOptimizerOpen(false);
+  }, []);
+
+  const handleManualSave = useCallback(async () => {
+    if (!canConfigureAgentRuntime) {
+      toast.error(tRoot('common.unauthorizedDescription'));
+      return;
+    }
+    if (hasAgentMemorySlotErrors) {
+      toast.error(t('toasts.fixMemorySlotsBeforeSave'));
+      return;
+    }
+    if (isAgentModelUnavailable) {
+      toast.error(t('toasts.modelUnavailable'));
+      return;
+    }
+    if (isSystemPromptTooLong) {
+      toast.error(
+        t('toasts.systemPromptTooLongBeforeSave', { limit: AGENT_SYSTEM_PROMPT_MAX_LENGTH })
+      );
+      return;
+    }
+    const saved = await saveNow({ silent: false, force: true });
+    if (saved) {
+      const savedHealth = lastSaveBindingHealthRef.current;
+      const abnormalCount =
+        (savedHealth?.suspended_count ?? 0) + (savedHealth?.unavailable_count ?? 0);
+      if (abnormalCount > 0) {
+        toast.warning(t('toasts.saveSuccessWithBindingWarnings', { count: abnormalCount }));
+      } else {
+        toast.success(t('toasts.saveSuccess'));
+      }
+    }
+  }, [
+    canConfigureAgentRuntime,
+    hasAgentMemorySlotErrors,
+    isAgentModelUnavailable,
+    isSystemPromptTooLong,
+    saveNow,
+    t,
+    tRoot,
+  ]);
+
+  const focusInvalidBindings = useCallback((health?: AgentBindingHealth) => {
+    const firstAbnormalBinding = health?.items.find(item => item.status !== 'active');
+    let targetSection: AgentConfigSection | undefined;
+    if (firstAbnormalBinding?.binding_type === 'skill') targetSection = 'skills';
+    if (firstAbnormalBinding?.binding_type === 'knowledge_dataset') targetSection = 'knowledge';
+    if (
+      firstAbnormalBinding?.binding_type === 'database' ||
+      firstAbnormalBinding?.binding_type === 'database_table'
+    ) {
+      targetSection = 'databases';
+    }
+    if (firstAbnormalBinding?.binding_type === 'workflow') targetSection = 'workflows';
+    if (firstAbnormalBinding?.binding_type === 'integration_connection') {
+      targetSection = 'integrations';
+    }
+
+    if (health) {
+      setOpenSections(current => {
+        const next = { ...current };
+        health.items
+          .filter(item => item.status !== 'active')
+          .forEach(item => {
+            if (item.binding_type === 'skill') next.skills = true;
+            if (item.binding_type === 'knowledge_dataset') next.knowledge = true;
+            if (item.binding_type === 'database' || item.binding_type === 'database_table') {
+              next.databases = true;
+            }
+            if (item.binding_type === 'workflow') next.workflows = true;
+            if (item.binding_type === 'integration_connection') next.integrations = true;
+          });
+        return next;
+      });
+    }
+    window.setTimeout(() => {
+      if (!targetSection) return;
+      document.getElementById(`agent-config-section-${targetSection}`)?.scrollIntoView({
+        behavior: 'smooth',
+        block: 'start',
+      });
+    }, 0);
+  }, []);
+
+  const publishCurrentDraft = useCallback(
+    async (acknowledgeSuspendedBindings: boolean, versionDetails: AgentPublishVersionDetails) => {
+      if (isPublishing) return;
+      setIsPublishing(true);
+      try {
+        await agentService.publishAgent(agentId, {
+          name: versionDetails.name.trim() || undefined,
+          description: versionDetails.description.trim() || undefined,
+          binding_revision: bindingRevisionRef.current || undefined,
+          acknowledge_suspended_bindings: acknowledgeSuspendedBindings || undefined,
+        });
+        setPublishVersionDialogOpen(false);
+        setSuspendedBindingsDialogOpen(false);
+        queryClient.invalidateQueries({ queryKey: AGENT_KEYS.detail(agentId) });
+        queryClient.invalidateQueries({ queryKey: AGENT_KEYS.lists() });
+        queryClient.invalidateQueries({ queryKey: [...AGENT_KEYS.all, 'runnable-webapps'] });
+        toast.success(tRoot('agents.toasts.publishSuccess'));
+      } catch (error) {
+        const conflict = getAgentBindingConflict(error);
+        if (conflict?.bindingHealth) setBindingHealth(conflict.bindingHealth);
+        if (conflict?.code === 'agent_bindings_suspended' && !acknowledgeSuspendedBindings) {
+          setPublishVersionDialogOpen(false);
+          setSuspendedBindingsDialogOpen(true);
+        } else if (conflict?.code === 'agent_bindings_invalid') {
+          setPublishVersionDialogOpen(false);
+          setSuspendedBindingsDialogOpen(false);
+          focusInvalidBindings(conflict.bindingHealth);
+          toast.error(t('toasts.publishBindingsInvalid'));
+        } else {
+          toast.error(getErrorMessage(error) || tRoot('agents.toasts.publishFailed'));
+        }
+      } finally {
+        setIsPublishing(false);
+      }
+    },
+    [agentId, focusInvalidBindings, isPublishing, queryClient, t, tRoot]
+  );
+
+  const handlePublish = useCallback(async () => {
+    if (!canPublishAgent) {
+      toast.error(tRoot('common.unauthorizedDescription'));
+      return;
+    }
+    if (hasAgentMemorySlotErrors) {
+      toast.error(t('toasts.fixMemorySlotsBeforePublish'));
+      return;
+    }
+    if (isAgentModelUnavailable) {
+      toast.error(t('toasts.modelUnavailable'));
+      return;
+    }
+    if (isSystemPromptTooLong) {
+      toast.error(
+        t('toasts.systemPromptTooLongBeforePublish', { limit: AGENT_SYSTEM_PROMPT_MAX_LENGTH })
+      );
+      return;
+    }
+    setPublishVersionDetails(EMPTY_PUBLISH_VERSION_DETAILS);
+    setPublishVersionDialogOpen(true);
+  }, [
+    canPublishAgent,
+    hasAgentMemorySlotErrors,
+    isAgentModelUnavailable,
+    isSystemPromptTooLong,
+    t,
+    tRoot,
+  ]);
+
+  const handleConfirmPublishVersion = useCallback(async () => {
+    const canPublishCurrentDraft =
+      !canConfigureAgentRuntime || (await saveNow({ silent: true, force: true }));
+    if (canPublishCurrentDraft) {
+      await publishCurrentDraft(false, publishVersionDetails);
+    }
+  }, [canConfigureAgentRuntime, publishCurrentDraft, publishVersionDetails, saveNow]);
+
+  const handleSaveBeforeLeave = useCallback(() => {
+    if (!canConfigureAgentRuntime) {
+      toast.error(tRoot('common.unauthorizedDescription'));
+      return Promise.resolve(false);
+    }
+    if (hasAgentMemorySlotErrors) {
+      toast.error(t('toasts.fixMemorySlotsBeforeSave'));
+      return Promise.resolve(false);
+    }
+    if (isAgentModelUnavailable) {
+      toast.error(t('toasts.modelUnavailable'));
+      return Promise.resolve(false);
+    }
+    if (isSystemPromptTooLong) {
+      toast.error(
+        t('toasts.systemPromptTooLongBeforeSave', { limit: AGENT_SYSTEM_PROMPT_MAX_LENGTH })
+      );
+      return Promise.resolve(false);
+    }
+    return saveNow({ silent: false, force: true });
+  }, [
+    canConfigureAgentRuntime,
+    hasAgentMemorySlotErrors,
+    isAgentModelUnavailable,
+    isSystemPromptTooLong,
+    saveNow,
+    t,
+    tRoot,
+  ]);
+
+  const handlePreviewSheetOpenChange = useCallback(
+    async (open: boolean) => {
+      if (!open) {
+        setPreviewSheetOpen(false);
+        return;
+      }
+      if (!canConfigureAgentRuntime || isVersionPreviewing) {
+        setPreviewSheetOpen(true);
+        return;
+      }
+      if (hasAgentMemorySlotErrors || isAgentModelUnavailable || isSystemPromptTooLong) {
+        if (isAgentModelUnavailable) {
+          toast.error(t('toasts.modelUnavailable'));
+        }
+        setPreviewSheetOpen(false);
+        return;
+      }
+      const saved = await saveNow({ silent: true, force: true });
+      if (saved) {
+        setPreviewSheetOpen(true);
+      }
+    },
+    [
+      canConfigureAgentRuntime,
+      hasAgentMemorySlotErrors,
+      isAgentModelUnavailable,
+      isSystemPromptTooLong,
+      isVersionPreviewing,
+      saveNow,
+      t,
+    ]
+  );
+
+  const handlePreviewBeforeSend = useCallback(async () => {
+    if (!canConfigureAgentRuntime) {
+      toast.error(tRoot('common.unauthorizedDescription'));
+      return false;
+    }
+    if (isVersionPreviewing) {
+      return true;
+    }
+    if (hasAgentMemorySlotErrors) {
+      toast.error(t('toasts.fixMemorySlotsBeforeSave'));
+      return false;
+    }
+    if (isAgentModelUnavailable) {
+      toast.error(t('toasts.modelUnavailable'));
+      return false;
+    }
+    if (isSystemPromptTooLong) {
+      toast.error(
+        t('toasts.systemPromptTooLongBeforeSave', { limit: AGENT_SYSTEM_PROMPT_MAX_LENGTH })
+      );
+      return false;
+    }
+    return saveNow({ silent: false, force: true });
+  }, [
+    canConfigureAgentRuntime,
+    hasAgentMemorySlotErrors,
+    isAgentModelUnavailable,
+    isSystemPromptTooLong,
+    isVersionPreviewing,
+    saveNow,
+    t,
+    tRoot,
+  ]);
+
+  const leaveGuardNode = useAgentRuntimeLeaveGuard({
+    enabled: canConfigureAgentRuntime && !isVersionPreviewing,
+    hasUnsavedChanges: isDirty,
+    isSaving,
+    onSave: handleSaveBeforeLeave,
+  });
+
+  const webAppUrl = agentDetail?.web_app_id ? `/webapp/${agentDetail.web_app_id}/chat` : '';
+  const isRuntimeConfigReadOnly = isVersionPreviewing || !canConfigureAgentRuntime;
+  const aiChatContext = useMemo(
+    () =>
+      buildAgentRuntimeAIChatContext({
+        agent: agentDetail,
+        locale,
+        payload: currentPayload,
+        promptCharacterCount: systemPromptEffectiveLength,
+        isPromptTooLong: isSystemPromptTooLong,
+        selectedSkills,
+        selectedKnowledgeDatasets,
+        permissions,
+        organizationRole,
+        workspaceRole,
+        workspaceRoleName,
+        canManageAgent,
+        saveState,
+        isDirty,
+        isVersionPreviewing,
+        webAppUrl,
+      }),
+    [
+      agentDetail,
+      canManageAgent,
+      currentPayload,
+      isDirty,
+      isSystemPromptTooLong,
+      isVersionPreviewing,
+      locale,
+      organizationRole,
+      permissions,
+      saveState,
+      selectedKnowledgeDatasets,
+      selectedSkills,
+      systemPromptEffectiveLength,
+      webAppUrl,
+      workspaceRole,
+      workspaceRoleName,
+    ]
+  );
+
+  return {
+    agentId,
+    locale,
+    t,
+    externalIntegrationsEnabled,
+    aiChatContext,
+    isLoading: isAgentLoading || isConfigLoading || isPermissionsLoading,
+    canOpenAgentRuntimeEditor,
+    leaveGuardNode,
+    previewSheetOpen,
+    setPreviewSheetOpen: handlePreviewSheetOpenChange,
+    header: {
+      agentId,
+      agent: agentDetail,
+      saveState,
+      saveText: getAgentRuntimeSaveText(t, saveState, lastSavedAt),
+      isDirty,
+      isPublishing,
+      canEditBasicInfo: canUpdateAgent,
+      disablePrimaryActions: isVersionPreviewing || !canConfigureAgentRuntime,
+      disablePublishActions: isVersionPreviewing || !canPublishAgent,
+      disablePublishSettingsActions: isVersionPreviewing || !canManageAgentRuntimeAccess,
+      webAppUrl,
+      showPreviewAction: canConfigureAgentRuntime,
+      isPreviewOpen: previewSheetOpen,
+      onSave: handleManualSave,
+      onPublish: handlePublish,
+      onCopyWebAppUrl: handleCopyWebAppUrl,
+      onTogglePreview: () => void handlePreviewSheetOpenChange(!previewSheetOpen),
+      onOpenPublishedVersions: handleOpenPublishedVersions,
+    },
+    version: {
+      open: publishedVersionsOpen,
+      isLoading: isLoadingVersions,
+      isRollingBack: isRollingBackVersion,
+      isLoadingPreview: isLoadingRollbackPreview,
+      isPreviewing: isVersionPreviewing,
+      canRollback: canPublishAgent,
+      canOpen: canPublishAgent,
+      versions: publishedVersions,
+      selectedVersionId: selectedPublishedVersionId,
+      rollbackPreview,
+      onOpenChange: handlePublishedVersionsOpenChange,
+      onSelectVersion: handleSelectPublishedVersion,
+      onCancelPreview: () => {
+        handleCancelVersionPreview();
+        setPublishedVersionsOpen(false);
+      },
+      onConfirmRollback: () => void handleConfirmVersionRollback(),
+    },
+    prompt: {
+      readOnly: isRuntimeConfigReadOnly,
+      systemPrompt,
+      agentWorkspaceId,
+      selectedKnowledgeDatasets,
+      selectedSkills,
+      databaseBindings,
+      workflowBindings,
+      workflowCandidatesByBindingID,
+      onChangeSystemPrompt: (value: string) => {
+        if (isRuntimeConfigReadOnly) return;
+        setSystemPrompt(value);
+      },
+      onOpenOptimizer: () => {
+        if (isRuntimeConfigReadOnly) return;
+        setPromptOptimizerOpen(true);
+      },
+    },
+    orchestration: {
+      readOnly: isRuntimeConfigReadOnly,
+      agentId,
+      openSections,
+      modelValue,
+      isAgentModelUnavailable,
+      isAgentModelRecommended,
+      homeTitle,
+      openingStatement,
+      inputPlaceholder,
+      selectedSkillItems,
+      normalizedSelectedSkillIds,
+      selectableSkillsCount: skillCandidatesResponse?.data.total ?? selectableSkills.length,
+      isSkillsLoading: isSkillCandidatesLoading || isSkillCandidatesFetching,
+      isSkillConfigLoading: false,
+      isDatasetsLoading: isSelectedDatasetsLoading,
+      canBindKnowledge,
+      selectedKnowledgeDatasets,
+      selectedKnowledgeDatasetIds: knowledgeDatasetIds,
+      databaseBindings,
+      workflowBindings,
+      workflowCandidatesByBindingID,
+      isWorkflowCandidatesLoading,
+      integrationBindings,
+      integrationCandidatesByConnectionID,
+      isIntegrationCandidatesLoading,
+      externalIntegrationsEnabled,
+      suggestedQuestions,
+      isGeneratingSuggestions,
+      fileUploadEnabled,
+      agentMemoryEnabled,
+      agentMemoryAutoExtractionEnabled,
+      agentMemorySlots,
+      agentMemorySlotValidationErrors,
+      defaultHomeTitle,
+      defaultInputPlaceholder,
+      openingGuideBrand: agentOpeningGuideBrand,
+      bindingHealth,
+      isSkillCleanupPending: isAbnormalSkillCleanupPending,
+      onRemoveAbnormalSkills: () => setCleanupSkillsDialogOpen(true),
+      onToggleSection: (section: AgentConfigSection) =>
+        setOpenSections(current => ({ ...current, [section]: !current[section] })),
+      onChangeModelValue: (value: ModelSelectorParameterValue) => {
+        if (isRuntimeConfigReadOnly) return;
+        setModelValue(value);
+      },
+      onChangeHomeTitle: (value: string) => {
+        if (isRuntimeConfigReadOnly) return;
+        setHomeTitle(value);
+      },
+      onChangeOpeningStatement: (value: string) => {
+        if (isRuntimeConfigReadOnly) return;
+        setOpeningStatement(value);
+      },
+      onChangeInputPlaceholder: (value: string) => {
+        if (isRuntimeConfigReadOnly) return;
+        setInputPlaceholder(value);
+      },
+      onOpenSkillDialog: () => {
+        if (isRuntimeConfigReadOnly) return;
+        setSkillDialogOpen(true);
+      },
+      onOpenKnowledgeDialog: () => {
+        if (isRuntimeConfigReadOnly || !canBindKnowledge) return;
+        setKnowledgeDialogOpen(true);
+      },
+      onOpenWorkflowDialog: () => {
+        if (isRuntimeConfigReadOnly) return;
+        setWorkflowDialogOpen(true);
+      },
+      onOpenIntegrationDialog: () => {
+        if (isRuntimeConfigReadOnly || !externalIntegrationsEnabled) return;
+        setIntegrationDialogOpen(true);
+      },
+      onToggleSkill: (skillId: string, checked: boolean) => {
+        if (isRuntimeConfigReadOnly) return;
+        handleToggleSkill(skillId, checked);
+      },
+      onToggleKnowledgeDataset: (datasetId: string, checked: boolean) => {
+        if (isRuntimeConfigReadOnly || !canBindKnowledge) return;
+        handleToggleKnowledgeDataset(datasetId, checked);
+      },
+      onChangeDatabaseBindings: (value: AgentDatabaseBinding[]) => {
+        if (isRuntimeConfigReadOnly) return;
+        setDatabaseBindings(value);
+      },
+      onChangeWorkflowBindings: (value: AgentWorkflowBinding[]) => {
+        if (isRuntimeConfigReadOnly) return;
+        setWorkflowBindings(normalizeAgentWorkflowBindings(value));
+      },
+      onChangeIntegrationBindings: (value: AgentIntegrationConnectionBinding[]) => {
+        if (isRuntimeConfigReadOnly) return;
+        setIntegrationBindings(normalizeAgentIntegrationBindings(value));
+      },
+      onGenerateSuggestedQuestions: async (value: OpeningStatementDialogValue) => {
+        if (isRuntimeConfigReadOnly) return undefined;
+        return handleGenerateSuggestedQuestions(value);
+      },
+      onChangeSuggestedQuestions: (value: string[]) => {
+        if (isRuntimeConfigReadOnly) return;
+        setSuggestedQuestions(value);
+      },
+      onChangeFileUploadEnabled: (value: boolean) => {
+        if (isRuntimeConfigReadOnly) return;
+        setFileUploadEnabled(value);
+      },
+      onChangeAgentMemoryEnabled: (value: boolean) => {
+        if (isRuntimeConfigReadOnly) return;
+        setAgentMemoryEnabled(value);
+      },
+      onChangeAgentMemoryAutoExtractionEnabled: (value: boolean) => {
+        if (isRuntimeConfigReadOnly) return;
+        setAgentMemoryAutoExtractionEnabled(value);
+      },
+      onChangeAgentMemorySlots: (value: AgentMemorySlotConfig[]) => {
+        if (isRuntimeConfigReadOnly) return;
+        setAgentMemorySlots(value);
+      },
+    },
+    preview: {
+      canUseDraftPreview: canConfigureAgentRuntime,
+      agentId,
+      controller: chatController,
+      modelSelectorValue,
+      modelProps: selectedModelProps,
+      useMemory: false,
+      fileUploadEnabled,
+      suggestions: currentPayload.suggested_questions,
+      inputPlaceholder: currentPayload.input_placeholder,
+      openingGuideBrand: agentOpeningGuideBrand,
+      homeTitle: currentPayload.home_title || defaultHomeTitle,
+      openingStatement: currentPayload.opening_statement,
+      voiceInputEnabled,
+      speechEnabled,
+      beforeSend: handlePreviewBeforeSend,
+      onOpenMemoryValues: () => setMemoryValuesOpen(true),
+      onModelChange: handleModelChange,
+      onClose: () => void handlePreviewSheetOpenChange(false),
+    },
+    dialogs: {
+      promptOptimizer: {
+        open: promptOptimizerOpen,
+        onOpenChange: setPromptOptimizerOpen,
+        initialPrompt: systemPrompt,
+        sourceLabel: t('prompt.optimizerSourceLabel'),
+        sourceHelpText: t('prompt.optimizerSourceHelp'),
+        sourceResetLabel: t('prompt.optimizerSourceReset'),
+        targetMaxChars: AGENT_SYSTEM_PROMPT_MAX_LENGTH,
+        initialModel: modelValue.model
+          ? {
+              provider: modelValue.provider,
+              model: modelValue.model,
+            }
+          : null,
+        applyLabel: t('prompt.optimizerApply'),
+        onApplyResult: handleApplyOptimizedPrompt,
+      },
+      skill: {
+        agentId,
+        open: skillDialogOpen,
+        locale,
+        normalizedSelectedSkillIds,
+        onOpenChange: setSkillDialogOpen,
+        onConfirmSkills: handleConfirmSkills,
+      },
+      knowledge: {
+        agentId,
+        open: knowledgeDialogOpen && canBindKnowledge,
+        selectedDatasetIds: knowledgeDatasetIds,
+        onOpenChange: setKnowledgeDialogOpen,
+        onConfirmDatasets: handleConfirmKnowledgeDatasets,
+      },
+      workflow: {
+        agentId,
+        open: workflowDialogOpen,
+        bindings: workflowBindings,
+        onOpenChange: setWorkflowDialogOpen,
+        onConfirmWorkflows: handleConfirmWorkflows,
+      },
+      integration: {
+        agentId,
+        open: integrationDialogOpen && externalIntegrationsEnabled,
+        bindings: integrationBindings,
+        onOpenChange: setIntegrationDialogOpen,
+        onConfirmBindings: handleConfirmIntegrations,
+      },
+      memoryValues: {
+        agentId,
+        open: memoryValuesOpen,
+        defaultUserId: profile?.id,
+        onOpenChange: setMemoryValuesOpen,
+      },
+      publishVersion: {
+        open: publishVersionDialogOpen,
+        isUpdate: Boolean(agentDetail?.is_published),
+        isSubmitting: isPublishing || saveState === 'saving',
+        value: publishVersionDetails,
+        onOpenChange: setPublishVersionDialogOpen,
+        onChange: setPublishVersionDetails,
+        onConfirm: () => void handleConfirmPublishVersion(),
+      },
+      suspendedBindings: {
+        open: suspendedBindingsDialogOpen,
+        health: bindingHealth,
+        isPublishing,
+        onOpenChange: setSuspendedBindingsDialogOpen,
+        onConfirm: () => void publishCurrentDraft(true, publishVersionDetails),
+      },
+      cleanupSkills: {
+        open: cleanupSkillsDialogOpen,
+        onOpenChange: setCleanupSkillsDialogOpen,
+        title: t('bindingHealth.cleanupSkillsConfirmTitle'),
+        description: t('bindingHealth.cleanupSkillsConfirmDescription'),
+        onConfirm: handleRemoveAbnormalSkills,
+      },
+    },
+  };
+}
+
+export type AgentRuntimePageModel = ReturnType<typeof useAgentRuntimePageModel>;

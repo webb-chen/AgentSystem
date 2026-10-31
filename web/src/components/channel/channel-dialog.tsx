@@ -1,0 +1,1022 @@
+'use client';
+
+import React, { useCallback } from 'react';
+import {
+  Dialog,
+  DialogContent,
+  DialogHeader,
+  DialogTitle,
+  DialogDescription,
+  DialogBody,
+} from '@/components/ui/dialog';
+import { Input, PasswordInput } from '@/components/ui/input';
+import { Switch } from '@/components/ui/switch';
+import { Button } from '@/components/ui/button';
+import { useCreateChannel, useUpdateChannel } from '@/hooks';
+import type {
+  CreateChannelRequest,
+  ChannelDetail,
+  UpdateChannelRequest,
+} from '@/services/types/channel';
+import type { ModelItem } from '@/services/types/model';
+import { useT } from '@/i18n';
+import ModelMultiSelector from '@/components/common/model-multi-selector/model-multi-selector';
+import { buildModelSelectionKey } from '@/components/common/model-multi-selector/model-selection';
+import { ArrowLeft, ChevronDown } from 'lucide-react';
+import { cn } from '@/lib/utils';
+import { toast } from 'sonner';
+import ChannelProviderSelector, {
+  getMappedProvider,
+  getChannelProviderOption,
+} from '@/components/channel/channel-provider-selector';
+import { ProviderIcon } from '@/components/common/provider-icon';
+import { isDoubaoSpeechModel } from '@/components/channel/channel-model-scope';
+import {
+  CHANNEL_INITIAL_CREDIT_MAX,
+  CHANNEL_POINTS_PER_USD,
+  formatChannelCreditPoints,
+  usdToChannelPoints,
+} from '@/utils/ai-credits';
+
+const DEFAULT_INITIAL_FUNDS_USD = '100.00';
+
+type ChannelSetupCategory = 'common' | 'aggregator' | 'advanced';
+type ChannelSetupKind = 'direct' | 'aggregator' | 'compatible' | 'local' | 'custom';
+type ChannelModelScope = 'speech' | 'non-speech';
+
+interface ChannelSetupOption {
+  id: string;
+  category: ChannelSetupCategory;
+  kind: ChannelSetupKind;
+  labelKey: string;
+  descriptionKey: string;
+  capabilityKey: string;
+  channelProvider: string;
+  providerFilter?: string;
+  modelScope?: ChannelModelScope;
+  icon?: string;
+  defaultApiBaseUrl?: string;
+  lockProtocol?: boolean;
+}
+
+const CHANNEL_SETUP_CATEGORIES: ChannelSetupCategory[] = ['common', 'aggregator', 'advanced'];
+
+const CHANNEL_SETUP_OPTIONS: ChannelSetupOption[] = [
+  {
+    id: 'openai',
+    category: 'common',
+    kind: 'direct',
+    labelKey: 'dialog.setup.providers.openai.label',
+    descriptionKey: 'dialog.setup.providers.openai.description',
+    capabilityKey: 'dialog.setup.providers.openai.capabilities',
+    channelProvider: 'openai',
+    providerFilter: 'openai',
+    icon: 'openai',
+    lockProtocol: true,
+  },
+  {
+    id: 'qwen',
+    category: 'common',
+    kind: 'direct',
+    labelKey: 'dialog.setup.providers.qwen.label',
+    descriptionKey: 'dialog.setup.providers.qwen.description',
+    capabilityKey: 'dialog.setup.providers.qwen.capabilities',
+    channelProvider: 'qwen',
+    providerFilter: 'qwen',
+    icon: 'qwen',
+    lockProtocol: true,
+  },
+  {
+    id: 'minimax',
+    category: 'common',
+    kind: 'direct',
+    labelKey: 'dialog.setup.providers.minimax.label',
+    descriptionKey: 'dialog.setup.providers.minimax.description',
+    capabilityKey: 'dialog.setup.providers.minimax.capabilities',
+    channelProvider: 'minimax',
+    providerFilter: 'minimax',
+    icon: 'minimax',
+    lockProtocol: true,
+  },
+  {
+    id: 'doubao',
+    category: 'common',
+    kind: 'direct',
+    labelKey: 'dialog.setup.providers.doubao.label',
+    descriptionKey: 'dialog.setup.providers.doubao.description',
+    capabilityKey: 'dialog.setup.providers.doubao.capabilities',
+    channelProvider: 'doubao',
+    providerFilter: 'doubao',
+    modelScope: 'non-speech',
+    icon: 'doubao',
+    lockProtocol: true,
+  },
+  {
+    id: 'doubao-speech',
+    category: 'common',
+    kind: 'direct',
+    labelKey: 'dialog.setup.providers.doubaoSpeech.label',
+    descriptionKey: 'dialog.setup.providers.doubaoSpeech.description',
+    capabilityKey: 'dialog.setup.providers.doubaoSpeech.capabilities',
+    channelProvider: 'doubao-speech',
+    providerFilter: 'doubao',
+    modelScope: 'speech',
+    icon: 'doubao',
+    defaultApiBaseUrl: 'https://openspeech.bytedance.com',
+    lockProtocol: true,
+  },
+  {
+    id: 'deepseek',
+    category: 'common',
+    kind: 'direct',
+    labelKey: 'dialog.setup.providers.deepseek.label',
+    descriptionKey: 'dialog.setup.providers.deepseek.description',
+    capabilityKey: 'dialog.setup.providers.deepseek.capabilities',
+    channelProvider: 'deepseek',
+    providerFilter: 'deepseek',
+    icon: 'deepseek',
+    lockProtocol: true,
+  },
+  {
+    id: 'anthropic',
+    category: 'common',
+    kind: 'direct',
+    labelKey: 'dialog.setup.providers.anthropic.label',
+    descriptionKey: 'dialog.setup.providers.anthropic.description',
+    capabilityKey: 'dialog.setup.providers.anthropic.capabilities',
+    channelProvider: 'anthropic',
+    providerFilter: 'anthropic',
+    icon: 'anthropic',
+    lockProtocol: true,
+  },
+  {
+    id: 'google',
+    category: 'common',
+    kind: 'direct',
+    labelKey: 'dialog.setup.providers.google.label',
+    descriptionKey: 'dialog.setup.providers.google.description',
+    capabilityKey: 'dialog.setup.providers.google.capabilities',
+    channelProvider: 'google',
+    providerFilter: 'google',
+    icon: 'google',
+    lockProtocol: true,
+  },
+  {
+    id: 'moonshot',
+    category: 'common',
+    kind: 'direct',
+    labelKey: 'dialog.setup.providers.moonshot.label',
+    descriptionKey: 'dialog.setup.providers.moonshot.description',
+    capabilityKey: 'dialog.setup.providers.moonshot.capabilities',
+    channelProvider: 'moonshotai-cn',
+    providerFilter: 'moonshot',
+    icon: 'moonshot',
+    lockProtocol: true,
+  },
+  {
+    id: 'mistral',
+    category: 'common',
+    kind: 'direct',
+    labelKey: 'dialog.setup.providers.mistral.label',
+    descriptionKey: 'dialog.setup.providers.mistral.description',
+    capabilityKey: 'dialog.setup.providers.mistral.capabilities',
+    channelProvider: 'mistral',
+    providerFilter: 'mistral',
+    icon: 'mistral',
+    lockProtocol: true,
+  },
+  {
+    id: 'openrouter',
+    category: 'aggregator',
+    kind: 'aggregator',
+    labelKey: 'dialog.setup.providers.openrouter.label',
+    descriptionKey: 'dialog.setup.providers.openrouter.description',
+    capabilityKey: 'dialog.setup.providers.openrouter.capabilities',
+    channelProvider: 'openrouter',
+    providerFilter: 'openrouter',
+    icon: 'openrouter',
+    lockProtocol: true,
+  },
+  {
+    id: 'openai-compatible',
+    category: 'advanced',
+    kind: 'compatible',
+    labelKey: 'dialog.setup.providers.openaiCompatible.label',
+    descriptionKey: 'dialog.setup.providers.openaiCompatible.description',
+    capabilityKey: 'dialog.setup.providers.openaiCompatible.capabilities',
+    channelProvider: 'openai-compatible',
+    providerFilter: 'all',
+    icon: 'openai',
+    defaultApiBaseUrl: '',
+    lockProtocol: true,
+  },
+  {
+    id: 'ollama',
+    category: 'advanced',
+    kind: 'local',
+    labelKey: 'dialog.setup.providers.ollama.label',
+    descriptionKey: 'dialog.setup.providers.ollama.description',
+    capabilityKey: 'dialog.setup.providers.ollama.capabilities',
+    channelProvider: 'ollama',
+    providerFilter: 'ollama',
+    icon: 'ollama',
+    lockProtocol: true,
+  },
+  {
+    id: 'custom',
+    category: 'advanced',
+    kind: 'custom',
+    labelKey: 'dialog.setup.providers.custom.label',
+    descriptionKey: 'dialog.setup.providers.custom.description',
+    capabilityKey: 'dialog.setup.providers.custom.capabilities',
+    channelProvider: 'openai-compatible',
+    providerFilter: 'all',
+    icon: 'openai',
+    defaultApiBaseUrl: '',
+    lockProtocol: false,
+  },
+];
+
+function getSetupOption(id?: string): ChannelSetupOption | undefined {
+  if (!id) return undefined;
+  const normalized = id.trim().toLowerCase();
+  return CHANNEL_SETUP_OPTIONS.find(
+    option =>
+      option.id === normalized ||
+      option.channelProvider.toLowerCase() === normalized ||
+      option.providerFilter?.toLowerCase() === normalized
+  );
+}
+
+function getSetupKindClassName(kind: ChannelSetupKind): string {
+  switch (kind) {
+    case 'direct':
+      return 'border-emerald-200 bg-emerald-50 text-emerald-700';
+    case 'aggregator':
+      return 'border-blue-200 bg-blue-50 text-blue-700';
+    case 'compatible':
+      return 'border-amber-200 bg-amber-50 text-amber-700';
+    case 'local':
+      return 'border-slate-200 bg-slate-50 text-slate-700';
+    case 'custom':
+      return 'border-purple-200 bg-purple-50 text-purple-700';
+    default:
+      return 'border-muted bg-muted text-muted-foreground';
+  }
+}
+
+/**
+ * Props for ChannelDialog component.
+ * Only supports fields that exist in current channel API.
+ */
+export interface ChannelDialogProps {
+  open: boolean;
+  onOpenChange: (open: boolean) => void;
+  mode: 'create' | 'edit';
+  initial?: ChannelDetail | null;
+  defaultChannelProvider?: string;
+  defaultModels?: string[];
+  lockChannelProvider?: boolean;
+  providerOptions?: string[];
+}
+
+/** Utility: number or undefined */
+function toNumberOrUndefined(value: string): number | undefined {
+  const v = value.trim();
+  if (!v) return undefined;
+  const n = Number(v);
+  return Number.isFinite(n) ? n : undefined;
+}
+
+/** Utility: sanitize numeric input to allow only non-negative integers */
+function sanitizeNonNegativeInt(value: string, max: number): string {
+  const digits = value.replace(/\D/g, '').replace(/^0+(?=\d)/, '');
+  if (!digits) return '';
+
+  const numeric = Number(digits);
+  if (!Number.isFinite(numeric)) return String(max);
+
+  return String(Math.min(numeric, max));
+}
+
+function sanitizeUsdInput(value: string, maxUsd: number): string {
+  const normalized = value.replace(/[^\d.]/g, '');
+  const [integer = '', ...decimalParts] = normalized.split('.');
+  const decimal = decimalParts.join('').slice(0, 2);
+  const next = decimalParts.length > 0 ? `${integer}.${decimal}` : integer;
+  if (!next) return '';
+
+  const numeric = Number(next);
+  if (!Number.isFinite(numeric)) return '';
+  if (numeric > maxUsd) return maxUsd.toFixed(2);
+
+  return next;
+}
+
+function hasNativeQwenModel(models: ModelItem[]): boolean {
+  return models.some(model => {
+    if (model.provider !== 'qwen') return false;
+    const useCases = model.use_cases ?? [];
+    return (
+      useCases.includes('image-gen') ||
+      useCases.includes('rerank') ||
+      useCases.includes('vision') ||
+      useCases.includes('realtime-audio') ||
+      /(?:rerank|image|vl|vision|omni|tongyi)/i.test(model.model)
+    );
+  });
+}
+
+function getCompatibilityWarningKey(
+  channelProvider: string,
+  selectedModels: ModelItem[]
+): 'dialog.errors.qwenOpenAICompatibleMismatch' | 'dialog.errors.dashScopeProviderMismatch' | '' {
+  if (channelProvider.trim().toLowerCase() !== 'openai-compatible') {
+    return '';
+  }
+
+  if (hasNativeQwenModel(selectedModels)) {
+    return 'dialog.errors.qwenOpenAICompatibleMismatch';
+  }
+
+  return '';
+}
+
+function haveSameSelectedModelItems(left: ModelItem[], right: ModelItem[]): boolean {
+  if (left.length !== right.length) return false;
+  return left.every(
+    (item, index) =>
+      buildModelSelectionKey(item.provider, item.model) ===
+      buildModelSelectionKey(right[index]?.provider, right[index]?.model ?? '')
+  );
+}
+
+interface ChannelFormProps {
+  mode: 'create' | 'edit';
+  initial?: ChannelDetail | null;
+  defaultChannelProvider?: string;
+  defaultModels?: string[];
+  lockChannelProvider?: boolean;
+  onOpenChange: (open: boolean) => void;
+}
+
+function ChannelForm({
+  mode,
+  initial,
+  defaultChannelProvider,
+  defaultModels,
+  lockChannelProvider = false,
+  onOpenChange,
+}: ChannelFormProps) {
+  const t = useT('channels');
+  const rawInitialChannelProvider =
+    initial?.channel_provider ?? initial?.provider ?? defaultChannelProvider ?? 'openai-compatible';
+  const initialSetupOption =
+    mode === 'create' && defaultChannelProvider
+      ? getSetupOption(defaultChannelProvider)
+      : undefined;
+  const initialChannelProvider =
+    initialSetupOption?.channelProvider ??
+    getChannelProviderOption(rawInitialChannelProvider)?.value ??
+    rawInitialChannelProvider;
+  const initialProviderOption = getChannelProviderOption(initialChannelProvider);
+  const initialFundsMaxLabel = CHANNEL_INITIAL_CREDIT_MAX.toLocaleString();
+  const maxInitialFundsUsd = CHANNEL_INITIAL_CREDIT_MAX / CHANNEL_POINTS_PER_USD;
+
+  // Local form state
+  const [name, setName] = React.useState<string>(initial?.name ?? '');
+  const [channelProvider, setChannelProvider] = React.useState<string>(initialChannelProvider);
+  const [apiKey, setApiKey] = React.useState<string>('');
+  const [apiBaseUrl, setApiBaseUrl] = React.useState<string>(
+    initial?.api_base_url ?? initialProviderOption?.defaultApiBaseUrl ?? ''
+  );
+  const [initialFundsUsd, setInitialFundsUsd] = React.useState<string>(
+    mode === 'create' ? DEFAULT_INITIAL_FUNDS_USD : ''
+  );
+  // Edit mode: toggle to update API key
+  const [updateApiKey, setUpdateApiKey] = React.useState<boolean>(false);
+  const [modelsSelected, setModelsSelected] = React.useState<string[]>(
+    mode === 'create'
+      ? [...(defaultModels ?? [])]
+      : Array.isArray(initial?.models)
+        ? (initial.models as string[])
+        : []
+  );
+  const [selectedModelItems, setSelectedModelItems] = React.useState<ModelItem[]>([]);
+  const [priority, setPriority] = React.useState<string>(
+    initial?.priority != null ? String(initial.priority) : ''
+  );
+  const [weight, setWeight] = React.useState<string>(
+    initial?.weight != null ? String(initial.weight) : ''
+  );
+  const [isEnabled, setIsEnabled] = React.useState<boolean>(initial?.is_enabled ?? true);
+  const [advancedOpen, setAdvancedOpen] = React.useState<boolean>(false);
+  const [setupStep, setSetupStep] = React.useState<'provider' | 'config'>(() =>
+    mode === 'create' && !initialSetupOption && !lockChannelProvider ? 'provider' : 'config'
+  );
+  const [setupOption, setSetupOption] = React.useState<ChannelSetupOption | undefined>(
+    initialSetupOption
+  );
+  const parsedInitialFundsUsd = initialFundsUsd.trim() ? Number(initialFundsUsd) : undefined;
+  const initialFundsPoints = usdToChannelPoints(parsedInitialFundsUsd);
+  const initialFundsPreview =
+    initialFundsPoints === undefined ? 0 : Math.min(initialFundsPoints, CHANNEL_INITIAL_CREDIT_MAX);
+  const hasValidInitialFunds =
+    mode !== 'create' ||
+    (initialFundsPoints !== undefined &&
+      initialFundsPoints > 0 &&
+      initialFundsPoints <= CHANNEL_INITIAL_CREDIT_MAX);
+  const apiKeyRequired = mode === 'create' && channelProvider !== 'ollama';
+  const compatibilityWarningKey = getCompatibilityWarningKey(channelProvider, selectedModelItems);
+  const sharedCredentialCount = initial?.upstream_state?.shared_channel_count ?? 0;
+
+  const selectedProviderOption = React.useMemo(
+    () => getChannelProviderOption(channelProvider),
+    [channelProvider]
+  );
+  const mappedProvider = React.useMemo(
+    () => selectedProviderOption?.provider || getMappedProvider(channelProvider),
+    [channelProvider, selectedProviderOption]
+  );
+  const currentSetupOption = setupOption ?? getSetupOption(channelProvider);
+  const effectiveProviderFilter = currentSetupOption?.providerFilter
+    ? currentSetupOption.providerFilter
+    : lockChannelProvider
+      ? mappedProvider
+      : undefined;
+  const effectiveModelFilter = React.useMemo(() => {
+    switch (currentSetupOption?.modelScope) {
+      case 'speech':
+        return isDoubaoSpeechModel;
+      case 'non-speech':
+        return (model: ModelItem) => !isDoubaoSpeechModel(model);
+      default:
+        return undefined;
+    }
+  }, [currentSetupOption?.modelScope]);
+
+  // Stable callbacks to prevent child component re-renders when parent re-renders
+
+  const handleModelsChange = useCallback((models: string[]) => {
+    setModelsSelected(models);
+  }, []);
+
+  const handleSelectionMetaChange = useCallback((models: ModelItem[]) => {
+    setSelectedModelItems(prev => (haveSameSelectedModelItems(prev, models) ? prev : models));
+  }, []);
+
+  const selectSetupOption = React.useCallback((option: ChannelSetupOption) => {
+    const providerOption = getChannelProviderOption(option.channelProvider);
+    setSetupOption(option);
+    setChannelProvider(option.channelProvider);
+    setApiBaseUrl(option.defaultApiBaseUrl ?? providerOption?.defaultApiBaseUrl ?? '');
+    setModelsSelected([]);
+    setSelectedModelItems([]);
+    setSetupStep('config');
+  }, []);
+
+  const { createChannel, isCreating } = useCreateChannel();
+  const { updateChannel, isUpdating } = useUpdateChannel();
+
+  const handleNumericInput = (
+    value: string,
+    setter: React.Dispatch<React.SetStateAction<string>>,
+    max: number
+  ) => {
+    setter(sanitizeNonNegativeInt(value, max));
+  };
+
+  const disabled = isCreating || isUpdating;
+
+  const onSubmit = async (): Promise<void> => {
+    if (compatibilityWarningKey) {
+      toast.error(t(compatibilityWarningKey as never));
+      return;
+    }
+
+    const normalizedApiBaseUrl = apiBaseUrl.trim();
+
+    // Build payloads strictly from allowed fields
+    const common = {
+      channel_provider: channelProvider.trim(),
+      api_base_url: normalizedApiBaseUrl || undefined,
+      priority: toNumberOrUndefined(priority),
+      weight: toNumberOrUndefined(weight),
+      // Advanced fields for creation or legacy
+    } as const;
+
+    if (mode === 'create') {
+      const payload: CreateChannelRequest = {
+        name: name.trim(),
+        api_key: apiKey.trim(),
+        ...common,
+        models: modelsSelected.length ? modelsSelected : undefined,
+        initial_funds: initialFundsPoints,
+      };
+      await createChannel(payload);
+      onOpenChange(false);
+      return;
+    }
+
+    // edit mode requires id
+    if (!initial) return;
+
+    // Build partial update - only include changed fields
+    const update: UpdateChannelRequest = {};
+
+    // Compare and add only changed fields
+    if (name.trim() !== (initial.name ?? '')) {
+      update.name = name.trim() || undefined;
+    }
+    if (channelProvider !== initialChannelProvider) {
+      update.channel_provider = channelProvider || undefined;
+    }
+    if (normalizedApiBaseUrl !== (initial.api_base_url ?? '')) {
+      update.api_base_url = normalizedApiBaseUrl || undefined;
+    }
+    if (updateApiKey && apiKey.trim()) {
+      update.api_key = apiKey.trim();
+    }
+    if (JSON.stringify(modelsSelected) !== JSON.stringify(initial.models ?? [])) {
+      update.models = modelsSelected;
+    }
+    if (isEnabled !== (initial.is_enabled ?? true)) {
+      update.is_enabled = isEnabled;
+    }
+
+    const newWeight = toNumberOrUndefined(weight);
+    if (newWeight !== initial.weight) {
+      update.weight = newWeight;
+    }
+
+    // Only submit if there are changes
+    if (Object.keys(update).length === 0) {
+      onOpenChange(false);
+      return;
+    }
+
+    await updateChannel(initial.id, update);
+    onOpenChange(false);
+  };
+
+  const apiKeyPlaceholder =
+    selectedProviderOption?.apiKeyPlaceholder || t('dialog.placeholders.apiKey');
+  const apiBaseUrlPlaceholder =
+    selectedProviderOption?.defaultApiBaseUrl ||
+    selectedProviderOption?.apiBaseUrlPlaceholder ||
+    t('dialog.placeholders.apiBaseUrl');
+
+  if (mode === 'create' && setupStep === 'provider') {
+    return (
+      <div className="flex h-full flex-col overflow-hidden">
+        <DialogHeader className="px-6 pt-6">
+          <DialogTitle>{t('dialog.titleCreate')}</DialogTitle>
+          <DialogDescription>{t('dialog.setup.description')}</DialogDescription>
+        </DialogHeader>
+
+        <DialogBody className="h-0 grow overflow-y-auto px-6">
+          <div className="mb-4 flex items-center gap-2 text-sm text-muted-foreground">
+            <span className="font-medium text-primary">{t('dialog.setup.steps.provider')}</span>
+            <span>/</span>
+            <span>{t('dialog.setup.steps.config')}</span>
+          </div>
+
+          <div className="space-y-5">
+            {CHANNEL_SETUP_CATEGORIES.map(category => (
+              <section key={category} className="space-y-2">
+                <div>
+                  <div className="text-sm font-semibold text-foreground">
+                    {t(`dialog.setup.categories.${category}` as never)}
+                  </div>
+                  <div className="text-xs text-muted-foreground">
+                    {t(`dialog.setup.categoryDescriptions.${category}` as never)}
+                  </div>
+                </div>
+                <div className="grid grid-cols-1 gap-3 md:grid-cols-2 xl:grid-cols-3">
+                  {CHANNEL_SETUP_OPTIONS.filter(option => option.category === category).map(
+                    option => {
+                      const providerOption = getChannelProviderOption(option.channelProvider);
+                      return (
+                        <button
+                          key={option.id}
+                          type="button"
+                          className="min-h-[132px] rounded-md border bg-background p-4 text-left transition hover:border-primary/60 hover:bg-primary/5 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
+                          onClick={() => selectSetupOption(option)}
+                        >
+                          <div className="flex items-start justify-between gap-3">
+                            <div className="flex min-w-0 items-center gap-2">
+                              {option.icon ? (
+                                <ProviderIcon size={24} provider={option.icon} />
+                              ) : null}
+                              <div className="truncate text-sm font-semibold">
+                                {t(option.labelKey as never)}
+                              </div>
+                            </div>
+                            <span
+                              className={cn(
+                                'shrink-0 rounded-full border px-2 py-0.5 text-[11px] font-medium',
+                                getSetupKindClassName(option.kind)
+                              )}
+                            >
+                              {t(`dialog.setup.kinds.${option.kind}.label` as never)}
+                            </span>
+                          </div>
+                          <div className="mt-3 line-clamp-2 text-xs leading-5 text-muted-foreground">
+                            {t(option.descriptionKey as never)}
+                          </div>
+                          <div className="mt-3 space-y-1 text-xs">
+                            <div className="text-muted-foreground">
+                              {t('dialog.setup.fields.modelStrategy')}:{' '}
+                              <span className="text-foreground">
+                                {t(`dialog.setup.kinds.${option.kind}.strategy` as never)}
+                              </span>
+                            </div>
+                            <div className="text-muted-foreground">
+                              {t('dialog.setup.fields.capabilities')}:{' '}
+                              <span className="text-foreground">
+                                {t(option.capabilityKey as never)}
+                              </span>
+                            </div>
+                            <div className="text-muted-foreground">
+                              {t('dialog.setup.fields.protocol')}:{' '}
+                              <span className="text-foreground">
+                                {providerOption
+                                  ? t(providerOption.labelKey as never)
+                                  : option.channelProvider}
+                              </span>
+                            </div>
+                          </div>
+                        </button>
+                      );
+                    }
+                  )}
+                </div>
+              </section>
+            ))}
+          </div>
+        </DialogBody>
+
+        <div className="flex shrink-0 items-center justify-end gap-2 border-t px-6 py-4">
+          <Button variant="outline" onClick={() => onOpenChange(false)}>
+            {t('dialog.buttons.cancel')}
+          </Button>
+        </div>
+      </div>
+    );
+  }
+
+  return (
+    <div className="h-full overflow-hidden flex flex-col gap-2">
+      <DialogHeader className="px-6 pt-6">
+        <DialogTitle>
+          {mode === 'create' ? t('dialog.titleCreate') : t('dialog.titleEdit')}
+        </DialogTitle>
+        <DialogDescription>{t('description')}</DialogDescription>
+      </DialogHeader>
+
+      <DialogBody className="grid h-0 grow grid-cols-1 gap-4 overflow-y-auto xl:grid-cols-3 xl:overflow-hidden">
+        <div className="min-w-0 space-y-3 xl:overflow-y-auto xl:pr-3">
+          {mode === 'create' && setupOption && (
+            <div className="rounded-md border bg-muted/30 p-3">
+              <button
+                type="button"
+                className="mb-2 inline-flex items-center gap-1 text-xs text-muted-foreground hover:text-foreground"
+                onClick={() => setSetupStep('provider')}
+                disabled={disabled}
+              >
+                <ArrowLeft className="h-3.5 w-3.5" />
+                {t('dialog.setup.actions.changeProvider')}
+              </button>
+              <div className="flex items-center gap-2">
+                {setupOption.icon ? <ProviderIcon size={24} provider={setupOption.icon} /> : null}
+                <div>
+                  <div className="flex flex-wrap items-center gap-2">
+                    <div className="text-sm font-semibold">{t(setupOption.labelKey as never)}</div>
+                    <span
+                      className={cn(
+                        'rounded-full border px-2 py-0.5 text-[11px] font-medium',
+                        getSetupKindClassName(setupOption.kind)
+                      )}
+                    >
+                      {t(`dialog.setup.kinds.${setupOption.kind}.label` as never)}
+                    </span>
+                  </div>
+                  <div className="text-xs text-muted-foreground">
+                    {t(setupOption.descriptionKey as never)}
+                  </div>
+                </div>
+              </div>
+              <div className="mt-3 rounded-md border bg-background px-3 py-2 text-xs leading-5">
+                <div className="font-medium text-foreground">
+                  {t(`dialog.setup.kinds.${setupOption.kind}.headline` as never)}
+                </div>
+                <div className="mt-1 text-muted-foreground">
+                  {t(`dialog.setup.kinds.${setupOption.kind}.guidance` as never)}
+                </div>
+              </div>
+            </div>
+          )}
+          <div className="text-sm font-semibold text-foreground">{t('dialog.basic')}</div>
+          {mode === 'edit' && sharedCredentialCount > 1 && (
+            <div className="rounded-md border border-amber-300 bg-amber-50 px-3 py-2 text-xs leading-5 text-amber-900">
+              {t('dialog.hints.sharedCredentialIsolation', {
+                count: sharedCredentialCount,
+              })}
+            </div>
+          )}
+          <div className="space-y-1">
+            <div className="text-sm font-medium">
+              {t('dialog.labels.name')}
+              <span className="text-destructive ml-0.5">*</span>
+            </div>
+            <Input
+              value={name}
+              onChange={e => setName(e.target.value)}
+              placeholder={t('dialog.placeholders.name')}
+            />
+          </div>
+          <div className="space-y-1">
+            <div className="text-sm font-medium">
+              {t('dialog.labels.provider')}
+              <span className="text-destructive ml-0.5">*</span>
+            </div>
+            <ChannelProviderSelector
+              value={channelProvider}
+              onChange={option => {
+                if (lockChannelProvider || setupOption?.lockProtocol) return;
+                if (option.value !== channelProvider) {
+                  setModelsSelected([]);
+                  setSelectedModelItems([]);
+                }
+                setChannelProvider(option.value);
+                if (option.defaultApiBaseUrl) {
+                  setApiBaseUrl(option.defaultApiBaseUrl);
+                  return;
+                }
+                setApiBaseUrl('');
+              }}
+              disabled={disabled || lockChannelProvider || Boolean(setupOption?.lockProtocol)}
+            />
+            {(lockChannelProvider || setupOption?.lockProtocol) && (
+              <div className="text-xs text-muted-foreground">
+                {t('dialog.hints.providerLocked')}
+              </div>
+            )}
+            {selectedProviderOption?.notesKey && (
+              <div className="text-xs text-muted-foreground">
+                {t(selectedProviderOption.notesKey as never)}
+              </div>
+            )}
+          </div>
+          <div className="space-y-1">
+            <div className="text-sm font-medium">
+              {t('dialog.labels.apiKey')}
+              {apiKeyRequired && <span className="text-destructive ml-0.5">*</span>}
+              {mode === 'edit' && updateApiKey && (
+                <span className="text-destructive ml-0.5">*</span>
+              )}
+            </div>
+            {mode === 'edit' ? (
+              <div className="space-y-2">
+                {updateApiKey ? (
+                  <PasswordInput
+                    value={apiKey}
+                    onChange={e => setApiKey(e.target.value)}
+                    placeholder={apiKeyPlaceholder}
+                    autoComplete="new-password"
+                  />
+                ) : (
+                  <div className="text-sm bg-muted px-3 py-2 rounded-md font-mono">
+                    {initial?.api_key_masked || '••••••••••••••••'}
+                  </div>
+                )}
+                <div className="flex items-center gap-2">
+                  <Switch
+                    checked={updateApiKey}
+                    onCheckedChange={v => {
+                      setUpdateApiKey(Boolean(v));
+                      if (!v) {
+                        setApiKey('');
+                      }
+                    }}
+                  />
+                  <span className="text-sm text-muted-foreground">
+                    {t('dialog.labels.updateApiKey')}
+                  </span>
+                </div>
+              </div>
+            ) : (
+              <PasswordInput
+                value={apiKey}
+                onChange={e => setApiKey(e.target.value)}
+                placeholder={apiKeyPlaceholder}
+                autoComplete="new-password"
+              />
+            )}
+          </div>
+          <div className="space-y-1">
+            <div className="text-sm font-medium">
+              {t('dialog.labels.apiBaseUrl')}
+              <span className="text-destructive ml-0.5">*</span>
+            </div>
+            <Input
+              value={apiBaseUrl}
+              onChange={e => setApiBaseUrl(e.target.value)}
+              placeholder={apiBaseUrlPlaceholder}
+            />
+            {channelProvider === 'doubao-speech' && (
+              <p className="text-xs text-muted-foreground">
+                {t('dialog.hints.doubaoSpeechBaseUrl')}
+              </p>
+            )}
+          </div>
+          {mode === 'create' && (
+            <div className="space-y-2 rounded-md border border-primary/30 bg-primary/5 p-3">
+              <div className="flex flex-col gap-1 sm:flex-row sm:items-center sm:justify-between">
+                <div className="text-sm font-medium">
+                  {t('dialog.labels.initialFunds')}
+                  <span className="text-destructive ml-0.5">*</span>
+                </div>
+                <div className="text-xs text-muted-foreground">{t('credit.rate')}</div>
+              </div>
+              <p className="text-xs text-muted-foreground">
+                {t('dialog.hints.initialFundsDefault')}
+              </p>
+              <div className="relative">
+                <span className="pointer-events-none absolute left-3 top-1/2 -translate-y-1/2 text-sm text-muted-foreground">
+                  $
+                </span>
+                <Input
+                  className="pl-8 pr-16"
+                  inputMode="decimal"
+                  value={initialFundsUsd}
+                  onChange={e =>
+                    setInitialFundsUsd(sanitizeUsdInput(e.target.value, maxInitialFundsUsd))
+                  }
+                  placeholder={t('dialog.placeholders.initialFunds')}
+                />
+                <span className="pointer-events-none absolute right-3 top-1/2 -translate-y-1/2 text-sm text-muted-foreground">
+                  USD
+                </span>
+              </div>
+              <div className="flex flex-wrap gap-2">
+                {[50, 100, 500].map(amount => (
+                  <Button
+                    key={amount}
+                    type="button"
+                    variant="outline"
+                    size="sm"
+                    className="h-7 rounded-sm px-2 text-xs"
+                    onClick={() => setInitialFundsUsd(amount.toFixed(2))}
+                  >
+                    {t('credit.quickAmount', { amount })}
+                  </Button>
+                ))}
+              </div>
+              <p className="text-xs text-muted-foreground">
+                {t('credit.usdToPoints', {
+                  usd: initialFundsUsd ? `$${Number(initialFundsUsd || 0).toFixed(2)}` : '$0.00',
+                  points: formatChannelCreditPoints(initialFundsPreview),
+                })}
+              </p>
+              <p className="text-xs text-muted-foreground">
+                {t('dialog.hints.initialFundsMax', { max: initialFundsMaxLabel })}
+              </p>
+            </div>
+          )}
+          <div
+            className="flex items-center justify-between cursor-pointer py-2 mt-2"
+            onClick={() => setAdvancedOpen(v => !v)}
+          >
+            <div className="text-sm font-semibold text-foreground">{t('dialog.advanced')}</div>
+            <ChevronDown
+              className={`h-4 w-4 transition-transform ${advancedOpen ? '' : 'rotate-90'}`}
+            />
+          </div>
+          <div
+            className={cn(
+              'space-y-2 transition-all duration-300 overflow-hidden',
+              advancedOpen ? 'h-auto opacity-100 pb-3' : 'h-0 opacity-0'
+            )}
+          >
+            <div id="advanced-section" className="grid grid-cols-1 gap-3 sm:grid-cols-2">
+              <div className="space-y-1">
+                <div className="text-sm font-medium">{t('dialog.labels.priority')}</div>
+                <Input
+                  inputMode="numeric"
+                  value={priority}
+                  onChange={e => handleNumericInput(e.target.value, setPriority, 9999)}
+                  placeholder={t('dialog.placeholders.priority')}
+                  min={0}
+                  max={9999}
+                />
+                <p className="text-xs text-muted-foreground">{t('dialog.hints.priority')}</p>
+              </div>
+              <div className="space-y-1">
+                <div className="text-sm font-medium">{t('dialog.labels.weight')}</div>
+                <Input
+                  inputMode="numeric"
+                  value={weight}
+                  onChange={e => handleNumericInput(e.target.value, setWeight, 9999)}
+                  placeholder={t('dialog.placeholders.weight')}
+                  min={0}
+                  max={9999}
+                />
+                <p className="text-xs text-muted-foreground">{t('dialog.hints.weight')}</p>
+              </div>
+              <div className="flex items-center gap-3 sm:col-span-2">
+                <div className="text-sm font-medium">{t('dialog.labels.enabled')}</div>
+                <Switch checked={isEnabled} onCheckedChange={v => setIsEnabled(Boolean(v))} />
+              </div>
+            </div>
+          </div>
+        </div>
+        <div className="min-w-0 xl:col-span-2 xl:overflow-y-auto xl:pl-3">
+          {compatibilityWarningKey && (
+            <div className="mb-3 rounded-md border border-destructive/30 bg-destructive/5 px-3 py-2 text-sm text-destructive">
+              {t(compatibilityWarningKey as never)}
+            </div>
+          )}
+          <ModelMultiSelector
+            value={modelsSelected}
+            onChange={handleModelsChange}
+            onSelectionMetaChange={handleSelectionMetaChange}
+            placeholder={t('dialog.placeholders.modelsCsv')}
+            className="min-h-[360px] max-h-[calc(92vh-12rem)] overflow-hidden xl:h-full"
+            columns={2}
+            preferredProvider={effectiveProviderFilter || mappedProvider}
+            autoCollapseOthers={(effectiveProviderFilter || mappedProvider) !== 'all'}
+            providerFilter={effectiveProviderFilter}
+            itemFilter={effectiveModelFilter}
+            selectionPolicy="catalog"
+          />
+        </div>
+      </DialogBody>
+
+      <div className="pb-6 px-6 pt-4 border-t shrink-0 flex justify-end">
+        <div className="flex shrink-0 items-center justify-end gap-2">
+          <Button variant="outline" onClick={() => onOpenChange(false)} disabled={disabled}>
+            {t('dialog.buttons.cancel')}
+          </Button>
+          <Button
+            onClick={onSubmit}
+            disabled={
+              disabled ||
+              !name.trim() ||
+              !channelProvider.trim() ||
+              !apiBaseUrl.trim() ||
+              !hasValidInitialFunds ||
+              Boolean(compatibilityWarningKey) ||
+              (mode === 'create' && apiKeyRequired && !apiKey.trim()) ||
+              modelsSelected.length === 0 ||
+              (mode === 'edit' && updateApiKey && !apiKey.trim())
+            }
+          >
+            {mode === 'create' ? t('dialog.buttons.create') : t('dialog.buttons.save')}
+          </Button>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+export default function ChannelDialog({
+  open,
+  onOpenChange,
+  mode,
+  initial,
+  defaultChannelProvider,
+  defaultModels,
+  lockChannelProvider,
+  providerOptions: _providerOptions,
+}: ChannelDialogProps): JSX.Element {
+  const normalizedInitial = React.useMemo(() => {
+    if (!initial) return initial;
+    const rawChannelProvider = initial?.channel_provider ?? initial?.provider;
+    if (!rawChannelProvider) return initial;
+    const option = getChannelProviderOption(rawChannelProvider);
+    if (!option) return initial;
+    return {
+      ...initial,
+      provider: option.value,
+      channel_provider: option.value,
+    };
+  }, [initial]);
+
+  return (
+    <Dialog open={open} onOpenChange={onOpenChange}>
+      <DialogContent className="w-[96vw] max-w-[96vw] h-[92vh] p-0">
+        {open && (
+          <ChannelForm
+            mode={mode}
+            initial={normalizedInitial}
+            defaultChannelProvider={defaultChannelProvider}
+            defaultModels={defaultModels}
+            lockChannelProvider={lockChannelProvider}
+            onOpenChange={onOpenChange}
+          />
+        )}
+      </DialogContent>
+    </Dialog>
+  );
+}

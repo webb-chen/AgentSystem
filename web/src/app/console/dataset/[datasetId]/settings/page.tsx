@@ -1,0 +1,448 @@
+'use client';
+
+import React, { useState, useEffect, useCallback, useRef, useMemo } from 'react';
+import { useParams } from 'next/navigation';
+import { useT } from '@/i18n';
+import { Save, ShieldAlert } from 'lucide-react';
+import { Button } from '@/components/ui/button';
+import { Switch } from '@/components/ui/switch';
+import { Badge } from '@/components/ui/badge';
+import { Card, CardContent, CardDescription, CardHeader, CardTitle } from '@/components/ui/card';
+import { Input } from '@/components/ui/input';
+import { Label } from '@/components/ui/label';
+import { Textarea } from '@/components/ui/textarea';
+import { useDataset, useUpdateDataset } from '@/hooks/dataset/use-datasets';
+import {
+  DatasetIndexingConfigForm,
+  type FormRef,
+} from '@/components/datasets/indexing-config-form';
+import type {
+  DatasetUploadFormData,
+  SearchMethod,
+  UpdateDatasetRequest,
+} from '@/services/types/dataset';
+import { IconInput } from '@/components/common/icon-input';
+import {
+  type IconValue,
+  createTextIconValue,
+  createImageIconValue,
+} from '@/components/common/icon-input/types';
+import { getNameValidationErrors } from '@/utils/validation';
+import { cn } from '@/lib/utils';
+import { useAccountPermissions } from '@/hooks/organization/use-account-permissions';
+import { useCurrentWorkspace } from '@/store/workspace-store';
+import { ICON_BG, ICON_TEXT } from '@/lib/config';
+import { normalizeDatasetSearchMethod } from '@/utils/dataset/retrieval-config';
+import { toast } from 'sonner';
+import { KNOWLEDGE_BASE_PERMISSION_ACTIONS } from '@/constants/permissions';
+import { DATASET_NAME_VALIDATION_OPTIONS } from '@/constants/dataset';
+import { useGraphRuntimeCapability } from '@/hooks/dataset/use-dataset-graph';
+
+const GRAPH_MODEL_CHANGE_CONFIRMATION_ERROR = 'graph_model_change_confirmation_required';
+
+export default function DatasetSettingsPage() {
+  const { datasetId } = useParams<{ datasetId: string }>();
+  const t = useT();
+  const updateDataset = useUpdateDataset(datasetId);
+  const currentWorkspace = useCurrentWorkspace();
+
+  // Permission checking
+  const { hasAnyPermission, isLoading: isPermissionsLoading } = useAccountPermissions();
+  const canUpdateDataset = hasAnyPermission(KNOWLEDGE_BASE_PERMISSION_ACTIONS.update);
+  const canManageGraph = hasAnyPermission(KNOWLEDGE_BASE_PERMISSION_ACTIONS.graphManage);
+  const { data, isLoading } = useDataset(datasetId, { enabled: canUpdateDataset });
+
+  // Form state
+  const [name, setName] = useState('');
+  const [description, setDescription] = useState('');
+  const [iconValue, setIconValue] = useState<IconValue>(createTextIconValue(ICON_TEXT, ICON_BG));
+  const [hasSubmitted, setHasSubmitted] = useState(false);
+  const [nameTouched, setNameTouched] = useState(false);
+  // const [hasUnsavedChanges, setHasUnsavedChanges] = useState(false);
+
+  // Ref to get data from child component
+  const configFormRef = useRef<FormRef>(null);
+
+  // Configuration form data - simplified, will be retrieved from child component on save
+  const [configData, setConfigData] = useState<DatasetUploadFormData>({
+    files: [],
+    notionPages: [],
+    crawlResults: [],
+    processConfig: null,
+    indexType: 'high_quality',
+    embeddingModel: null,
+    embeddingModelProvider: null,
+    enableGraphFlow: false,
+    entityModel: null,
+    entityModelProvider: null,
+    retrievalConfig: {
+      search_method: 'graph_search',
+      top_k: 10,
+      score_threshold_enabled: true,
+      score_threshold: 0.35,
+      reranking_enable: true,
+      reranking_model: {
+        reranking_model_name: '',
+        reranking_provider_name: '',
+      },
+      hop_depth: 3,
+    },
+  });
+
+  const dataset = data?.data;
+  const isGraphFlowEnabled = Boolean(dataset?.enable_graph_flow);
+  const graphCapability = useGraphRuntimeCapability();
+  // const isExternalDataSource = !!dataset?.external_knowledge_info?.external_knowledge_id;
+
+  // Initialize form data from dataset
+  useEffect(() => {
+    if (dataset) {
+      setName(dataset.name || '');
+      setDescription(dataset.description || '');
+      setHasSubmitted(false);
+      setNameTouched(false);
+
+      // Initialize iconValue based on dataset icon data
+      if (dataset.icon_type === 'image') {
+        setIconValue(createImageIconValue(dataset.icon_url || '', dataset.icon || ''));
+      } else {
+        setIconValue(
+          createTextIconValue(dataset.icon || ICON_TEXT, dataset.icon_background || ICON_BG)
+        );
+      }
+
+      // Initialize config data
+      setConfigData({
+        files: [],
+        notionPages: [],
+        crawlResults: [],
+        processConfig: null,
+        indexType: 'high_quality',
+        embeddingModel: dataset.embedding_model || null,
+        embeddingModelProvider: dataset.embedding_model_provider || null,
+        enableGraphFlow: dataset.enable_graph_flow ?? false,
+        entityModel: dataset.entity_model || null,
+        entityModelProvider: dataset.entity_model_provider || null,
+        retrievalConfig: dataset.retrieval_config
+          ? {
+              search_method: normalizeDatasetSearchMethod(
+                dataset.retrieval_config.search_method as SearchMethod,
+                Boolean(dataset.enable_graph_flow)
+              ),
+              top_k: dataset.retrieval_config.top_k,
+              score_threshold_enabled: dataset.retrieval_config.score_threshold_enabled,
+              score_threshold: dataset.retrieval_config.score_threshold,
+              reranking_enable: dataset.retrieval_config.reranking_enable,
+              reranking_model: {
+                reranking_model_name:
+                  dataset.retrieval_config.reranking_model?.reranking_model_name || '',
+                reranking_provider_name:
+                  dataset.retrieval_config.reranking_model?.reranking_provider_name || '',
+              },
+              hop_depth: 3,
+            }
+          : null,
+      });
+    }
+  }, [dataset]);
+
+  // Handle config form changes - simplified since data is retrieved from child component on save
+  const handleConfigChange = useCallback(
+    (changes: Partial<DatasetUploadFormData>) => {
+      setConfigData(prev => {
+        const nextGraphFlowEnabled = dataset?.enable_graph_flow
+          ? true
+          : Boolean(changes.enableGraphFlow ?? prev.enableGraphFlow);
+        const nextRetrievalConfig = changes.retrievalConfig
+          ? {
+              ...changes.retrievalConfig,
+              search_method: normalizeDatasetSearchMethod(
+                changes.retrievalConfig.search_method,
+                nextGraphFlowEnabled
+              ),
+            }
+          : prev.retrievalConfig;
+
+        return {
+          ...prev,
+          ...changes,
+          enableGraphFlow: nextGraphFlowEnabled,
+          retrievalConfig: nextRetrievalConfig,
+        };
+      });
+    },
+    [dataset?.enable_graph_flow]
+  );
+
+  // Inline validation for name field
+  const nameErrors = useMemo(
+    () => getNameValidationErrors(name, DATASET_NAME_VALIDATION_OPTIONS),
+    [name]
+  );
+  const isNameValid = nameErrors.length === 0;
+  const showNameError = (hasSubmitted || nameTouched) && !isNameValid;
+
+  const handleSave = useCallback(async () => {
+    setHasSubmitted(true);
+    if (!canUpdateDataset) {
+      toast.error(t('common.unauthorizedDescription'));
+      return;
+    }
+    if (updateDataset.isPending || !dataset) return;
+
+    if (!isNameValid) {
+      // Show validation error without using toast directly
+      return;
+    }
+
+    // Get current form data from child component
+    const currentFormData = configFormRef.current?.getFormData() || configData;
+    const nextGraphFlowEnabled = Boolean(
+      dataset.enable_graph_flow || currentFormData.enableGraphFlow
+    );
+    const workspaceId = currentWorkspace?.id || dataset.workspace_id || dataset.workspace?.id || '';
+    const normalizedRetrievalConfig = currentFormData.retrievalConfig
+      ? {
+          ...currentFormData.retrievalConfig,
+          search_method: normalizeDatasetSearchMethod(
+            currentFormData.retrievalConfig.search_method,
+            nextGraphFlowEnabled
+          ),
+        }
+      : undefined;
+
+    if (
+      nextGraphFlowEnabled &&
+      !(currentFormData.entityModel && currentFormData.entityModelProvider)
+    ) {
+      toast.error(t('datasets.validation.graphModel.required'));
+      return;
+    }
+
+    // Build update payload with proper icon_type handling (text/image)
+    const requestParams: UpdateDatasetRequest = {
+      name,
+      description,
+      icon_type: iconValue.type,
+      icon: iconValue.type === 'image' ? iconValue.imageId || iconValue.iconUrl : iconValue.icon,
+      icon_background: iconValue.type === 'text' ? iconValue.iconBackground : undefined,
+      workspace_id: workspaceId,
+      enable_graph_flow: nextGraphFlowEnabled,
+      ...(nextGraphFlowEnabled
+        ? {
+            entity_model: currentFormData.entityModel || undefined,
+            entity_model_provider: currentFormData.entityModelProvider || undefined,
+          }
+        : {}),
+      retrieval_config: normalizedRetrievalConfig
+        ? {
+            search_method: normalizedRetrievalConfig.search_method,
+            top_k: normalizedRetrievalConfig.top_k,
+            score_threshold_enabled: normalizedRetrievalConfig.score_threshold_enabled,
+            score_threshold: normalizedRetrievalConfig.score_threshold,
+            reranking_enable: normalizedRetrievalConfig.reranking_enable,
+            reranking_model: normalizedRetrievalConfig.reranking_model,
+            hop_depth: 3,
+          }
+        : undefined,
+    };
+
+    const graphModelChanged =
+      Boolean(dataset.enable_graph_flow) &&
+      (dataset.entity_model !== requestParams.entity_model ||
+        dataset.entity_model_provider !== requestParams.entity_model_provider);
+    if (graphModelChanged) {
+      const confirmed = window.confirm(t('datasets.graph.modelChangeConfirmation'));
+      if (!confirmed) return;
+      requestParams.confirm_graph_rebuild = true;
+    }
+
+    void GRAPH_MODEL_CHANGE_CONFIRMATION_ERROR;
+
+    updateDataset.mutate(requestParams);
+  }, [
+    updateDataset,
+    dataset,
+    name,
+    description,
+    iconValue,
+    currentWorkspace,
+    configData,
+    isNameValid,
+    t,
+    canUpdateDataset,
+  ]);
+
+  if (isPermissionsLoading || (canUpdateDataset && isLoading)) {
+    return (
+      <div className="flex h-full items-center justify-center text-sm text-muted-foreground">
+        {t('datasets.loading')}
+      </div>
+    );
+  }
+
+  // Check manage permission - show empty state if no permission
+  if (!canUpdateDataset) {
+    return (
+      <div className="flex flex-col items-center justify-center h-full gap-4 text-center p-8">
+        <div className="w-16 h-16 rounded-full bg-muted flex items-center justify-center">
+          <ShieldAlert className="w-8 h-8 text-muted-foreground" />
+        </div>
+        <div className="space-y-2">
+          <h2 className="text-lg font-semibold text-foreground">{t('common.accessDenied')}</h2>
+          <p className="text-sm text-muted-foreground max-w-md">
+            {t('common.unauthorizedDescription')}
+          </p>
+        </div>
+      </div>
+    );
+  }
+
+  if (!dataset) {
+    return <div>Dataset not found</div>;
+  }
+
+  return (
+    <div className="h-full overflow-y-auto bg-background">
+      <div className="mx-auto max-w-4xl px-6 py-6">
+        <div className="mb-5 flex items-start justify-between gap-4">
+          <div className="min-w-0">
+            <h1 className="text-2xl font-semibold tracking-tight text-foreground">
+              {t('datasets.settingsTitle')}
+            </h1>
+            <p className="mt-1 text-sm leading-6 text-muted-foreground">
+              {t('datasets.settingsDescription')}
+            </p>
+          </div>
+          <Button
+            className="h-9 gap-2"
+            variant="default"
+            disabled={updateDataset.isPending || !canUpdateDataset}
+            onClick={handleSave}
+          >
+            <Save className="h-4 w-4" />
+            {updateDataset.isPending ? t('datasets.saving') : t('datasets.save')}
+          </Button>
+        </div>
+
+        <div className="space-y-5">
+          <Card className="border-border/80 shadow-sm">
+            <CardHeader className="space-y-1.5">
+              <CardTitle className="text-base">{t('datasets.settings.basicInfo')}</CardTitle>
+              <CardDescription>{t('datasets.settings.basicInfoDescription')}</CardDescription>
+            </CardHeader>
+            <CardContent className="space-y-5">
+              <div className="space-y-1.5">
+                <Label htmlFor="name" className="text-sm font-medium leading-5">
+                  {t('datasets.fieldName')}
+                  <span className="text-destructive">*</span>
+                </Label>
+                <Input
+                  id="name"
+                  value={name}
+                  onChange={e => {
+                    setName(e.target.value);
+                    setNameTouched(true);
+                  }}
+                  placeholder={t('datasets.settings.namePlaceholder')}
+                  disabled={!dataset?.embedding_available}
+                  aria-invalid={showNameError ? 'true' : 'false'}
+                  className={cn(
+                    'h-9',
+                    showNameError && 'border-destructive focus-visible:ring-destructive'
+                  )}
+                />
+                {showNameError && (
+                  <div className="text-xs text-destructive">
+                    {(() => {
+                      const code = nameErrors[0];
+                      return code === 'required'
+                        ? t('datasets.validation.datasetName.required')
+                        : code === 'tooShort'
+                          ? t('datasets.validation.datasetName.tooShort')
+                          : code === 'tooLong'
+                            ? t('datasets.validation.datasetName.tooLong')
+                            : code === 'invalidChars'
+                              ? t('datasets.validation.datasetName.invalidChars')
+                              : t('datasets.validation.datasetName.onlySpaces');
+                    })()}
+                  </div>
+                )}
+              </div>
+
+              <div className="space-y-1.5">
+                <Label htmlFor="description" className="text-sm font-medium leading-5">
+                  {t('datasets.fieldDescription')}
+                </Label>
+                <Textarea
+                  id="description"
+                  value={description}
+                  onChange={e => setDescription(e.target.value)}
+                  placeholder={t('datasets.settings.descriptionPlaceholder')}
+                  disabled={!dataset?.embedding_available}
+                  className="min-h-24"
+                />
+              </div>
+
+              <IconInput value={iconValue} onChange={setIconValue} />
+
+              {isGraphFlowEnabled ? (
+                <div className="rounded-lg border border-border/70 bg-muted/30 p-4">
+                  <div className="flex items-center gap-2">
+                    <Badge variant="secondary" className="rounded-full px-2 py-0.5 text-[11px]">
+                      {t('datasets.graphFlowBadge')}
+                    </Badge>
+                    <span className="text-sm font-semibold">
+                      {t('datasets.settings.graphFlowEnabledLabel')}
+                    </span>
+                  </div>
+                  <p className="mt-2 max-w-[520px] text-sm leading-6 text-muted-foreground">
+                    {t('datasets.settings.graphFlowEnabledDescription')}
+                  </p>
+                </div>
+              ) : canManageGraph ? (
+                <div className="flex items-center justify-between rounded-lg border border-border/70 bg-muted/30 p-4">
+                  <div>
+                    <div className="text-sm font-semibold">{t('datasets.graph.enableTitle')}</div>
+                    <p className="mt-1 text-sm text-muted-foreground">
+                      {t('datasets.graph.enableDescription')}
+                    </p>
+                    {configData.enableGraphFlow ? (
+                      <p className="mt-1 text-xs text-muted-foreground">
+                        {t('datasets.graph.enableSaveHint')}
+                      </p>
+                    ) : null}
+                  </div>
+                  <Switch
+                    checked={Boolean(configData.enableGraphFlow)}
+                    disabled={!graphCapability.data?.data?.available}
+                    onCheckedChange={checked =>
+                      setConfigData(previous => ({ ...previous, enableGraphFlow: checked }))
+                    }
+                  />
+                </div>
+              ) : null}
+            </CardContent>
+          </Card>
+
+          <Card className="border-border/80 shadow-sm">
+            <CardHeader className="space-y-1.5">
+              <CardTitle className="text-base">{t('datasets.hitTesting.configuration')}</CardTitle>
+              <CardDescription>{t('datasets.hitTesting.configDescription')}</CardDescription>
+            </CardHeader>
+            <CardContent>
+              <DatasetIndexingConfigForm
+                ref={configFormRef}
+                data={configData}
+                onChange={handleConfigChange}
+                isSettingMode
+                currentDataset={dataset}
+                className="space-y-5"
+              />
+            </CardContent>
+          </Card>
+        </div>
+      </div>
+    </div>
+  );
+}

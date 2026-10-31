@@ -1,0 +1,1373 @@
+package qwen
+
+import (
+	"context"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"net/http"
+	"net/http/httptest"
+	"strings"
+	"testing"
+
+	adapter "github.com/webb-chen/AgentSystem/api/internal/modules/llm/protocol/adapters"
+)
+
+func newTestAdapter(config *adapter.AdapterConfig) (*Adapter, error) {
+	return NewAdapter(config, Dependencies{})
+}
+
+func TestAdapterHandleErrorUsesExactBillingCodes(t *testing.T) {
+	a, err := newTestAdapter(&adapter.AdapterConfig{APIKey: "test-key"})
+	if err != nil {
+		t.Fatalf("newTestAdapter() error = %v", err)
+	}
+
+	tests := []struct {
+		name       string
+		statusCode int
+		body       string
+		want       error
+	}{
+		{name: "native arrearage", statusCode: http.StatusBadRequest, body: `{"code":"Arrearage","message":"account is overdue"}`, want: adapter.ErrBillingUnavailable},
+		{name: "free tier exhausted", statusCode: http.StatusForbidden, body: `{"code":"AllocationQuota.FreeTierOnly","message":"free tier exhausted"}`, want: adapter.ErrQuotaExhausted},
+		{name: "prepaid bill overdue", statusCode: http.StatusTooManyRequests, body: `{"code":"PrepaidBillOverdue","message":"prepaid bill overdue"}`, want: adapter.ErrBillingUnavailable},
+		{name: "openai postpaid bill overdue", statusCode: http.StatusTooManyRequests, body: `{"error":{"code":"PostpaidBillOverdue","message":"postpaid bill overdue"}}`, want: adapter.ErrBillingUnavailable},
+		{name: "allocation throttling", statusCode: http.StatusTooManyRequests, body: `{"code":"Throttling.AllocationQuota","message":"allocated quota exceeded"}`, want: adapter.ErrRateLimited},
+		{name: "openai insufficient quota is throttling", statusCode: http.StatusTooManyRequests, body: `{"error":{"code":"insufficient_quota","message":"rate quota exceeded"}}`, want: adapter.ErrRateLimited},
+		{name: "unknown balance wording", statusCode: http.StatusBadRequest, body: `{"code":"UnknownAccountState","message":"balance service unavailable"}`, want: adapter.ErrUpstreamError},
+	}
+
+	for _, testCase := range tests {
+		t.Run(testCase.name, func(t *testing.T) {
+			err := a.handleError(testCase.statusCode, []byte(testCase.body))
+			if !errors.Is(err, testCase.want) {
+				t.Fatalf("handleError() error = %v, want %v", err, testCase.want)
+			}
+		})
+	}
+}
+
+func TestAdapterHandleErrorDoesNotExposeProviderBillingMessage(t *testing.T) {
+	a, err := newTestAdapter(&adapter.AdapterConfig{APIKey: "test-key"})
+	if err != nil {
+		t.Fatalf("newTestAdapter() error = %v", err)
+	}
+
+	err = a.handleError(
+		http.StatusTooManyRequests,
+		[]byte(`{"code":"PrepaidBillOverdue","message":"account sk-sensitive-value is overdue"}`),
+	)
+	if !errors.Is(err, adapter.ErrBillingUnavailable) {
+		t.Fatalf("handleError() error = %v, want billing unavailable", err)
+	}
+	if strings.Contains(err.Error(), "sk-sensitive-value") {
+		t.Fatalf("handleError() exposed provider message: %v", err)
+	}
+}
+
+func TestAdapterStreamingPreservesExactBillingCodes(t *testing.T) {
+	tests := []struct {
+		name       string
+		body       string
+		callStream func(*Adapter) error
+		wantCode   string
+	}{
+		{
+			name: "native chat",
+			body: `{"code":"PrepaidBillOverdue","message":"prepaid bill overdue"}`,
+			callStream: func(a *Adapter) error {
+				_, err := a.chatCompletionStreamNative(context.Background(), &adapter.ChatRequest{
+					Model: "qwen-plus", Messages: []adapter.Message{{Role: "user", Content: "hello"}},
+				})
+				return err
+			},
+			wantCode: "PrepaidBillOverdue",
+		},
+	}
+
+	for _, testCase := range tests {
+		t.Run(testCase.name, func(t *testing.T) {
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+				w.Header().Set("Content-Type", "application/json")
+				w.WriteHeader(http.StatusTooManyRequests)
+				fmt.Fprint(w, testCase.body)
+			}))
+			defer server.Close()
+
+			a, err := newTestAdapter(&adapter.AdapterConfig{APIKey: "test-key", BaseURL: server.URL + "/api/v1"})
+			if err != nil {
+				t.Fatalf("newTestAdapter() error = %v", err)
+			}
+			err = testCase.callStream(a)
+			if !errors.Is(err, adapter.ErrBillingUnavailable) {
+				t.Fatalf("stream error = %v, want billing unavailable", err)
+			}
+			var adapterErr *adapter.AdapterError
+			if !errors.As(err, &adapterErr) || adapterErr.Code != testCase.wantCode || adapterErr.StatusCode != http.StatusTooManyRequests {
+				t.Fatalf("stream adapter error = %#v, want code %q status 429", adapterErr, testCase.wantCode)
+			}
+		})
+	}
+}
+
+func TestAdapterChatCompletion_UsesNativeTextGeneration(t *testing.T) {
+	t.Helper()
+
+	var (
+		gotPath      string
+		gotAuth      string
+		gotAccept    string
+		gotWorkspace string
+		gotPayload   map[string]any
+	)
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		defer r.Body.Close()
+
+		if err := json.NewDecoder(r.Body).Decode(&gotPayload); err != nil {
+			t.Fatalf("decode request body: %v", err)
+		}
+		gotPath = r.URL.Path
+		gotAuth = r.Header.Get("Authorization")
+		gotAccept = r.Header.Get("Accept")
+		gotWorkspace = r.Header.Get("X-DashScope-Workspace")
+
+		w.Header().Set("Content-Type", "application/json")
+		fmt.Fprint(w, `{
+			"request_id":"chat-1",
+			"output":{"choices":[{"finish_reason":"stop","message":{"role":"assistant","content":"hello"}}]},
+			"usage":{"input_tokens":3,"output_tokens":2,"total_tokens":5}
+		}`)
+	}))
+	defer server.Close()
+
+	a, err := newTestAdapter(&adapter.AdapterConfig{
+		APIKey:  "test-key",
+		BaseURL: server.URL + "/api/v1",
+		Headers: map[string]string{
+			"Accept":                "application/problem+json",
+			"X-DashScope-Workspace": "workspace-1",
+		},
+	})
+	if err != nil {
+		t.Fatalf("newTestAdapter() error = %v", err)
+	}
+
+	resp, err := a.chatCompletionNative(context.Background(), &adapter.ChatRequest{
+		Model:    "qwen-plus",
+		Messages: []adapter.Message{{Role: "user", Content: "say hello"}},
+	})
+	if err != nil {
+		t.Fatalf("ChatCompletion() error = %v", err)
+	}
+
+	if gotPath != "/api/v1/services/aigc/text-generation/generation" {
+		t.Fatalf("path = %q, want native text generation", gotPath)
+	}
+	if gotAuth != "Bearer test-key" {
+		t.Fatalf("Authorization = %q, want %q", gotAuth, "Bearer test-key")
+	}
+	if gotAccept != "application/json" {
+		t.Fatalf("Accept = %q, want application/json", gotAccept)
+	}
+	if gotWorkspace != "workspace-1" {
+		t.Fatalf("X-DashScope-Workspace = %q, want workspace-1", gotWorkspace)
+	}
+	input, ok := gotPayload["input"].(map[string]any)
+	if !ok {
+		t.Fatalf("payload.input = %#v, want object", gotPayload["input"])
+	}
+	messages, ok := input["messages"].([]any)
+	if !ok || len(messages) != 1 {
+		t.Fatalf("payload.input.messages = %#v, want one message", input["messages"])
+	}
+	message := messages[0].(map[string]any)
+	if got := message["content"]; got != "say hello" {
+		t.Fatalf("message.content = %#v, want text string", got)
+	}
+	if resp.Choices[0].Message.Content != "hello" {
+		t.Fatalf("response content = %#v, want hello", resp.Choices[0].Message.Content)
+	}
+	if resp.Usage == nil || resp.Usage.TotalTokens != 5 {
+		t.Fatalf("usage = %+v, want total_tokens=5", resp.Usage)
+	}
+}
+
+func TestAdapterChatCompletion_UsesNativeMultimodalGeneration(t *testing.T) {
+	t.Helper()
+
+	var (
+		gotPath    string
+		gotPayload map[string]any
+	)
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		defer r.Body.Close()
+
+		if err := json.NewDecoder(r.Body).Decode(&gotPayload); err != nil {
+			t.Fatalf("decode request body: %v", err)
+		}
+		gotPath = r.URL.Path
+
+		w.Header().Set("Content-Type", "application/json")
+		fmt.Fprint(w, `{"output":{"choices":[{"message":{"content":"seen"}}]}}`)
+	}))
+	defer server.Close()
+
+	a, err := newTestAdapter(&adapter.AdapterConfig{APIKey: "test-key", BaseURL: server.URL + "/api/v1"})
+	if err != nil {
+		t.Fatalf("newTestAdapter() error = %v", err)
+	}
+
+	_, err = a.chatCompletionNative(context.Background(), &adapter.ChatRequest{
+		Model: "qwen-vl-max",
+		Messages: []adapter.Message{{
+			Role: "user",
+			Content: []adapter.MessageContentPart{
+				{Type: "text", Text: "describe"},
+				{Type: "image_url", ImageURL: &adapter.ImageURL{URL: "https://example.com/a.png"}},
+			},
+		}},
+	})
+	if err != nil {
+		t.Fatalf("ChatCompletion() error = %v", err)
+	}
+
+	if gotPath != "/api/v1/services/aigc/multimodal-generation/generation" {
+		t.Fatalf("path = %q, want native multimodal generation", gotPath)
+	}
+	input := gotPayload["input"].(map[string]any)
+	messages := input["messages"].([]any)
+	content := messages[0].(map[string]any)["content"].([]any)
+	if got := content[0].(map[string]any)["text"]; got != "describe" {
+		t.Fatalf("first content = %#v, want text", content[0])
+	}
+	if got := content[1].(map[string]any)["image"]; got != "https://example.com/a.png" {
+		t.Fatalf("second content image = %#v, want image url", got)
+	}
+}
+
+func TestAdapterChatCompletion_Qwen36UsesNativeMultimodalGeneration(t *testing.T) {
+	for _, model := range []string{"qwen3.6-plus", "qwen3.6-plus-2026-04-02", "qwen3.6-flash", "qwen3.6-flash-2026-04-16"} {
+		t.Run(model, func(t *testing.T) {
+			var (
+				gotPath    string
+				gotPayload map[string]any
+			)
+
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				defer r.Body.Close()
+
+				if err := json.NewDecoder(r.Body).Decode(&gotPayload); err != nil {
+					t.Fatalf("decode request body: %v", err)
+				}
+				gotPath = r.URL.Path
+
+				w.Header().Set("Content-Type", "application/json")
+				fmt.Fprint(w, `{"output":{"choices":[{"message":{"role":"assistant","content":"ok"}}]}}`)
+			}))
+			defer server.Close()
+
+			a, err := newTestAdapter(&adapter.AdapterConfig{APIKey: "test-key", BaseURL: server.URL + "/api/v1"})
+			if err != nil {
+				t.Fatalf("newTestAdapter() error = %v", err)
+			}
+
+			_, err = a.chatCompletionNative(context.Background(), &adapter.ChatRequest{
+				Model:    model,
+				Messages: []adapter.Message{{Role: "user", Content: "hello"}},
+			})
+			if err != nil {
+				t.Fatalf("ChatCompletion() error = %v", err)
+			}
+
+			if gotPath != "/api/v1/services/aigc/multimodal-generation/generation" {
+				t.Fatalf("path = %q, want native multimodal generation", gotPath)
+			}
+			input := gotPayload["input"].(map[string]any)
+			messages := input["messages"].([]any)
+			content := messages[0].(map[string]any)["content"].([]any)
+			if got := content[0].(map[string]any)["text"]; got != "hello" {
+				t.Fatalf("content text = %#v, want hello", got)
+			}
+		})
+	}
+}
+
+func TestAdapterChatCompletion_AllowsDataURLImage(t *testing.T) {
+	t.Helper()
+
+	var gotPayload map[string]any
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		defer r.Body.Close()
+		if err := json.NewDecoder(r.Body).Decode(&gotPayload); err != nil {
+			t.Fatalf("decode request body: %v", err)
+		}
+		w.Header().Set("Content-Type", "application/json")
+		fmt.Fprint(w, `{"output":{"choices":[{"message":{"role":"assistant","content":"ok"}}]}}`)
+	}))
+	defer server.Close()
+
+	a, err := newTestAdapter(&adapter.AdapterConfig{APIKey: "test-key", BaseURL: server.URL + "/api/v1"})
+	if err != nil {
+		t.Fatalf("newTestAdapter() error = %v", err)
+	}
+
+	_, err = a.chatCompletionNative(context.Background(), &adapter.ChatRequest{
+		Model: "qwen-vl-max",
+		Messages: []adapter.Message{{
+			Role: "user",
+			Content: []adapter.MessageContentPart{
+				{Type: "text", Text: "describe"},
+				{Type: "image_url", ImageURL: &adapter.ImageURL{URL: "data:image/png;base64,abc"}},
+			},
+		}},
+	})
+	if err != nil {
+		t.Fatalf("ChatCompletion() error = %v", err)
+	}
+
+	input := gotPayload["input"].(map[string]any)
+	messages := input["messages"].([]any)
+	content := messages[0].(map[string]any)["content"].([]any)
+	if got := content[1].(map[string]any)["image"]; got != "data:image/png;base64,abc" {
+		t.Fatalf("image = %#v, want data URL", got)
+	}
+}
+
+func TestAdapterChatCompletion_RejectsLocalImageURL(t *testing.T) {
+	t.Helper()
+
+	a, err := newTestAdapter(&adapter.AdapterConfig{APIKey: "test-key", BaseURL: "https://dashscope.aliyuncs.com/api/v1"})
+	if err != nil {
+		t.Fatalf("newTestAdapter() error = %v", err)
+	}
+
+	_, err = a.chatCompletionNative(context.Background(), &adapter.ChatRequest{
+		Model: "qwen-vl-max",
+		Messages: []adapter.Message{{
+			Role: "user",
+			Content: []adapter.MessageContentPart{
+				{Type: "image_url", ImageURL: &adapter.ImageURL{URL: "http://localhost:3000/files/a.png"}},
+			},
+		}},
+	})
+	if err == nil {
+		t.Fatal("ChatCompletion() error = nil, want local image URL rejection")
+	}
+}
+
+func TestAdapterChatCompletionStream_UsesNativeSSE(t *testing.T) {
+	t.Helper()
+
+	var (
+		gotAccept    string
+		gotSSE       string
+		gotPath      string
+		gotWorkspace string
+		gotPayload   map[string]any
+	)
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		defer r.Body.Close()
+
+		if err := json.NewDecoder(r.Body).Decode(&gotPayload); err != nil {
+			t.Fatalf("decode request body: %v", err)
+		}
+		gotAccept = r.Header.Get("Accept")
+		gotSSE = r.Header.Get("X-DashScope-SSE")
+		gotPath = r.URL.Path
+		gotWorkspace = r.Header.Get("X-DashScope-Workspace")
+		w.Header().Set("Content-Type", "text/event-stream")
+		fmt.Fprint(w, "data: {\"request_id\":\"s1\",\"output\":{\"choices\":[{\"message\":{\"role\":\"assistant\",\"content\":\"he\"}}]}}\n\n")
+		fmt.Fprint(w, "data: {\"request_id\":\"s1\",\"output\":{\"choices\":[{\"finish_reason\":\"stop\",\"message\":{\"role\":\"assistant\",\"content\":\"llo\"}}]},\"usage\":{\"input_tokens\":1,\"output_tokens\":2,\"total_tokens\":3}}\n\n")
+	}))
+	defer server.Close()
+
+	a, err := newTestAdapter(&adapter.AdapterConfig{
+		APIKey:  "test-key",
+		BaseURL: server.URL + "/api/v1",
+		Headers: map[string]string{
+			"Accept":                "application/problem+json",
+			"X-DashScope-SSE":       "disable",
+			"X-DashScope-Workspace": "workspace-1",
+		},
+	})
+	if err != nil {
+		t.Fatalf("newTestAdapter() error = %v", err)
+	}
+
+	stream, err := a.chatCompletionStreamNative(context.Background(), &adapter.ChatRequest{
+		Model:    "qwen-plus",
+		Messages: []adapter.Message{{Role: "user", Content: "say hello"}},
+	})
+	if err != nil {
+		t.Fatalf("ChatCompletionStream() error = %v", err)
+	}
+
+	var chunks []adapter.StreamResponse
+	for chunk := range stream {
+		chunks = append(chunks, chunk)
+	}
+	if gotPath != "/api/v1/services/aigc/text-generation/generation" {
+		t.Fatalf("path = %q, want native text generation", gotPath)
+	}
+	if gotAccept != "text/event-stream" {
+		t.Fatalf("Accept = %q, want text/event-stream", gotAccept)
+	}
+	if gotSSE != "enable" {
+		t.Fatalf("X-DashScope-SSE = %q, want enable", gotSSE)
+	}
+	if gotWorkspace != "workspace-1" {
+		t.Fatalf("X-DashScope-Workspace = %q, want workspace-1", gotWorkspace)
+	}
+	if _, ok := gotPayload["stream"]; ok {
+		t.Fatalf("payload.stream = %#v, want omitted", gotPayload["stream"])
+	}
+	if len(chunks) != 3 {
+		t.Fatalf("chunk count = %d, want 3", len(chunks))
+	}
+	if chunks[0].Choices[0].Delta.Content != "he" || chunks[1].Choices[0].Delta.Content != "llo" {
+		t.Fatalf("chunks = %#v, want text deltas", chunks)
+	}
+	if chunks[2].Usage == nil || chunks[2].Usage.TotalTokens != 3 {
+		t.Fatalf("final usage = %+v, want total_tokens=3", chunks[2].Usage)
+	}
+}
+func TestAdapterChatCompletionStream_ParsesNativeOutputText(t *testing.T) {
+	t.Helper()
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		fmt.Fprint(w, "data: {\"request_id\":\"s1\",\"output\":{\"text\":\"foo\"}}\n\n")
+		fmt.Fprint(w, "data: {\"request_id\":\"s1\",\"output\":{\"text\":\"bar\"},\"usage\":{\"input_tokens\":1,\"output_tokens\":2,\"total_tokens\":3}}\n\n")
+	}))
+	defer server.Close()
+
+	a, err := newTestAdapter(&adapter.AdapterConfig{APIKey: "test-key", BaseURL: server.URL + "/api/v1"})
+	if err != nil {
+		t.Fatalf("newTestAdapter() error = %v", err)
+	}
+
+	stream, err := a.chatCompletionStreamNative(context.Background(), &adapter.ChatRequest{
+		Model:    "qwen-plus",
+		Messages: []adapter.Message{{Role: "user", Content: "say hello"}},
+	})
+	if err != nil {
+		t.Fatalf("ChatCompletionStream() error = %v", err)
+	}
+
+	var got string
+	var usage *adapter.Usage
+	for chunk := range stream {
+		if chunk.Error != nil {
+			t.Fatalf("stream error = %v", chunk.Error)
+		}
+		if len(chunk.Choices) > 0 {
+			if text, ok := chunk.Choices[0].Delta.Content.(string); ok {
+				got += text
+			}
+		}
+		if chunk.Usage != nil {
+			usage = chunk.Usage
+		}
+	}
+
+	if got != "foobar" {
+		t.Fatalf("stream text = %q, want foobar", got)
+	}
+	if usage == nil || usage.TotalTokens != 3 {
+		t.Fatalf("usage = %+v, want total_tokens=3", usage)
+	}
+}
+
+func TestAdapterChatCompletionStream_ParsesNativeDeltaContent(t *testing.T) {
+	t.Helper()
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		fmt.Fprint(w, "data: {\"request_id\":\"s1\",\"output\":{\"choices\":[{\"delta\":{\"role\":\"assistant\",\"content\":\"foo\"}}]}}\n\n")
+		fmt.Fprint(w, "data: {\"request_id\":\"s1\",\"output\":{\"choices\":[{\"delta\":{\"content\":\"bar\"}}]},\"usage\":{\"input_tokens\":1,\"output_tokens\":2,\"total_tokens\":3}}\n\n")
+	}))
+	defer server.Close()
+
+	a, err := newTestAdapter(&adapter.AdapterConfig{APIKey: "test-key", BaseURL: server.URL + "/api/v1"})
+	if err != nil {
+		t.Fatalf("newTestAdapter() error = %v", err)
+	}
+
+	stream, err := a.chatCompletionStreamNative(context.Background(), &adapter.ChatRequest{
+		Model:    "qwen-plus",
+		Messages: []adapter.Message{{Role: "user", Content: "say hello"}},
+	})
+	if err != nil {
+		t.Fatalf("ChatCompletionStream() error = %v", err)
+	}
+
+	var got string
+	var usage *adapter.Usage
+	for chunk := range stream {
+		if chunk.Error != nil {
+			t.Fatalf("stream error = %v", chunk.Error)
+		}
+		if len(chunk.Choices) > 0 {
+			if text, ok := chunk.Choices[0].Delta.Content.(string); ok {
+				got += text
+			}
+		}
+		if chunk.Usage != nil {
+			usage = chunk.Usage
+		}
+	}
+
+	if got != "foobar" {
+		t.Fatalf("stream text = %q, want foobar", got)
+	}
+	if usage == nil || usage.TotalTokens != 3 {
+		t.Fatalf("usage = %+v, want total_tokens=3", usage)
+	}
+}
+
+func TestAdapterChatCompletion_RejectsUnsupportedContentPart(t *testing.T) {
+	t.Helper()
+
+	a, err := newTestAdapter(&adapter.AdapterConfig{APIKey: "test-key", BaseURL: "https://dashscope.aliyuncs.com/api/v1"})
+	if err != nil {
+		t.Fatalf("newTestAdapter() error = %v", err)
+	}
+
+	_, err = a.chatCompletionNative(context.Background(), &adapter.ChatRequest{
+		Model: "qwen-vl-max",
+		Messages: []adapter.Message{{
+			Role:    "user",
+			Content: []adapter.MessageContentPart{{Type: "audio_url"}},
+		}},
+	})
+	if err == nil {
+		t.Fatal("ChatCompletion() error = nil, want unsupported content type error")
+	}
+}
+func TestAdapterCreateEmbeddings_UsesNativeTextEmbeddingEndpoint(t *testing.T) {
+	t.Helper()
+
+	var (
+		gotAuth    string
+		gotPath    string
+		gotPayload map[string]any
+	)
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		defer r.Body.Close()
+
+		if err := json.NewDecoder(r.Body).Decode(&gotPayload); err != nil {
+			t.Fatalf("decode request body: %v", err)
+		}
+
+		gotAuth = r.Header.Get("Authorization")
+		gotPath = r.URL.Path
+
+		w.Header().Set("Content-Type", "application/json")
+		fmt.Fprint(w, `{
+			"output":{"embeddings":[{"embedding":[0.1,0.2],"text_index":0}]},
+			"usage":{"input_tokens":3,"total_tokens":3}
+		}`)
+	}))
+	defer server.Close()
+
+	a, err := newTestAdapter(&adapter.AdapterConfig{
+		APIKey:  "test-key",
+		BaseURL: server.URL + "/api/v1",
+	})
+	if err != nil {
+		t.Fatalf("newTestAdapter() error = %v", err)
+	}
+
+	resp, err := a.CreateEmbeddings(context.Background(), &adapter.EmbeddingsRequest{
+		Model: "text-embedding-v4",
+		Input: "hello",
+	})
+	if err != nil {
+		t.Fatalf("CreateEmbeddings() error = %v", err)
+	}
+
+	if gotPath != "/api/v1/services/embeddings/text-embedding/text-embedding" {
+		t.Fatalf("path = %q, want %q", gotPath, "/api/v1/services/embeddings/text-embedding/text-embedding")
+	}
+	if gotAuth != "Bearer test-key" {
+		t.Fatalf("Authorization = %q, want %q", gotAuth, "Bearer test-key")
+	}
+	if got := gotPayload["model"]; got != "text-embedding-v4" {
+		t.Fatalf("payload.model = %#v, want %q", got, "text-embedding-v4")
+	}
+	input, ok := gotPayload["input"].(map[string]any)
+	if !ok {
+		t.Fatalf("payload.input = %#v, want object", gotPayload["input"])
+	}
+	texts, ok := input["texts"].([]any)
+	if !ok || len(texts) != 1 || texts[0] != "hello" {
+		t.Fatalf("payload.input.texts = %#v, want [hello]", input["texts"])
+	}
+	if resp.Model != "text-embedding-v4" {
+		t.Fatalf("response model = %q, want %q", resp.Model, "text-embedding-v4")
+	}
+	if len(resp.Data) != 1 {
+		t.Fatalf("len(response.data) = %d, want 1", len(resp.Data))
+	}
+}
+
+func TestAdapterCreateEmbeddings_QwenVLEmbeddingUsesNativeMultimodalEndpoint(t *testing.T) {
+	t.Helper()
+
+	var (
+		gotPath    string
+		gotPayload map[string]any
+	)
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		defer r.Body.Close()
+
+		if err := json.NewDecoder(r.Body).Decode(&gotPayload); err != nil {
+			t.Fatalf("decode request body: %v", err)
+		}
+		gotPath = r.URL.Path
+
+		w.Header().Set("Content-Type", "application/json")
+		fmt.Fprint(w, `{
+			"output":{"embeddings":[{"embedding":[0.1,0.2],"index":0},{"embedding":[0.3,0.4],"index":1}]},
+			"usage":{"input_tokens":6,"total_tokens":6}
+		}`)
+	}))
+	defer server.Close()
+
+	a, err := newTestAdapter(&adapter.AdapterConfig{
+		APIKey:  "test-key",
+		BaseURL: server.URL + "/api/v1",
+	})
+	if err != nil {
+		t.Fatalf("newTestAdapter() error = %v", err)
+	}
+
+	resp, err := a.CreateEmbeddings(context.Background(), &adapter.EmbeddingsRequest{
+		Model: "qwen3-vl-embedding",
+		Input: []string{"hello", "world"},
+	})
+	if err != nil {
+		t.Fatalf("CreateEmbeddings() error = %v", err)
+	}
+
+	if gotPath != "/api/v1/services/embeddings/multimodal-embedding/multimodal-embedding" {
+		t.Fatalf("path = %q, want multimodal embedding endpoint", gotPath)
+	}
+	input, ok := gotPayload["input"].(map[string]any)
+	if !ok {
+		t.Fatalf("payload.input = %#v, want object", gotPayload["input"])
+	}
+	contents, ok := input["contents"].([]any)
+	if !ok || len(contents) != 2 {
+		t.Fatalf("payload.input.contents = %#v, want two text contents", input["contents"])
+	}
+	first, ok := contents[0].(map[string]any)
+	if !ok || first["text"] != "hello" {
+		t.Fatalf("first content = %#v, want text hello", contents[0])
+	}
+	if len(resp.Data) != 2 || resp.Data[1].Index != 1 {
+		t.Fatalf("response.data = %#v, want two indexed embeddings", resp.Data)
+	}
+}
+
+func TestAdapterRerank_Qwen3Rerank_UsesCompatibleAPI(t *testing.T) {
+	t.Helper()
+
+	topN := 2
+	var (
+		gotPath    string
+		gotAuth    string
+		gotPayload map[string]any
+	)
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		defer r.Body.Close()
+
+		if err := json.NewDecoder(r.Body).Decode(&gotPayload); err != nil {
+			t.Fatalf("decode request body: %v", err)
+		}
+
+		gotPath = r.URL.Path
+		gotAuth = r.Header.Get("Authorization")
+
+		w.Header().Set("Content-Type", "application/json")
+		fmt.Fprint(w, `{
+			"id":"rerank-1",
+			"results":[
+				{"index":1,"relevance_score":0.91,"document":"doc-b"},
+				{"index":0,"relevance_score":0.42,"document":"doc-a"}
+			],
+			"usage":{"total_tokens":8}
+		}`)
+	}))
+	defer server.Close()
+
+	a, err := newTestAdapter(&adapter.AdapterConfig{
+		APIKey:  "test-key",
+		BaseURL: server.URL + "/api/v1",
+	})
+	if err != nil {
+		t.Fatalf("newTestAdapter() error = %v", err)
+	}
+
+	resp, err := a.Rerank(context.Background(), &adapter.RerankRequest{
+		Model:     "qwen3-rerank",
+		Query:     "query",
+		Documents: []string{"doc-a", "doc-b"},
+		TopN:      &topN,
+	})
+	if err != nil {
+		t.Fatalf("Rerank() error = %v", err)
+	}
+
+	if gotPath != "/compatible-api/v1/reranks" {
+		t.Fatalf("path = %q, want %q", gotPath, "/compatible-api/v1/reranks")
+	}
+	if gotAuth != "Bearer test-key" {
+		t.Fatalf("Authorization = %q, want %q", gotAuth, "Bearer test-key")
+	}
+	if got := gotPayload["model"]; got != "qwen3-rerank" {
+		t.Fatalf("payload.model = %#v, want %q", got, "qwen3-rerank")
+	}
+	if got := gotPayload["query"]; got != "query" {
+		t.Fatalf("payload.query = %#v, want %q", got, "query")
+	}
+	if got := gotPayload["top_n"]; got != float64(2) {
+		t.Fatalf("payload.top_n = %#v, want %v", got, 2)
+	}
+	documents, ok := gotPayload["documents"].([]any)
+	if !ok || len(documents) != 2 {
+		t.Fatalf("payload.documents = %#v, want two items", gotPayload["documents"])
+	}
+	if resp.Model != "qwen3-rerank" {
+		t.Fatalf("response model = %q, want %q", resp.Model, "qwen3-rerank")
+	}
+	if len(resp.Results) != 2 {
+		t.Fatalf("len(results) = %d, want 2", len(resp.Results))
+	}
+	if resp.Results[0].Index != 1 || resp.Results[0].Text != "doc-b" {
+		t.Fatalf("results[0] = %#v, want index=1 text=%q", resp.Results[0], "doc-b")
+	}
+	if resp.Usage == nil || resp.Usage.TotalTokens != 8 {
+		t.Fatalf("usage = %+v, want total_tokens=8", resp.Usage)
+	}
+}
+func TestAdapterRerank_GTERerank_UsesNativeAPI(t *testing.T) {
+	t.Helper()
+
+	topN := 1
+	returnDocuments := true
+	var (
+		gotPath    string
+		gotAuth    string
+		gotPayload map[string]any
+	)
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		defer r.Body.Close()
+
+		if err := json.NewDecoder(r.Body).Decode(&gotPayload); err != nil {
+			t.Fatalf("decode request body: %v", err)
+		}
+
+		gotPath = r.URL.Path
+		gotAuth = r.Header.Get("Authorization")
+
+		w.Header().Set("Content-Type", "application/json")
+		fmt.Fprint(w, `{
+			"output":{
+				"results":[
+					{"index":0,"relevance_score":0.97,"document":"doc-a"}
+				]
+			},
+			"usage":{"total_tokens":5}
+		}`)
+	}))
+	defer server.Close()
+
+	a, err := newTestAdapter(&adapter.AdapterConfig{
+		APIKey:  "test-key",
+		BaseURL: server.URL + "/api/v1",
+	})
+	if err != nil {
+		t.Fatalf("newTestAdapter() error = %v", err)
+	}
+
+	resp, err := a.Rerank(context.Background(), &adapter.RerankRequest{
+		Model:           "gte-rerank-v2",
+		Query:           "query",
+		Documents:       []string{"doc-a", "doc-b"},
+		TopN:            &topN,
+		ReturnDocuments: &returnDocuments,
+	})
+	if err != nil {
+		t.Fatalf("Rerank() error = %v", err)
+	}
+
+	if gotPath != "/api/v1/services/rerank/text-rerank/text-rerank" {
+		t.Fatalf("path = %q, want %q", gotPath, "/api/v1/services/rerank/text-rerank/text-rerank")
+	}
+	if gotAuth != "Bearer test-key" {
+		t.Fatalf("Authorization = %q, want %q", gotAuth, "Bearer test-key")
+	}
+	if got := gotPayload["model"]; got != "gte-rerank-v2" {
+		t.Fatalf("payload.model = %#v, want %q", got, "gte-rerank-v2")
+	}
+	input, ok := gotPayload["input"].(map[string]any)
+	if !ok {
+		t.Fatalf("payload.input = %#v, want object", gotPayload["input"])
+	}
+	if got := input["query"]; got != "query" {
+		t.Fatalf("payload.input.query = %#v, want %q", got, "query")
+	}
+	documents, ok := input["documents"].([]any)
+	if !ok || len(documents) != 2 {
+		t.Fatalf("payload.input.documents = %#v, want two items", input["documents"])
+	}
+	parameters, ok := gotPayload["parameters"].(map[string]any)
+	if !ok {
+		t.Fatalf("payload.parameters = %#v, want object", gotPayload["parameters"])
+	}
+	if got := parameters["top_n"]; got != float64(1) {
+		t.Fatalf("payload.parameters.top_n = %#v, want %v", got, 1)
+	}
+	if got := parameters["return_documents"]; got != true {
+		t.Fatalf("payload.parameters.return_documents = %#v, want true", got)
+	}
+	if resp.Model != "gte-rerank-v2" {
+		t.Fatalf("response model = %q, want %q", resp.Model, "gte-rerank-v2")
+	}
+	if len(resp.Results) != 1 {
+		t.Fatalf("len(results) = %d, want 1", len(resp.Results))
+	}
+	if resp.Results[0].Text != "doc-a" {
+		t.Fatalf("results[0] = %#v, want text=%q", resp.Results[0], "doc-a")
+	}
+	if resp.Usage == nil || resp.Usage.TotalTokens != 5 {
+		t.Fatalf("usage = %+v, want total_tokens=5", resp.Usage)
+	}
+}
+
+func TestAdapterCreateImage_AddsReferenceImageContentForQwenImage(t *testing.T) {
+	t.Helper()
+
+	n := 2
+	var (
+		gotPath    string
+		gotAuth    string
+		gotPayload map[string]any
+	)
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		defer r.Body.Close()
+
+		if err := json.NewDecoder(r.Body).Decode(&gotPayload); err != nil {
+			t.Fatalf("decode request body: %v", err)
+		}
+		gotPath = r.URL.Path
+		gotAuth = r.Header.Get("Authorization")
+
+		w.Header().Set("Content-Type", "application/json")
+		fmt.Fprint(w, `{
+			"output":{"choices":[{"message":{"role":"assistant","content":[{"image":"https://cdn.example.com/out.png"}]}}]},
+			"usage":{"image_count":1}
+		}`)
+	}))
+	defer server.Close()
+
+	a, err := newTestAdapter(&adapter.AdapterConfig{
+		APIKey:  "test-key",
+		BaseURL: server.URL + "/api/v1",
+	})
+	if err != nil {
+		t.Fatalf("newTestAdapter() error = %v", err)
+	}
+
+	resp, err := a.CreateImage(context.Background(), &adapter.ImageRequest{
+		Model:             "qwen-image-plus",
+		Prompt:            "change the style",
+		Size:              "1024x1024",
+		N:                 &n,
+		ReferenceImageURL: "https://files.example.com/reference.png?sign=1",
+	})
+	if err != nil {
+		t.Fatalf("CreateImage() error = %v", err)
+	}
+
+	if gotPath != "/api/v1/services/aigc/multimodal-generation/generation" {
+		t.Fatalf("path = %q, want %q", gotPath, "/api/v1/services/aigc/multimodal-generation/generation")
+	}
+	if gotAuth != "Bearer test-key" {
+		t.Fatalf("Authorization = %q, want %q", gotAuth, "Bearer test-key")
+	}
+	if got := gotPayload["model"]; got != "qwen-image-plus" {
+		t.Fatalf("payload.model = %#v, want %q", got, "qwen-image-plus")
+	}
+	input, ok := gotPayload["input"].(map[string]any)
+	if !ok {
+		t.Fatalf("payload.input = %#v, want object", gotPayload["input"])
+	}
+	messages, ok := input["messages"].([]any)
+	if !ok || len(messages) != 1 {
+		t.Fatalf("payload.input.messages = %#v, want one message", input["messages"])
+	}
+	message, ok := messages[0].(map[string]any)
+	if !ok {
+		t.Fatalf("message = %#v, want object", messages[0])
+	}
+	content, ok := message["content"].([]any)
+	if !ok || len(content) != 2 {
+		t.Fatalf("message.content = %#v, want text plus reference image", message["content"])
+	}
+	if got := content[0].(map[string]any)["image"]; got != "https://files.example.com/reference.png?sign=1" {
+		t.Fatalf("content[0].image = %#v, want reference image url", got)
+	}
+	if got := content[1].(map[string]any)["text"]; got != "change the style" {
+		t.Fatalf("content[1].text = %#v, want prompt", got)
+	}
+	parameters, ok := gotPayload["parameters"].(map[string]any)
+	if !ok {
+		t.Fatalf("payload.parameters = %#v, want object", gotPayload["parameters"])
+	}
+	if got := parameters["size"]; got != "1024*1024" {
+		t.Fatalf("payload.parameters.size = %#v, want normalized size", got)
+	}
+	if got := parameters["n"]; got != float64(n) {
+		t.Fatalf("payload.parameters.n = %#v, want %d", got, n)
+	}
+	if len(resp.Data) != 1 || resp.Data[0].URL != "https://cdn.example.com/out.png" {
+		t.Fatalf("response data = %#v, want generated image url", resp.Data)
+	}
+}
+
+func TestAdapterCreateImage_RejectsInvalidReferenceImageURLForQwenImage(t *testing.T) {
+	t.Helper()
+
+	a, err := newTestAdapter(&adapter.AdapterConfig{APIKey: "test-key"})
+	if err != nil {
+		t.Fatalf("newTestAdapter() error = %v", err)
+	}
+
+	_, err = a.CreateImage(context.Background(), &adapter.ImageRequest{
+		Model:             "qwen-image-plus",
+		Prompt:            "change the style",
+		ReferenceImageURL: "file:///tmp/reference.png",
+	})
+	if !errors.Is(err, adapter.ErrInvalidRequest) {
+		t.Fatalf("CreateImage() error = %v, want ErrInvalidRequest", err)
+	}
+}
+
+func TestAdapterListModels_UsesUpstreamModelsEndpointWithoutGuessingCapabilities(t *testing.T) {
+	t.Helper()
+
+	var (
+		gotPath string
+		gotAuth string
+	)
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gotPath = r.URL.Path
+		gotAuth = r.Header.Get("Authorization")
+
+		w.Header().Set("Content-Type", "application/json")
+		fmt.Fprint(w, `{
+			"object":"list",
+			"data":[
+				{"id":"qwen-plus","object":"model","owned_by":"dashscope"},
+				{"id":"qwen-image-max","object":"model","owned_by":"dashscope"},
+				{"id":"text-embedding-v4","object":"model","owned_by":"dashscope"},
+				{"id":"qwen3-rerank","object":"model","owned_by":"dashscope"},
+				{"id":"unknown-model","object":"model","owned_by":"dashscope"}
+			]
+		}`)
+	}))
+	defer server.Close()
+
+	a, err := newTestAdapter(&adapter.AdapterConfig{
+		APIKey:  "config-key",
+		BaseURL: server.URL + "/api/v1",
+	})
+	if err != nil {
+		t.Fatalf("newTestAdapter() error = %v", err)
+	}
+
+	models, err := a.ListModels(context.Background(), "runtime-key")
+	if err != nil {
+		t.Fatalf("ListModels() error = %v", err)
+	}
+
+	if gotPath != "/compatible-mode/v1/models" {
+		t.Fatalf("path = %q, want %q", gotPath, "/compatible-mode/v1/models")
+	}
+	if gotAuth != "Bearer runtime-key" {
+		t.Fatalf("Authorization = %q, want %q", gotAuth, "Bearer runtime-key")
+	}
+
+	for _, id := range []string{"qwen-plus", "qwen-image-max", "text-embedding-v4", "qwen3-rerank", "unknown-model"} {
+		model := findAliyunModel(t, models, id)
+		if model.Type != "" || len(model.Capabilities) != 0 {
+			t.Fatalf("%s inferred type/capabilities = %q/%#v, want upstream-only metadata", id, model.Type, model.Capabilities)
+		}
+	}
+}
+
+func TestAdapterListModels_ReturnsUnsupportedInsteadOfStaleCatalog(t *testing.T) {
+	t.Helper()
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		http.Error(w, `{"error":{"message":"not found","code":"NOT_FOUND"}}`, http.StatusNotFound)
+	}))
+	defer server.Close()
+
+	a, err := newTestAdapter(&adapter.AdapterConfig{
+		APIKey:  "config-key",
+		BaseURL: server.URL + "/api/v1",
+	})
+	if err != nil {
+		t.Fatalf("newTestAdapter() error = %v", err)
+	}
+
+	models, err := a.ListModels(context.Background(), "runtime-key")
+	if !errors.Is(err, adapter.ErrCapabilityUnsupported) {
+		t.Fatalf("ListModels() error = %v, want ErrCapabilityUnsupported", err)
+	}
+	if models != nil {
+		t.Fatalf("ListModels() models = %#v, want nil", models)
+	}
+}
+
+func TestAdapterGetProviderInfo_DeclaresDocumentedCapabilities(t *testing.T) {
+	t.Helper()
+
+	a, err := newTestAdapter(&adapter.AdapterConfig{
+		APIKey:  "test-key",
+		BaseURL: "https://dashscope.aliyuncs.com/api/v1",
+	})
+	if err != nil {
+		t.Fatalf("newTestAdapter() error = %v", err)
+	}
+
+	info := a.GetProviderInfo()
+	if info == nil {
+		t.Fatal("GetProviderInfo() = nil, want non-nil")
+	}
+
+	if !containsAliyunValue(info.Capabilities, "chat") {
+		t.Fatalf("Capabilities = %#v, want to contain %q", info.Capabilities, "chat")
+	}
+	if !containsAliyunValue(info.Capabilities, "stream") {
+		t.Fatalf("Capabilities = %#v, want to contain %q", info.Capabilities, "stream")
+	}
+	if !containsAliyunValue(info.Capabilities, "image") {
+		t.Fatalf("Capabilities = %#v, want to contain %q", info.Capabilities, "image")
+	}
+	if !containsAliyunValue(info.Capabilities, "embedding") {
+		t.Fatalf("Capabilities = %#v, want to contain %q", info.Capabilities, "embedding")
+	}
+	if !containsAliyunValue(info.Capabilities, "rerank") {
+		t.Fatalf("Capabilities = %#v, want to contain %q", info.Capabilities, "rerank")
+	}
+	if !containsAliyunValue(info.Capabilities, "model_listing") {
+		t.Fatalf("Capabilities = %#v, want to contain %q", info.Capabilities, "model_listing")
+	}
+}
+
+func findAliyunModel(t *testing.T, models []adapter.Model, id string) adapter.Model {
+	t.Helper()
+
+	for _, model := range models {
+		if model.ID == id {
+			return model
+		}
+	}
+
+	t.Fatalf("model %q not found in %#v", id, models)
+	return adapter.Model{}
+}
+
+func containsAliyunValue(values []string, target string) bool {
+	for _, value := range values {
+		if value == target {
+			return true
+		}
+	}
+	return false
+}
+
+func TestAdapterChatCompletion_PreservesToolCallMessages(t *testing.T) {
+	t.Helper()
+
+	var gotPayload map[string]any
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		defer r.Body.Close()
+		if err := json.NewDecoder(r.Body).Decode(&gotPayload); err != nil {
+			t.Fatalf("decode request body: %v", err)
+		}
+		w.Header().Set("Content-Type", "application/json")
+		fmt.Fprint(w, `{"output":{"choices":[{"message":{"role":"assistant","content":"ok"}}]}}`)
+	}))
+	defer server.Close()
+
+	a, err := newTestAdapter(&adapter.AdapterConfig{APIKey: "test-key", BaseURL: server.URL + "/api/v1"})
+	if err != nil {
+		t.Fatalf("newTestAdapter() error = %v", err)
+	}
+
+	idx := 0
+	_, err = a.chatCompletionNative(context.Background(), &adapter.ChatRequest{
+		Model: "qwen-plus",
+		Messages: []adapter.Message{
+			{Role: "assistant", Content: "", ToolCalls: []adapter.ToolCall{{Index: &idx, ID: "call_1", Type: "function", Function: adapter.FunctionCall{Name: "lookup", Arguments: `{"city":"hz"}`}}}},
+			{Role: "tool", ToolCallID: "call_1", Content: "sunny"},
+		},
+	})
+	if err != nil {
+		t.Fatalf("ChatCompletion() error = %v", err)
+	}
+
+	input := gotPayload["input"].(map[string]any)
+	messages := input["messages"].([]any)
+	assistantMsg := messages[0].(map[string]any)
+	toolCalls, ok := assistantMsg["tool_calls"].([]any)
+	if !ok || len(toolCalls) != 1 {
+		t.Fatalf("assistant tool_calls = %#v, want one tool call", assistantMsg["tool_calls"])
+	}
+	function := toolCalls[0].(map[string]any)["function"].(map[string]any)
+	if function["name"] != "lookup" || function["arguments"] != `{"city":"hz"}` {
+		t.Fatalf("tool function = %#v, want lookup args", function)
+	}
+	toolMsg := messages[1].(map[string]any)
+	if toolMsg["tool_call_id"] != "call_1" {
+		t.Fatalf("tool_call_id = %#v, want call_1", toolMsg["tool_call_id"])
+	}
+}
+
+func TestAdapterChatCompletion_ParsesToolCalls(t *testing.T) {
+	t.Helper()
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		fmt.Fprint(w, `{
+			"request_id":"chat-tool-1",
+			"output":{"choices":[{"finish_reason":"tool_calls","message":{"role":"assistant","content":"","tool_calls":[{"id":"call_1","type":"function","function":{"name":"lookup","arguments":"{\"city\":\"hz\"}"}}]}}]},
+			"usage":{"input_tokens":3,"output_tokens":2,"total_tokens":5}
+		}`)
+	}))
+	defer server.Close()
+
+	a, err := newTestAdapter(&adapter.AdapterConfig{APIKey: "test-key", BaseURL: server.URL + "/api/v1"})
+	if err != nil {
+		t.Fatalf("newTestAdapter() error = %v", err)
+	}
+
+	resp, err := a.chatCompletionNative(context.Background(), &adapter.ChatRequest{
+		Model:    "qwen-plus",
+		Messages: []adapter.Message{{Role: "user", Content: "lookup"}},
+	})
+	if err != nil {
+		t.Fatalf("ChatCompletion() error = %v", err)
+	}
+
+	calls := resp.Choices[0].Message.ToolCalls
+	if len(calls) != 1 {
+		t.Fatalf("tool calls = %#v, want one", calls)
+	}
+	if calls[0].ID != "call_1" || calls[0].Type != "function" || calls[0].Function.Name != "lookup" || calls[0].Function.Arguments != `{"city":"hz"}` {
+		t.Fatalf("tool call = %#v, want full function call", calls[0])
+	}
+	if resp.Choices[0].FinishReason != "tool_calls" {
+		t.Fatalf("finish reason = %q, want tool_calls", resp.Choices[0].FinishReason)
+	}
+}
+
+func TestAdapterChatCompletionStream_ParsesToolCallDelta(t *testing.T) {
+	t.Helper()
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		fmt.Fprint(w, "data:"+`{"request_id":"s-tool-1","output":{"choices":[{"delta":{"role":"assistant","tool_calls":[{"index":0,"id":"call_1","type":"function","function":{"name":"lookup","arguments":"{\"city\":\""}}]}}]}}`+"\n\n")
+		fmt.Fprint(w, "data:"+`{"request_id":"s-tool-1","output":{"choices":[{"finish_reason":"tool_calls","delta":{"tool_calls":[{"index":0,"function":{"arguments":"hz\"}"}}]}}]},"usage":{"input_tokens":1,"output_tokens":2,"total_tokens":3}}`+"\n\n")
+	}))
+	defer server.Close()
+
+	a, err := newTestAdapter(&adapter.AdapterConfig{APIKey: "test-key", BaseURL: server.URL + "/api/v1"})
+	if err != nil {
+		t.Fatalf("newTestAdapter() error = %v", err)
+	}
+
+	stream, err := a.chatCompletionStreamNative(context.Background(), &adapter.ChatRequest{
+		Model:    "qwen-plus",
+		Messages: []adapter.Message{{Role: "user", Content: "lookup"}},
+	})
+	if err != nil {
+		t.Fatalf("ChatCompletionStream() error = %v", err)
+	}
+
+	var calls []adapter.ToolCall
+	var arguments string
+	var finishReason string
+	var usage *adapter.Usage
+	for chunk := range stream {
+		if chunk.Error != nil {
+			t.Fatalf("stream error = %v", chunk.Error)
+		}
+		if len(chunk.Choices) > 0 {
+			choice := chunk.Choices[0]
+			finishReason = choice.FinishReason
+			if len(choice.Delta.ToolCalls) > 0 {
+				calls = append(calls, choice.Delta.ToolCalls...)
+				arguments += choice.Delta.ToolCalls[0].Function.Arguments
+			}
+		}
+		if chunk.Usage != nil {
+			usage = chunk.Usage
+		}
+	}
+
+	if len(calls) != 2 {
+		t.Fatalf("tool call delta count = %d, want 2", len(calls))
+	}
+	if calls[0].ID != "call_1" || calls[0].Type != "function" || calls[0].Function.Name != "lookup" {
+		t.Fatalf("first tool call delta = %#v, want id/type/name", calls[0])
+	}
+	if arguments != `{"city":"hz"}` {
+		t.Fatalf("tool arguments = %q, want JSON args", arguments)
+	}
+	if finishReason != "tool_calls" {
+		t.Fatalf("finish reason = %q, want tool_calls", finishReason)
+	}
+	if usage == nil || usage.TotalTokens != 3 {
+		t.Fatalf("usage = %+v, want total_tokens=3", usage)
+	}
+}
+
+func TestAdapterChatCompletion_MapsNativeParameters(t *testing.T) {
+	t.Helper()
+
+	var gotPayload map[string]any
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		defer r.Body.Close()
+		if err := json.NewDecoder(r.Body).Decode(&gotPayload); err != nil {
+			t.Fatalf("decode request body: %v", err)
+		}
+		w.Header().Set("Content-Type", "application/json")
+		fmt.Fprint(w, `{"output":{"choices":[{"message":{"role":"assistant","content":"ok"}}]}}`)
+	}))
+	defer server.Close()
+
+	a, err := newTestAdapter(&adapter.AdapterConfig{APIKey: "test-key", BaseURL: server.URL + "/api/v1"})
+	if err != nil {
+		t.Fatalf("newTestAdapter() error = %v", err)
+	}
+
+	presencePenalty := 0.3
+	frequencyPenalty := 0.4
+	seed := 123
+	_, err = a.chatCompletionNative(context.Background(), &adapter.ChatRequest{
+		Model:            "qwen-plus",
+		Messages:         []adapter.Message{{Role: "user", Content: "say hello"}},
+		PresencePenalty:  &presencePenalty,
+		FrequencyPenalty: &frequencyPenalty,
+		Seed:             &seed,
+	})
+	if err != nil {
+		t.Fatalf("ChatCompletion() error = %v", err)
+	}
+
+	parameters := gotPayload["parameters"].(map[string]any)
+	if got := parameters["presence_penalty"]; got != presencePenalty {
+		t.Fatalf("presence_penalty = %#v, want %v", got, presencePenalty)
+	}
+	if got := parameters["frequency_penalty"]; got != frequencyPenalty {
+		t.Fatalf("frequency_penalty = %#v, want %v", got, frequencyPenalty)
+	}
+	if got := parameters["seed"]; got != float64(seed) {
+		t.Fatalf("seed = %#v, want %d", got, seed)
+	}
+}
+
+func TestAdapterChatCompletion_ParsesReasoningContent(t *testing.T) {
+	t.Helper()
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		fmt.Fprint(w, `{
+			"request_id":"chat-reasoning-1",
+			"output":{"choices":[{"message":{"role":"assistant","reasoning_content":"think","content":"answer"}}]}
+		}`)
+	}))
+	defer server.Close()
+
+	a, err := newTestAdapter(&adapter.AdapterConfig{APIKey: "test-key", BaseURL: server.URL + "/api/v1"})
+	if err != nil {
+		t.Fatalf("newTestAdapter() error = %v", err)
+	}
+
+	resp, err := a.chatCompletionNative(context.Background(), &adapter.ChatRequest{
+		Model:    "qwen-plus",
+		Messages: []adapter.Message{{Role: "user", Content: "question"}},
+	})
+	if err != nil {
+		t.Fatalf("ChatCompletion() error = %v", err)
+	}
+
+	if got := resp.Choices[0].Message.ReasoningContent; got != "think" {
+		t.Fatalf("reasoning_content = %q, want think", got)
+	}
+	if got := resp.Choices[0].Message.Content; got != "answer" {
+		t.Fatalf("content = %#v, want answer", got)
+	}
+}
+
+func TestAdapterChatCompletionStream_ParsesReasoningContentDelta(t *testing.T) {
+	t.Helper()
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		fmt.Fprint(w, "data: {\"request_id\":\"s-reasoning-1\",\"output\":{\"choices\":[{\"delta\":{\"role\":\"assistant\",\"reasoning_content\":\"think\"}}]}}\n\n")
+		fmt.Fprint(w, "data: {\"request_id\":\"s-reasoning-1\",\"output\":{\"choices\":[{\"delta\":{\"content\":\"answer\"}}]}}\n\n")
+	}))
+	defer server.Close()
+
+	a, err := newTestAdapter(&adapter.AdapterConfig{APIKey: "test-key", BaseURL: server.URL + "/api/v1"})
+	if err != nil {
+		t.Fatalf("newTestAdapter() error = %v", err)
+	}
+
+	stream, err := a.chatCompletionStreamNative(context.Background(), &adapter.ChatRequest{
+		Model:    "qwen-plus",
+		Messages: []adapter.Message{{Role: "user", Content: "question"}},
+	})
+	if err != nil {
+		t.Fatalf("ChatCompletionStream() error = %v", err)
+	}
+
+	var reasoning string
+	var content string
+	for chunk := range stream {
+		if chunk.Error != nil {
+			t.Fatalf("stream error = %v", chunk.Error)
+		}
+		if len(chunk.Choices) == 0 {
+			continue
+		}
+		choice := chunk.Choices[0]
+		reasoning += choice.Delta.ReasoningContent
+		if text, ok := choice.Delta.Content.(string); ok {
+			content += text
+		}
+	}
+
+	if reasoning != "think" {
+		t.Fatalf("reasoning_content = %q, want think", reasoning)
+	}
+	if content != "answer" {
+		t.Fatalf("content = %q, want answer", content)
+	}
+}

@@ -1,0 +1,30 @@
+# Binary files intentionally kept in Git.
+# Keep this list short. Prefer source fixtures or generated artifacts over committed binaries.
+api/tests/file_process/hyperparse/fixtures/empty.pdf
+api/tests/file_process/hyperparse/fixtures/sample.pdf
+# Public product-tour screenshots referenced by the project READMEs.
+docs/assets/product-tour/mingyingkeji-agent-studio-en.webp
+docs/assets/product-tour/mingyingkeji-agent-studio-zh.webp
+docs/assets/product-tour/mingyingkeji-data-analysis-en.webp
+docs/assets/product-tour/mingyingkeji-data-analysis-zh.webp
+docs/assets/product-tour/mingyingkeji-files-knowledge-en.webp
+docs/assets/product-tour/mingyingkeji-files-knowledge-zh.webp
+docs/assets/product-tour/mingyingkeji-model-gateway-en.webp
+docs/assets/product-tour/mingyingkeji-model-gateway-zh.webp
+docs/assets/product-tour/mingyingkeji-run-results-en.webp
+docs/assets/product-tour/mingyingkeji-run-results-zh.webp
+docs/assets/mingyingkeji-agent-runtime-hero.png
+docs/assets/mingyingkeji-workflow-editor-api-enrichment.png
+# Runtime fallback artwork for the video workbench.
+web/public/assets/video/default-video-cover.webp
+web/public/logo.png
+web/public/logo1.png
+web/public/logo_dark.png
+web/public/favicon.ico
+web/public/images/app-avatars/dolphin.webp
+web/public/images/app-avatars/jellyfish.webp
+web/public/images/app-avatars/little-z.webp
+web/public/images/app-avatars/manta-ray.webp
+web/public/images/app-avatars/octopus.webp
+web/public/images/app-avatars/whale.webp
+web/src/app/favicon.ico

@@ -1,0 +1,31 @@
+package statistics
+
+import (
+	"github.com/webb-chen/AgentSystem/api/internal/modules/llm/gateway"
+	"github.com/webb-chen/AgentSystem/api/internal/modules/llm/statistics/handler"
+	"github.com/webb-chen/AgentSystem/api/internal/modules/llm/statistics/repository"
+	"github.com/webb-chen/AgentSystem/api/internal/modules/llm/statistics/service"
+	"gorm.io/gorm"
+)
+
+// Module provides statistics functionality
+type Module struct {
+	Repository repository.StatisticsRepository
+	Service    service.StatisticsService
+	Handler    *handler.StatisticsHandler
+}
+
+// NewModule creates a new statistics module
+func NewModule(db *gorm.DB) *Module {
+	repo := repository.NewStatisticsRepository(db)
+	svc := service.NewStatisticsService(repo, func(organizationID string, enabled bool, retentionDays int) {
+		gateway.UpdateInvocationContentSettingsCache(db, organizationID, enabled, retentionDays)
+	})
+	h := handler.NewStatisticsHandler(svc)
+
+	return &Module{
+		Repository: repo,
+		Service:    svc,
+		Handler:    h,
+	}
+}

@@ -1,0 +1,257 @@
+package workflow
+
+import (
+	"context"
+	"fmt"
+	"strings"
+	"time"
+
+	"github.com/google/uuid"
+	"github.com/webb-chen/AgentSystem/api/internal/modules/app/conversation"
+	"github.com/webb-chen/AgentSystem/api/internal/modules/dataset/graphflow"
+	channelrepo "github.com/webb-chen/AgentSystem/api/internal/modules/llm/channel/repository"
+	llmclient "github.com/webb-chen/AgentSystem/api/internal/modules/llm/client"
+	"github.com/webb-chen/AgentSystem/api/internal/modules/shared/titlegen"
+	"github.com/webb-chen/AgentSystem/api/pkg/logger"
+)
+
+const (
+	defaultWorkflowConversationNameLayout = "2006-01-02 15:04:05"
+	workflowConversationTitleTimeout      = 15 * time.Second
+	workflowConversationTitleMaxTurns     = 3
+)
+
+var defaultWorkflowConversationNamePrefixes = []string{"Conversation ", "\u4f1a\u8bdd "}
+
+type workflowConversationTitleParams struct {
+	WorkspaceID    string
+	OrganizationID string
+	AgentID        string
+	AccountID      uuid.UUID
+	ConversationID uuid.UUID
+	WebAppID       string
+}
+
+func newWorkflowConversationTitleGenerator(llmClient interface{}, graphFlowService *graphflow.Service) titlegen.Service {
+	llm, ok := llmClient.(llmclient.LLMClient)
+	if !ok || llm == nil || graphFlowService == nil || graphFlowService.DefaultModelSvc == nil {
+		return nil
+	}
+	var routeModelProvider titlegen.RouteModelProvider
+	if graphFlowService.DB != nil {
+		routeModelProvider = titlegen.NewTenantRouteModelProvider(channelrepo.NewTenantRouteRepository(graphFlowService.DB))
+	}
+	return titlegen.NewServiceWithRouteModelProvider(llm, graphFlowService.DefaultModelSvc, routeModelProvider)
+}
+
+func (s *WorkflowService) enqueueWebAppConversationTitleGeneration(ctx context.Context, params workflowConversationTitleParams) {
+	if s == nil || s.advancedChatHandler == nil {
+		return
+	}
+	if s.conversationTitleGen == nil {
+		logger.WarnContext(ctx, "workflow conversation title generator is not configured", "conversation_id", params.ConversationID.String())
+		return
+	}
+	if params.ConversationID == uuid.Nil || params.AccountID == uuid.Nil {
+		return
+	}
+	if _, loaded := s.conversationTitleJobs.LoadOrStore(params.ConversationID, struct{}{}); loaded {
+		return
+	}
+
+	go func() {
+		defer s.conversationTitleJobs.Delete(params.ConversationID)
+		titleCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), workflowConversationTitleTimeout)
+		defer cancel()
+
+		if err := s.generateWebAppConversationTitle(titleCtx, params); err != nil {
+			logger.WarnContext(titleCtx, "failed to generate workflow conversation title", "conversation_id", params.ConversationID.String(), err)
+		}
+	}()
+}
+
+func (s *WorkflowService) generateWebAppConversationTitle(ctx context.Context, params workflowConversationTitleParams) error {
+	conversationSvc := s.advancedChatHandler.conversationService
+	messageSvc := s.advancedChatHandler.messageService
+	if conversationSvc == nil || messageSvc == nil {
+		return fmt.Errorf("conversation service is not configured")
+	}
+
+	agentID, err := uuid.Parse(strings.TrimSpace(params.AgentID))
+	if err != nil || agentID == uuid.Nil {
+		return fmt.Errorf("valid agent id is required for title generation")
+	}
+
+	conv, err := conversationSvc.GetConversationByIDAndAgent(ctx, params.ConversationID, agentID)
+	if err != nil {
+		return err
+	}
+	if conv == nil {
+		return fmt.Errorf("conversation not found")
+	}
+	if !conversationBelongsToAccount(conv, params.AccountID) {
+		return fmt.Errorf("conversation not found: %w", errWebAppConversationAccessDenied)
+	}
+	if !isDefaultWorkflowConversationName(conv.Name) {
+		return nil
+	}
+
+	messages, err := messageSvc.GetConversationMessages(ctx, params.ConversationID)
+	if err != nil {
+		return err
+	}
+	titleMessages := buildWorkflowConversationTitleMessages(messages)
+	if len(titleMessages) == 0 {
+		return fmt.Errorf("conversation has no message content for title generation")
+	}
+
+	organizationID := strings.TrimSpace(params.OrganizationID)
+	if organizationID == "" {
+		organizationID = s.getOrganizationIDByWorkspace(ctx, params.WorkspaceID)
+	}
+	organizationUUID, err := uuid.Parse(organizationID)
+	if err != nil || organizationUUID == uuid.Nil {
+		return fmt.Errorf("valid organization id is required for title generation")
+	}
+
+	var workspaceUUID *uuid.UUID
+	if parsedWorkspaceID, err := uuid.Parse(strings.TrimSpace(params.WorkspaceID)); err == nil && parsedWorkspaceID != uuid.Nil {
+		workspaceUUID = &parsedWorkspaceID
+	}
+
+	result, err := s.conversationTitleGen.Generate(ctx, titlegen.GenerateRequest{
+		OrganizationID: organizationUUID,
+		AccountID:      params.AccountID,
+		WorkspaceID:    workspaceUUID,
+		AppID:          strings.TrimSpace(params.AgentID),
+		AppType:        "workflow",
+		SessionID:      params.ConversationID.String(),
+		ConversationID: params.ConversationID.String(),
+		Messages:       titleMessages,
+		FallbackTitle:  fallbackWorkflowConversationTitle(conv.Name, titleMessages),
+	})
+	if err != nil {
+		return err
+	}
+	if result == nil {
+		return fmt.Errorf("title generator returned nil result")
+	}
+	if result.Source != titlegen.SourceModel && result.Source != titlegen.SourceFallback {
+		return fmt.Errorf("title generator returned fallback result")
+	}
+
+	nextName := strings.TrimSpace(result.Title)
+	if nextName == "" {
+		return fmt.Errorf("title generator returned empty title")
+	}
+	if isDefaultWorkflowConversationName(nextName) {
+		return fmt.Errorf("title generator returned a default timestamp title")
+	}
+
+	updated, err := conversationSvc.UpdateConversationNameIfCurrent(ctx, params.ConversationID, conv.Name, nextName)
+	if err != nil {
+		return err
+	}
+	if !updated {
+		logger.InfoContext(ctx, "workflow conversation title was not updated because name changed", "conversation_id", params.ConversationID.String())
+	}
+	return nil
+}
+
+func fallbackWorkflowConversationTitle(currentName string, messages []titlegen.Message) string {
+	for _, message := range messages {
+		if strings.TrimSpace(message.Role) != "user" {
+			continue
+		}
+		content := strings.TrimSpace(strings.Join(strings.Fields(message.Content), " "))
+		if content == "" {
+			continue
+		}
+		runes := []rune(content)
+		if len(runes) > 24 {
+			content = string(runes[:24])
+		}
+		return content
+	}
+	return currentName
+}
+
+func isDefaultWorkflowConversationName(name string) bool {
+	normalized := strings.TrimSpace(name)
+	for _, prefix := range defaultWorkflowConversationNamePrefixes {
+		timestamp := strings.TrimPrefix(normalized, prefix)
+		if timestamp == normalized || timestamp == "" {
+			continue
+		}
+		if _, err := time.Parse(defaultWorkflowConversationNameLayout, timestamp); err == nil {
+			return true
+		}
+	}
+	return false
+}
+
+func buildWorkflowConversationTitleMessages(messages []*conversation.AgentMessage) []titlegen.Message {
+	titleMessages := make([]titlegen.Message, 0, workflowConversationTitleMaxTurns*2)
+	turns := 0
+	for _, message := range messages {
+		if message == nil {
+			continue
+		}
+		query := strings.TrimSpace(message.Query)
+		answer := strings.TrimSpace(message.Answer)
+		if query == "" && answer == "" {
+			continue
+		}
+		if query != "" {
+			titleMessages = append(titleMessages, titlegen.Message{Role: "user", Content: query})
+		}
+		if answer != "" {
+			titleMessages = append(titleMessages, titlegen.Message{Role: "assistant", Content: answer})
+		}
+		turns++
+		if turns >= workflowConversationTitleMaxTurns {
+			break
+		}
+	}
+	return titleMessages
+}
+
+func workflowConversationTitleReady(status string) bool {
+	return strings.TrimSpace(status) != conversation.AgentMessageStatusRunning
+}
+
+func (h *WorkflowHandler) enqueueWebAppConversationTitleGeneration(ctx context.Context, systemInputs map[string]interface{}, requestInputs map[string]interface{}, messageData approvalConversationMessageData) {
+	if h == nil || !workflowConversationTitleReady(messageData.Status) {
+		return
+	}
+	workflowService, ok := h.workflowService.(*WorkflowService)
+	if !ok || workflowService == nil {
+		return
+	}
+
+	webAppID := ""
+	if messageData.WebAppID != nil {
+		webAppID = *messageData.WebAppID
+	}
+
+	workflowService.enqueueWebAppConversationTitleGeneration(ctx, workflowConversationTitleParams{
+		WorkspaceID:    workflowTitleStringInput(systemInputs, requestInputs, "sys.workspace_id", "sys.tenant_id"),
+		OrganizationID: workflowTitleStringInput(systemInputs, requestInputs, "sys.organization_id"),
+		AgentID:        messageData.AgentID.String(),
+		AccountID:      messageData.FromUserID,
+		ConversationID: messageData.ConversationID,
+		WebAppID:       webAppID,
+	})
+}
+
+func workflowTitleStringInput(systemInputs map[string]interface{}, requestInputs map[string]interface{}, keys ...string) string {
+	for _, key := range keys {
+		if value, ok := systemInputs[key].(string); ok && strings.TrimSpace(value) != "" {
+			return strings.TrimSpace(value)
+		}
+		if value, ok := requestInputs[key].(string); ok && strings.TrimSpace(value) != "" {
+			return strings.TrimSpace(value)
+		}
+	}
+	return ""
+}

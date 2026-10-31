@@ -1,0 +1,115 @@
+import assert from 'node:assert/strict';
+import { readFileSync } from 'node:fs';
+
+import enUS from '../src/i18n/modules/dashboard/en-US.ts';
+import zhHans from '../src/i18n/modules/dashboard/zh-Hans.ts';
+import {
+  MODEL_USAGE_APP_TYPES,
+  normalizeModelUsageAppType,
+} from '../src/utils/model-usage-app-type.ts';
+
+const usageOverviewPageSource = readFileSync(
+  new URL('../src/app/dashboard/usage/overview/page.tsx', import.meta.url),
+  'utf8'
+);
+
+const expectedAppTypes = [
+  'workflow',
+  'dataset',
+  'agent',
+  'aichat',
+  'image-runtime',
+  'video-runtime',
+  'data_library_file',
+  'prompt_optimizer',
+  'prompt_playground',
+  'automation_task_draft',
+  'unknown',
+];
+
+const expectedLabels = {
+  en: {
+    workflow: 'Workflow',
+    dataset: 'Knowledge Base',
+    agent: 'Agent',
+    aichat: 'General Chat',
+    'image-runtime': 'Image Generation',
+    'video-runtime': 'Video Generation',
+    data_library_file: 'Document Vectorization & Q&A',
+    prompt_optimizer: 'Prompt Optimization',
+    prompt_playground: 'Prompt Playground',
+    automation_task_draft: 'Scheduled Task Draft Generation',
+    unknown: 'Other',
+  },
+  zh: {
+    workflow: '工作流',
+    dataset: '知识库',
+    agent: '智能体',
+    aichat: '通用对话',
+    'image-runtime': '绘图',
+    'video-runtime': '视频生成',
+    data_library_file: '文档向量生成与问答',
+    prompt_optimizer: '提示词优化',
+    prompt_playground: '提示词调试台',
+    automation_task_draft: '定时任务草稿生成',
+    unknown: '其他',
+  },
+};
+
+assert.match(
+  usageOverviewPageSource,
+  /<SelectItem value="all">/,
+  'the app type filter must keep the all option separate'
+);
+assert.match(
+  usageOverviewPageSource,
+  /MODEL_USAGE_APP_TYPES\.map\(\s*appType\s*=>/,
+  'the app type filter must render every option from the shared app type contract'
+);
+assert.match(
+  usageOverviewPageSource,
+  /<SelectItem key=\{appType\} value=\{appType\}>/,
+  'each shared app type must become a selectable option'
+);
+
+for (const appType of expectedAppTypes) {
+  assert.doesNotMatch(
+    usageOverviewPageSource,
+    new RegExp(`<SelectItem value="${appType}">`),
+    `the app type filter must not hardcode ${appType}`
+  );
+}
+
+assert.deepEqual(
+  MODEL_USAGE_APP_TYPES,
+  expectedAppTypes,
+  'the frontend app type contract must match the statistics API contract'
+);
+
+for (const appType of expectedAppTypes) {
+  assert.equal(
+    normalizeModelUsageAppType(appType),
+    appType,
+    `known app type ${appType} must remain distinct`
+  );
+  assert.equal(
+    enUS.usage.appTypes[appType],
+    expectedLabels.en[appType],
+    `English label must match for ${appType}`
+  );
+  assert.equal(
+    zhHans.usage.appTypes[appType],
+    expectedLabels.zh[appType],
+    `Chinese label must match for ${appType}`
+  );
+}
+
+for (const appType of [undefined, null, '', 'web-app', 'future_app_type']) {
+  assert.equal(
+    normalizeModelUsageAppType(appType),
+    'unknown',
+    `unsupported app type ${String(appType)} must use the unknown label`
+  );
+}
+
+console.log('Model usage app type checks passed.');

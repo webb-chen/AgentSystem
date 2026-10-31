@@ -1,0 +1,137 @@
+docs/
+
+# Build outputs
+*.exe
+*.exe~
+*.dll
+*.so
+*.dylib
+*.test
+*.out
+*.prof
+*.trace
+
+
+# Binary outputs
+bin/
+dist/
+/server
+main
+mingyingkeji-api
+
+# Editor and OS files
+.idea/
+.vscode/
+.kiro/
+.trae/
+*.swp
+*.swo
+.DS_Store
+.env
+*.env
+
+# Dependencies
+vendor/
+
+# Logs
+*.log
+logs/
+log/
+
+# Test cache
+*.test
+*.tmp
+coverage.txt
+coverage.html
+
+# Local config
+# config.yaml
+# config.yml
+*.local.yaml
+*.local.yml
+
+# Temporary files
+tmp/
+temp/
+.tmp/
+
+# Database files
+*.db
+
+# Token files (sensitive data)
+scripts/tokens.json
+*.sqlite
+*.sqlite3
+mingyingkeji-table.sql
+
+# Certificate files
+*.pem
+*.key
+*.crt
+*.csr
+*.srl
+
+# Environment files
+.env
+.env.*
+!.env.example
+!.env.docker.example
+
+# Cache files
+.cache/
+
+# Air hot reload temporary files
+tmp/
+
+# Go workspace files
+go.work
+go.work.sum
+
+# Debug files
+__debug_bin
+debug.test
+
+# System files
+.DS_Store
+Thumbs.db
+
+# Project runtime files
+uploads/
+static/uploads/
+public/uploads/
+
+docker/volumes/db/data/*
+docker/volumes/redis/data/*
+docker/volumes/weaviate/*
+
+storage/*
+!storage/.gitkeep
+
+# Local tooling (do not commit)
+cmd/password_gen/
+*.bak
+
+# Test and Temporary scripts
+list_proxy_models.go
+test_login.go
+test_openai_params.go
+server.pid
+.api_key
+.auth_token
+.llm_api_key
+/.ref/
+
+# Test documents and scripts
+test_docs/
+scripts/inspect_kb.py
+scripts/inspect_kb.go
+scripts/inspect_kb/
+
+# Content parse local corpora, downloaded benchmark assets, and generated reports
+tests/contentparse/fixtures/hf/
+tests/contentparse/fixtures/private/
+tests/contentparse/downloads/
+tests/contentparse/generated/
+tests/contentparse/reports/
+tests/contentparse/manifests/private*.yaml
+tests/pdf-bench/

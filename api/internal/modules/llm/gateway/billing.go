@@ -1,0 +1,942 @@
+package gateway
+
+import (
+	"context"
+	"errors"
+	"fmt"
+	"strings"
+	"sync"
+	"time"
+
+	"github.com/google/uuid"
+	"github.com/shopspring/decimal"
+	apikeymodel "github.com/webb-chen/AgentSystem/api/internal/modules/llm/apikey/model"
+	apikeyrepo "github.com/webb-chen/AgentSystem/api/internal/modules/llm/apikey/repository"
+	accessmodel "github.com/webb-chen/AgentSystem/api/internal/modules/llm/developeraccess/model"
+	llmmodel "github.com/webb-chen/AgentSystem/api/internal/modules/llm/llmmodel/model"
+	adapter "github.com/webb-chen/AgentSystem/api/internal/modules/llm/protocol/adapters"
+	paymentModel "github.com/webb-chen/AgentSystem/api/internal/modules/payment/model"
+	paymentRepo "github.com/webb-chen/AgentSystem/api/internal/modules/payment/repository"
+	workspacemodel "github.com/webb-chen/AgentSystem/api/internal/modules/workspace/model"
+	"gorm.io/datatypes"
+	"gorm.io/gorm"
+	"gorm.io/gorm/clause"
+)
+
+// BillingProvider defines the interface for billing operations.
+// In CLOUD mode, this is implemented by RemoteBilling (gRPC to console-api).
+// In SELF_HOSTED mode, this is implemented by BillingService (local DB).
+type BillingProvider interface {
+	PreDeduct(ctx context.Context, bc *BillingContext) error
+	Settle(ctx context.Context, bc *BillingContext) error
+	CalculateCreditsFromTokens(promptTokens, completionTokens int, modelID uuid.UUID) (inputCredits, outputCredits, totalCredits int64, err error)
+	CalculateImageCredits(req *adapter.ImageRequest, modelID uuid.UUID) (int64, error)
+	CheckBalance(ctx context.Context, groupID uuid.UUID, ownerID uuid.UUID, estimatedCredits int64) (bool, error)
+}
+
+// BillingService handles billing and quota management (local DB implementation)
+type BillingService struct {
+	db                *gorm.DB
+	apiKeyRepo        apikeyrepo.APIKeyRepository
+	creditAccountRepo paymentRepo.GroupAICreditAccountRepository
+	creditTxRepo      paymentRepo.TransactionRepository
+	localRecoverOnce  sync.Once
+}
+
+// BillingContext contains billing-related information for a request
+type BillingContext struct {
+	APIKeyID             string
+	OrganizationID       string
+	DeductionID          string
+	AttemptID            string
+	QuotaSubjectType     string
+	QuotaSubjectID       string
+	AccountID            *uuid.UUID // Internal user ID when using models
+	PrincipalType        string
+	PrincipalID          string
+	AccessGrantID        string
+	AuthMethod           string
+	GroupID              *uuid.UUID // Organization ID (formerly Shadow Tenant ID)
+	WorkspaceID          string
+	AppID                *uuid.UUID // App ID (agent or dataset)
+	AppType              *string    // App type: 'agent' or 'dataset'
+	InvocationSource     InvocationSource
+	SessionID            string
+	ConversationID       string
+	WorkflowID           string
+	WorkflowRunID        string
+	NodeID               string
+	NodeType             string
+	ModelID              uuid.UUID
+	ModelSource          PricingModelSource
+	PricingOperation     PricingOperation
+	ModelName            string // Model name for logging
+	ProviderID           uuid.UUID
+	ProviderName         string     // Provider name for logging
+	RouteID              *uuid.UUID // Selected route ID when the request is routed
+	ChannelID            *uuid.UUID // Tenant channel ID, nil if using system provider
+	CredentialID         uuid.UUID
+	CredentialGeneration int64
+	ChannelProvider      string
+	UpstreamWouldGuard   bool
+	UpstreamHalfOpen     bool
+	AccountProviderID    *uint // Deprecated, kept for compatibility
+	EstimatedCredits     int64 // Estimated credits to deduct
+	// SubjectReservedCredits is the amount reserved from the quota subject.
+	// It can differ from EstimatedCredits when a platform-priced request has no
+	// local quote: a bounded developer grant reserves its remaining allowance to
+	// serialize unknown-cost requests without over-reserving organization funds.
+	// It is runtime-only; the subject ledger entry persists the reservation.
+	SubjectReservedCredits int64
+	// GrantAuthorizationVersion snapshots the developer grant period used for
+	// pre-deduction. Settlement must not mutate a renewed or re-authorized grant.
+	GrantAuthorizationVersion *int64
+	ActualCredits             int64 // Actual credits used
+	// QuotaChargedCredits is the amount charged to the quota subject after
+	// applying its hard limit. Nil means the subject charge equals ActualCredits.
+	// It is runtime-only; the subject ledger entry persists the final value.
+	QuotaChargedCredits *int64
+	PromptTokens        int
+	CacheReadTokens     int
+	CacheWriteTokens    int
+	CacheWrite5mTokens  int
+	CacheWrite1hTokens  int
+	CompletionTokens    int
+	TotalTokens         int
+	InputCost           decimal.Decimal // Legacy: input credits consumed for logging/RPC compatibility
+	OutputCost          decimal.Decimal // Legacy: output credits consumed for logging/RPC compatibility
+	TotalCost           decimal.Decimal // Legacy: total credits consumed for logging/RPC compatibility
+	InputUSD            decimal.Decimal
+	OutputUSD           decimal.Decimal
+	TotalUSD            decimal.Decimal
+	DisplayCurrency     string
+	USDToCNYRate        decimal.Decimal
+	PricingSource       PricingSource
+	UsageSource         UsageSource
+	PricingSnapshot     datatypes.JSON
+	LockedTokenQuote    *PricingQuote
+	ReservationPolicy   string
+	BillingLane         UsageBillingLane
+	UseSystemProvider   bool
+	IsStreaming         bool
+	RequestID           string
+	RequestCreatedAt    time.Time
+	SettledAt           time.Time
+	ResponseTime        int64 // milliseconds
+	Status              string
+	ErrorCode           string
+	ErrorMessage        string
+	IPAddress           string
+	UserAgent           string
+}
+
+func subjectReservedCredits(bc *BillingContext) int64 {
+	if bc == nil {
+		return 0
+	}
+	if bc.SubjectReservedCredits > 0 {
+		return bc.SubjectReservedCredits
+	}
+	return bc.EstimatedCredits
+}
+
+// NewBillingService creates a new billing service
+func NewBillingService(
+	db *gorm.DB,
+	apiKeyRepo apikeyrepo.APIKeyRepository,
+	creditAccountRepo paymentRepo.GroupAICreditAccountRepository,
+	creditTxRepo paymentRepo.TransactionRepository,
+) *BillingService {
+	return &BillingService{
+		db:                db,
+		apiKeyRepo:        apiKeyRepo,
+		creditAccountRepo: creditAccountRepo,
+		creditTxRepo:      creditTxRepo,
+	}
+}
+
+// PreDeduct pre-deducts estimated quota from API key
+func (b *BillingService) PreDeduct(ctx context.Context, bc *BillingContext) error {
+	usageLane, laneErr := normalizeBillingContextUsageLane(bc)
+	if laneErr != nil {
+		return laneErr
+	}
+	useSystemProvider := usageBillingLaneUsesSystemProvider(usageLane)
+
+	err := b.db.Transaction(func(tx *gorm.DB) error {
+		if usageLane == UsageBillingLanePrivate {
+			if err := captureOrganizationBillingCurrency(ctx, tx, bc); err != nil {
+				return fmt.Errorf("capture billing currency snapshot: %w", err)
+			}
+		}
+		if err := b.upsertAttemptInit(ctx, tx, bc); err != nil {
+			return fmt.Errorf("failed to init billing attempt: %w", err)
+		}
+		grantSubject := strings.TrimSpace(bc.QuotaSubjectType) == quotaSubjectTypeAccessGrant
+		if grantSubject {
+			// Developer-access mutations lock Grant before Key. Match that order
+			// here so pre-deduction cannot deadlock with approval or renewal. Any
+			// later key-validation failure rolls this reservation back atomically.
+			if err := b.preDeductAccessGrantQuota(ctx, tx, bc); err != nil {
+				return fmt.Errorf("failed to pre-deduct subject quota: %w", err)
+			}
+		}
+
+		// 1. Lock and get API key. Grant-backed subjects have already acquired
+		// their Grant lock above, preserving the global Grant -> Key order.
+		var apiKey apikeymodel.TenantAPIKey
+		if err := tx.WithContext(ctx).
+			Clauses(clause.Locking{Strength: "UPDATE"}).
+			Where("id = ? AND organization_id = ?", bc.APIKeyID, bc.OrganizationID).
+			First(&apiKey).Error; err != nil {
+			return err
+		}
+
+		// 2. Check the complete API key lifecycle - SECURITY: reject disabled,
+		// revoked, and expired keys that changed after gateway authentication.
+		if !apiKey.IsActive() {
+			return ErrAPIKeyInactive
+		}
+
+		// 3. Pre-deduct non-grant subject quota (key/workspace). Grant quota was
+		// reserved before the API key lock to preserve the lock hierarchy.
+		if !grantSubject {
+			if err := b.preDeductSubjectQuota(ctx, tx, bc, &apiKey); err != nil {
+				return fmt.Errorf("failed to pre-deduct subject quota: %w", err)
+			}
+		}
+		// Grant pre-deduction may establish a subject reservation and grant
+		// authorization snapshot that differ from the initial estimate. Persist
+		// both before any external settlement can observe this attempt.
+		if err := b.upsertAttemptInit(ctx, tx, bc); err != nil {
+			return fmt.Errorf("failed to persist subject reservation: %w", err)
+		}
+
+		if !useSystemProvider {
+			if err := b.preDeductPrivateChannelWallet(ctx, tx, bc); err != nil {
+				return fmt.Errorf("failed to pre-deduct private channel wallet: %w", err)
+			}
+		}
+
+		if err := b.updateAttemptStatus(ctx, tx, bc, billingAttemptStatusPre, nil, nil, nil); err != nil {
+			return fmt.Errorf("failed to update billing attempt status: %w", err)
+		}
+
+		return nil
+	})
+	if err != nil {
+		markErr := b.db.Transaction(func(tx *gorm.DB) error {
+			if err := b.upsertAttemptInit(ctx, tx, bc); err != nil {
+				return err
+			}
+			invocation := "error"
+			code := "PREDEDUCT_FAILED"
+			msg := err.Error()
+			return b.updateAttemptStatus(
+				ctx,
+				tx,
+				bc,
+				billingAttemptStatusPredeductFailed,
+				&invocation,
+				&code,
+				&msg,
+			)
+		})
+		if markErr != nil {
+			return fmt.Errorf("pre-deduct failed: %v (additionally failed to mark attempt: %w)", err, markErr)
+		}
+		return err
+	}
+	return nil
+}
+
+// CheckBalance checks if the group has sufficient AI credits for the estimated usage.
+// Returns true if balance is sufficient, false otherwise.
+func (b *BillingService) CheckBalance(ctx context.Context, groupID uuid.UUID, ownerID uuid.UUID, estimatedCredits int64) (bool, error) {
+	creditAccount, err := b.creditAccountRepo.GetOrCreateByGroupID(ctx, groupID, ownerID)
+	if err != nil {
+		return false, fmt.Errorf("failed to get or create credit account: %w", err)
+	}
+	return creditAccount.CanSpend(estimatedCredits), nil
+}
+
+// Settle settles the actual billing after request completion
+func (b *BillingService) Settle(ctx context.Context, bc *BillingContext) error {
+	usageLane, laneErr := normalizeBillingContextUsageLane(bc)
+	if laneErr != nil {
+		return laneErr
+	}
+	useSystemProvider := usageBillingLaneUsesSystemProvider(usageLane)
+
+	alreadyFinalized := false
+	// Critical billing operations in transaction
+	err := b.db.Transaction(func(tx *gorm.DB) error {
+		if usageLane == UsageBillingLanePrivate {
+			if err := captureOrganizationBillingCurrency(ctx, tx, bc); err != nil {
+				return fmt.Errorf("capture billing currency snapshot: %w", err)
+			}
+			applyLocalBillingCurrencySnapshot(bc)
+		}
+		attemptID, err := b.ensureAttemptID(bc)
+		if err != nil {
+			return err
+		}
+		bc.AttemptID = attemptID
+
+		var attempt BillingAttempt
+		err = tx.WithContext(ctx).
+			Clauses(clause.Locking{Strength: "UPDATE"}).
+			Where("attempt_id = ?", bc.AttemptID).
+			First(&attempt).Error
+		if err == nil {
+			if billingAttemptStatusIsFinalized(attempt.Status) {
+				alreadyFinalized = true
+				return nil
+			}
+		} else if !errors.Is(err, gorm.ErrRecordNotFound) {
+			return fmt.Errorf("load billing attempt for settle: %w", err)
+		}
+
+		if err := b.upsertAttemptInit(ctx, tx, bc); err != nil {
+			return fmt.Errorf("failed to init billing attempt: %w", err)
+		}
+		if bc.RequestCreatedAt.IsZero() {
+			bc.RequestCreatedAt = time.Now().UTC()
+		}
+		bc.SettledAt = time.Now().UTC()
+
+		// 1. Settle subject quota update (key/workspace)
+		if err := b.settleSubjectQuota(ctx, tx, bc); err != nil {
+			return fmt.Errorf("failed to settle subject quota: %w", err)
+		}
+
+		fundLedgerType := ""
+		fundLedgerRefID := ""
+
+		// 2. Deduct credits only for system provider (payment-on-behalf mode)
+		// Tenant channel mode uses tenant's own API key, no credit deduction needed
+		if useSystemProvider {
+			// System provider: deduct tenant AI credits (payment-on-behalf mode)
+			if err := b.deductTenantCredits(ctx, tx, bc); err != nil {
+				return fmt.Errorf("failed to deduct tenant credits: %w", err)
+			}
+			fundLedgerType = billingLedgerTypeOrgFunds
+			fundLedgerRefID = bc.OrganizationID
+		} else {
+			ledgerType, ledgerRefID, err := b.settlePrivateChannelWallet(ctx, tx, bc)
+			if err != nil {
+				return fmt.Errorf("failed to settle private channel wallet: %w", err)
+			}
+			fundLedgerType = ledgerType
+			fundLedgerRefID = ledgerRefID
+		}
+
+		if err := b.updateAttemptEntriesAfterSettle(ctx, tx, bc, fundLedgerType, fundLedgerRefID); err != nil {
+			return fmt.Errorf("failed to update attempt entries: %w", err)
+		}
+
+		invocation := "success"
+		attemptStatus := billingAttemptStatusSettled
+		if !billingContextStatusIsSuccess(bc.Status) {
+			invocation = "error"
+			attemptStatus = billingAttemptStatusRolledBack
+		}
+		if err := b.updateAttemptStatus(ctx, tx, bc, attemptStatus, &invocation, nil, nil); err != nil {
+			return fmt.Errorf("failed to update billing attempt status: %w", err)
+		}
+		if err := b.upsertUsageBill(ctx, tx, bc, usageBillStatusFromBillingContext(bc.Status), nil, nil); err != nil {
+			return fmt.Errorf("failed to upsert usage bill: %w", err)
+		}
+
+		return nil
+	})
+
+	if err != nil {
+		markErr := b.db.Transaction(func(tx *gorm.DB) error {
+			if err := b.upsertAttemptInit(ctx, tx, bc); err != nil {
+				return err
+			}
+			if bc.RequestCreatedAt.IsZero() {
+				bc.RequestCreatedAt = time.Now().UTC()
+			}
+			bc.SettledAt = time.Now().UTC()
+			invocation := invocationResultFromBillingStatus(bc.Status)
+			code := "SETTLE_FAILED"
+			msg := err.Error()
+			if err := b.updateAttemptStatus(
+				ctx,
+				tx,
+				bc,
+				billingAttemptStatusPartial,
+				&invocation,
+				&code,
+				&msg,
+			); err != nil {
+				return err
+			}
+			return b.upsertUsageBill(ctx, tx, bc, usageBillStatusPartial, &code, &msg)
+		})
+		if markErr != nil {
+			return fmt.Errorf("settle failed: %v (additionally failed to mark attempt: %w)", err, markErr)
+		}
+		return err
+	}
+	if alreadyFinalized {
+		return nil
+	}
+
+	return nil
+}
+
+// settleAPIKeyQuota settles the API key quota
+func (b *BillingService) settleAPIKeyQuota(ctx context.Context, tx *gorm.DB, bc *BillingContext) error {
+	var apiKey apikeymodel.TenantAPIKey
+	if err := tx.WithContext(ctx).
+		Clauses(clause.Locking{Strength: "UPDATE"}).
+		Where("id = ? AND organization_id = ?", bc.APIKeyID, bc.OrganizationID).
+		First(&apiKey).Error; err != nil {
+		return err
+	}
+
+	// If quota_limit is nil (unlimited), only update used_quota for tracking
+	if apiKey.QuotaLimit == nil {
+		apiKey.UsedQuota += bc.ActualCredits
+		return tx.Save(&apiKey).Error
+	}
+
+	// Calculate difference (pre-deducted - actual) using credit count
+	diff := bc.EstimatedCredits - bc.ActualCredits
+
+	// Subject quota must never go below zero.
+	apiKey.RemainQuota = clampQuotaRemainAtZero(apiKey.RemainQuota + diff)
+	apiKey.UsedQuota += bc.ActualCredits
+
+	return tx.Save(&apiKey).Error
+}
+
+func (b *BillingService) preDeductSubjectQuota(
+	ctx context.Context,
+	tx *gorm.DB,
+	bc *BillingContext,
+	apiKey *apikeymodel.TenantAPIKey,
+) error {
+	subjectType := strings.TrimSpace(bc.QuotaSubjectType)
+	if subjectType == "" {
+		return fmt.Errorf("missing quota_subject_type for subject pre-deduct (attempt_id=%s request_id=%s)", strings.TrimSpace(bc.AttemptID), strings.TrimSpace(bc.RequestID))
+	}
+	if subjectType == quotaSubjectTypeAPIKey {
+		apiKeyID := strings.TrimSpace(bc.APIKeyID)
+		subjectID := strings.TrimSpace(bc.QuotaSubjectID)
+		if apiKeyID == "" {
+			return fmt.Errorf("missing api_key_id for key subject pre-deduct (attempt_id=%s request_id=%s)", strings.TrimSpace(bc.AttemptID), strings.TrimSpace(bc.RequestID))
+		}
+		if subjectID == "" {
+			return fmt.Errorf("missing quota_subject_id for key subject pre-deduct (attempt_id=%s request_id=%s)", strings.TrimSpace(bc.AttemptID), strings.TrimSpace(bc.RequestID))
+		}
+		if subjectID != apiKeyID {
+			return fmt.Errorf(
+				"quota subject mismatch for key subject pre-deduct: quota_subject_id=%s api_key_id=%s attempt_id=%s request_id=%s",
+				subjectID,
+				apiKeyID,
+				strings.TrimSpace(bc.AttemptID),
+				strings.TrimSpace(bc.RequestID),
+			)
+		}
+		if apiKey == nil {
+			return fmt.Errorf("api key subject requires loaded api key")
+		}
+		return b.preDeductAPIKeyQuota(ctx, tx, bc, apiKey)
+	}
+	if subjectType == quotaSubjectTypeAccessGrant {
+		return b.preDeductAccessGrantQuota(ctx, tx, bc)
+	}
+	if subjectType == quotaSubjectTypeWorkspace {
+		return b.preDeductWorkspaceQuota(ctx, tx, bc)
+	}
+	if subjectType == quotaSubjectTypeOrganization {
+		return nil
+	}
+	return fmt.Errorf("unsupported quota subject type: %s", subjectType)
+}
+
+func (b *BillingService) preDeductAccessGrantQuota(ctx context.Context, tx *gorm.DB, bc *BillingContext) error {
+	grantID := strings.TrimSpace(bc.QuotaSubjectID)
+	if grantID == "" || strings.TrimSpace(bc.AccessGrantID) != grantID {
+		return ErrInvalidRequest
+	}
+	if bc.AuthMethod == "personal_api_key" {
+		workspaceID := strings.TrimSpace(bc.WorkspaceID)
+		organizationID := strings.TrimSpace(bc.OrganizationID)
+		if workspaceID == "" || organizationID == "" {
+			return ErrInvalidRequest
+		}
+		// Developer-access administration locks Workspace -> Policy -> Grant ->
+		// Key. Match that order here so a committed kill-switch change is
+		// authoritative at the final pre-provider boundary, including when the
+		// workspace previously relied on its implicit default policy.
+		var workspace workspacemodel.Workspace
+		if err := tx.WithContext(ctx).Clauses(clause.Locking{Strength: "UPDATE"}).
+			Where("id = ? AND organization_id = ?", workspaceID, organizationID).
+			First(&workspace).Error; err != nil {
+			return ErrAPIKeyInactive
+		}
+		if !workspace.IsNormal() || workspace.OrganizationID == nil || *workspace.OrganizationID != organizationID {
+			return ErrAPIKeyInactive
+		}
+		var organization workspacemodel.Organization
+		if err := tx.WithContext(ctx).Clauses(clause.Locking{Strength: "UPDATE"}).
+			Where("id = ?", organizationID).
+			First(&organization).Error; err != nil || !organization.IsActive() {
+			return ErrAPIKeyInactive
+		}
+		var policy accessmodel.Policy
+		err := tx.WithContext(ctx).Clauses(clause.Locking{Strength: "UPDATE"}).
+			Where("workspace_id = ? AND organization_id = ?", workspaceID, organizationID).
+			First(&policy).Error
+		if err != nil && !errors.Is(err, gorm.ErrRecordNotFound) {
+			return err
+		}
+		if err == nil && policy.Mode == accessmodel.AccessModeDisabled {
+			return ErrAPIKeyInactive
+		}
+	}
+	var grant accessmodel.Grant
+	if err := tx.WithContext(ctx).Clauses(clause.Locking{Strength: "UPDATE"}).
+		Where("id = ? AND organization_id = ?", grantID, bc.OrganizationID).First(&grant).Error; err != nil {
+		return err
+	}
+	if !grant.IsActive(time.Now()) {
+		return ErrAPIKeyInactive
+	}
+	// Authentication validates the personal key before provider routing. Bind
+	// pre-deduction to that key's authorization period so a grant renewal in the
+	// intervening window cannot admit a now-stale key into the new budget period.
+	if bc.AuthMethod == "personal_api_key" &&
+		(bc.GrantAuthorizationVersion == nil || grant.AuthorizationVersion != *bc.GrantAuthorizationVersion) {
+		return ErrAPIKeyInactive
+	}
+	version := grant.AuthorizationVersion
+	bc.GrantAuthorizationVersion = &version
+	if grant.QuotaLimit == nil {
+		return nil
+	}
+	availableQuota := grant.RemainQuota
+	remainingByLimit := *grant.QuotaLimit - grant.UsedQuota
+	if remainingByLimit < 0 {
+		remainingByLimit = 0
+	}
+	if availableQuota > remainingByLimit {
+		availableQuota = remainingByLimit
+	}
+	reservation := bc.EstimatedCredits
+	usageLane, err := normalizeBillingContextUsageLane(bc)
+	if err != nil {
+		return err
+	}
+	// Platform-priced routes may not have a local token quote and therefore
+	// estimate zero credits. Reserve the bounded grant's remaining allowance so
+	// only one unknown-cost request can be in flight, while the organization fund
+	// reservation remains based on the original estimate.
+	if usageBillingLaneUsesSystemProvider(usageLane) && reservation <= 0 {
+		reservation = availableQuota
+	}
+	if availableQuota <= 0 || availableQuota < reservation {
+		return ErrInsufficientQuota
+	}
+	bc.SubjectReservedCredits = reservation
+	grant.RemainQuota = availableQuota - reservation
+	return tx.WithContext(ctx).Save(&grant).Error
+}
+
+func (b *BillingService) preDeductAPIKeyQuota(
+	ctx context.Context,
+	tx *gorm.DB,
+	bc *BillingContext,
+	apiKey *apikeymodel.TenantAPIKey,
+) error {
+	// If quota_limit is nil, it means unlimited quota.
+	if apiKey.QuotaLimit == nil {
+		return nil
+	}
+
+	estimatedQuota := bc.EstimatedCredits
+	if apiKey.RemainQuota < estimatedQuota {
+		return ErrInsufficientQuota
+	}
+
+	apiKey.RemainQuota -= estimatedQuota
+	return tx.WithContext(ctx).Save(apiKey).Error
+}
+
+func (b *BillingService) preDeductWorkspaceQuota(
+	ctx context.Context,
+	tx *gorm.DB,
+	bc *BillingContext,
+) error {
+	workspaceID := strings.TrimSpace(bc.QuotaSubjectID)
+	if workspaceID == "" {
+		return ErrInvalidRequest
+	}
+	orgID, err := uuid.Parse(bc.OrganizationID)
+	if err != nil {
+		return fmt.Errorf("invalid organization id in billing context: %w", err)
+	}
+
+	workspaceQuota, err := b.getOrCreateWorkspaceQuotaForUpdate(ctx, tx, workspaceID, orgID)
+	if err != nil {
+		return err
+	}
+	if workspaceQuota.QuotaLimit == nil {
+		return nil
+	}
+	if workspaceQuota.RemainQuota < bc.EstimatedCredits {
+		return ErrInsufficientQuota
+	}
+
+	workspaceQuota.RemainQuota -= bc.EstimatedCredits
+	workspaceQuota.UpdatedAt = time.Now()
+	return tx.WithContext(ctx).Save(workspaceQuota).Error
+}
+
+func (b *BillingService) settleSubjectQuota(
+	ctx context.Context,
+	tx *gorm.DB,
+	bc *BillingContext,
+) error {
+	subjectType := strings.TrimSpace(bc.QuotaSubjectType)
+	if subjectType == "" {
+		return fmt.Errorf("missing quota_subject_type for subject settle (attempt_id=%s request_id=%s)", strings.TrimSpace(bc.AttemptID), strings.TrimSpace(bc.RequestID))
+	}
+	if subjectType == quotaSubjectTypeAPIKey {
+		apiKeyID := strings.TrimSpace(bc.APIKeyID)
+		subjectID := strings.TrimSpace(bc.QuotaSubjectID)
+		if apiKeyID == "" {
+			return fmt.Errorf("missing api_key_id for key subject settle (attempt_id=%s request_id=%s)", strings.TrimSpace(bc.AttemptID), strings.TrimSpace(bc.RequestID))
+		}
+		if subjectID == "" {
+			return fmt.Errorf("missing quota_subject_id for key subject settle (attempt_id=%s request_id=%s)", strings.TrimSpace(bc.AttemptID), strings.TrimSpace(bc.RequestID))
+		}
+		if subjectID != apiKeyID {
+			return fmt.Errorf(
+				"quota subject mismatch for key subject settle: quota_subject_id=%s api_key_id=%s attempt_id=%s request_id=%s",
+				subjectID,
+				apiKeyID,
+				strings.TrimSpace(bc.AttemptID),
+				strings.TrimSpace(bc.RequestID),
+			)
+		}
+		return b.settleAPIKeyQuota(ctx, tx, bc)
+	}
+	if subjectType == quotaSubjectTypeAccessGrant {
+		return b.settleAccessGrantQuota(ctx, tx, bc)
+	}
+	if subjectType == quotaSubjectTypeWorkspace {
+		return b.settleWorkspaceQuota(ctx, tx, bc)
+	}
+	if subjectType == quotaSubjectTypeOrganization {
+		return nil
+	}
+	return fmt.Errorf("unsupported quota subject type: %s", subjectType)
+}
+
+func (b *BillingService) settleAccessGrantQuota(ctx context.Context, tx *gorm.DB, bc *BillingContext) error {
+	grantID := strings.TrimSpace(bc.QuotaSubjectID)
+	if grantID == "" || strings.TrimSpace(bc.AccessGrantID) != grantID {
+		return ErrInvalidRequest
+	}
+	var grant accessmodel.Grant
+	if err := tx.WithContext(ctx).Unscoped().Clauses(clause.Locking{Strength: "UPDATE"}).
+		Where("id = ? AND organization_id = ?", grantID, bc.OrganizationID).First(&grant).Error; err != nil {
+		return err
+	}
+	// A grant update or renewal revokes old keys and starts a new authorization
+	// period. A delayed response from the old period is still an organization
+	// cost, but must never consume or refund the new period's member allowance.
+	if bc.GrantAuthorizationVersion == nil || grant.AuthorizationVersion != *bc.GrantAuthorizationVersion {
+		charged := int64(0)
+		bc.QuotaChargedCredits = &charged
+		return nil
+	}
+	if grant.QuotaLimit == nil {
+		grant.UsedQuota += bc.ActualCredits
+		charged := bc.ActualCredits
+		bc.QuotaChargedCredits = &charged
+		return tx.WithContext(ctx).Save(&grant).Error
+	}
+	// The reservation has already been removed from RemainQuota. The largest
+	// amount this attempt may charge is therefore the post-reservation balance
+	// plus its own reservation. Provider usage can exceed an estimate (notably
+	// hidden reasoning tokens), but a member grant must remain a hard boundary.
+	reservedCredits := subjectReservedCredits(bc)
+	availableForAttempt := grant.RemainQuota + reservedCredits
+	if availableForAttempt < 0 {
+		availableForAttempt = 0
+	}
+	remainingByLimit := *grant.QuotaLimit - grant.UsedQuota
+	if remainingByLimit < 0 {
+		remainingByLimit = 0
+	}
+	if availableForAttempt > remainingByLimit {
+		availableForAttempt = remainingByLimit
+	}
+	charged := bc.ActualCredits
+	if charged > availableForAttempt {
+		charged = availableForAttempt
+	}
+	if charged < 0 {
+		charged = 0
+	}
+	bc.QuotaChargedCredits = &charged
+	diff := reservedCredits - charged
+	grant.RemainQuota = clampQuotaRemainAtZero(grant.RemainQuota + diff)
+	grant.UsedQuota += charged
+	if grant.QuotaLimit != nil && grant.UsedQuota > *grant.QuotaLimit {
+		grant.UsedQuota = *grant.QuotaLimit
+	}
+	return tx.WithContext(ctx).Save(&grant).Error
+}
+
+func (b *BillingService) settleWorkspaceQuota(
+	ctx context.Context,
+	tx *gorm.DB,
+	bc *BillingContext,
+) error {
+	workspaceID := strings.TrimSpace(bc.QuotaSubjectID)
+	if workspaceID == "" {
+		return ErrInvalidRequest
+	}
+	orgID, err := uuid.Parse(bc.OrganizationID)
+	if err != nil {
+		return fmt.Errorf("invalid organization id in billing context: %w", err)
+	}
+
+	workspaceQuota, err := b.getOrCreateWorkspaceQuotaForUpdate(ctx, tx, workspaceID, orgID)
+	if err != nil {
+		return err
+	}
+
+	if workspaceQuota.QuotaLimit == nil {
+		workspaceQuota.UsedQuota += bc.ActualCredits
+		workspaceQuota.UpdatedAt = time.Now()
+		return tx.WithContext(ctx).Save(workspaceQuota).Error
+	}
+
+	diff := bc.EstimatedCredits - bc.ActualCredits
+	// Subject quota must never go below zero.
+	workspaceQuota.RemainQuota = clampQuotaRemainAtZero(workspaceQuota.RemainQuota + diff)
+	workspaceQuota.UsedQuota += bc.ActualCredits
+	workspaceQuota.UpdatedAt = time.Now()
+	return tx.WithContext(ctx).Save(workspaceQuota).Error
+}
+
+func clampQuotaRemainAtZero(remain int64) int64 {
+	if remain < 0 {
+		return 0
+	}
+	return remain
+}
+
+func (b *BillingService) getOrCreateWorkspaceQuotaForUpdate(
+	ctx context.Context,
+	tx *gorm.DB,
+	workspaceID string,
+	organizationID uuid.UUID,
+) (*WorkspaceQuota, error) {
+	var quota WorkspaceQuota
+	err := tx.WithContext(ctx).
+		Clauses(clause.Locking{Strength: "UPDATE"}).
+		Where("workspace_id = ?", workspaceID).
+		First(&quota).Error
+	if err == nil {
+		if quota.OrganizationID != organizationID {
+			return nil, fmt.Errorf(
+				"workspace quota organization mismatch: workspace_id=%s quota_org=%s request_org=%s",
+				workspaceID,
+				quota.OrganizationID.String(),
+				organizationID.String(),
+			)
+		}
+		return &quota, nil
+	}
+	if !errors.Is(err, gorm.ErrRecordNotFound) {
+		return nil, err
+	}
+
+	quota = WorkspaceQuota{
+		WorkspaceID:    workspaceID,
+		OrganizationID: organizationID,
+		UsedQuota:      0,
+		RemainQuota:    0,
+		QuotaLimit:     nil, // default unlimited unless explicitly configured
+		CreatedAt:      time.Now(),
+		UpdatedAt:      time.Now(),
+	}
+	if createErr := tx.WithContext(ctx).
+		Clauses(clause.OnConflict{
+			Columns:   []clause.Column{{Name: "workspace_id"}},
+			DoNothing: true,
+		}).
+		Create(&quota).Error; createErr != nil {
+		return nil, fmt.Errorf("create workspace quota: %w", createErr)
+	}
+
+	quota = WorkspaceQuota{}
+	err = tx.WithContext(ctx).
+		Clauses(clause.Locking{Strength: "UPDATE"}).
+		Where("workspace_id = ?", workspaceID).
+		First(&quota).Error
+	if err != nil {
+		return nil, fmt.Errorf("load workspace quota after create: %w", err)
+	}
+	if quota.OrganizationID != organizationID {
+		return nil, fmt.Errorf(
+			"workspace quota organization mismatch: workspace_id=%s quota_org=%s request_org=%s",
+			workspaceID,
+			quota.OrganizationID.String(),
+			organizationID.String(),
+		)
+	}
+	return &quota, nil
+}
+
+// deductTenantCredits deducts AI credits from tenant (payment-on-behalf mode)
+func (b *BillingService) deductTenantCredits(ctx context.Context, tx *gorm.DB, bc *BillingContext) error {
+	// Parse tenant ID to UUID
+	tenantUUID, err := uuid.Parse(bc.OrganizationID)
+	if err != nil {
+		return fmt.Errorf("invalid tenant ID: %w", err)
+	}
+
+	creditsToDeduct := bc.ActualCredits
+	if billingContextNeedsTokenReprice(bc) {
+		engine := NewPricingEngine(b.db)
+		quote, quoteErr := engine.(cacheTokenPricingEngine).QuoteTokenUsage(ctx, pricingModelRefFromBillingContext(bc), TokenUsage{
+			InputTokens: bc.PromptTokens, CacheReadTokens: bc.CacheReadTokens,
+			CacheWriteTokens: bc.CacheWriteTokens, CacheWrite5mTokens: bc.CacheWrite5mTokens,
+			CacheWrite1hTokens: bc.CacheWrite1hTokens, OutputTokens: bc.CompletionTokens,
+		})
+		err = wrapPricingNotConfiguredError(quoteErr)
+		if err != nil {
+			return wrapPricingCalculationError(err)
+		}
+		creditsToDeduct = quote.TotalCredits
+	}
+	if creditsToDeduct <= 0 {
+		return nil
+	}
+
+	// Get account before deduction to record balances
+	var accountBefore paymentModel.GroupAICreditAccount
+	if err := tx.WithContext(ctx).Where("group_id = ?", tenantUUID).First(&accountBefore).Error; err != nil {
+		return fmt.Errorf("failed to get account: %w", err)
+	}
+
+	// Deduct credits from user AI credit account (by group_id which is tenant_id)
+	account, err := b.creditAccountRepo.DeductCreditsByGroupID(ctx, tx, tenantUUID, creditsToDeduct)
+	if err != nil {
+		return fmt.Errorf("failed to deduct credits: %w", err)
+	}
+
+	// Create transaction detail (shared across all records in the batch)
+	transactionDetail := map[string]interface{}{
+		"model_name":            bc.ModelName,
+		"provider_name":         bc.ProviderName,
+		"prompt_tokens":         bc.PromptTokens,
+		"cache_read_tokens":     bc.CacheReadTokens,
+		"cache_write_tokens":    bc.CacheWriteTokens,
+		"cache_write_5m_tokens": bc.CacheWrite5mTokens,
+		"cache_write_1h_tokens": bc.CacheWrite1hTokens,
+		"completion_tokens":     bc.CompletionTokens,
+		"total_tokens":          bc.TotalTokens,
+		"request_id":            bc.RequestID,
+		"api_key_id":            bc.APIKeyID,
+	}
+
+	// Generate shared batch_id for related transactions
+	batchID := "BAT-" + uuid.New().String()[:8]
+	now := time.Now()
+	transactions := []*paymentModel.Transaction{
+		{
+			BatchID:           batchID,
+			GroupID:           account.GroupID,
+			CurrencyType:      string(paymentModel.CurrencyTypePurchasedCredits),
+			TransactionType:   string(paymentModel.TransactionTypeAIConsumption),
+			Amount:            float64(-creditsToDeduct),
+			BalanceBefore:     float64(accountBefore.PurchasedCredits),
+			BalanceAfter:      float64(account.PurchasedCredits),
+			TransactionDetail: transactionDetail,
+			CreatedAt:         now,
+		},
+	}
+
+	return b.creditTxRepo.CreateBatch(ctx, transactions)
+}
+
+func billingContextNeedsTokenReprice(bc *BillingContext) bool {
+	if bc == nil || bc.ActualCredits != 0 {
+		return false
+	}
+	if bc.PromptTokens <= 0 && bc.CompletionTokens <= 0 {
+		return false
+	}
+	return bc.PricingSource == ""
+}
+
+// CalculateCost calculates the cost based on token usage and model pricing.
+func (b *BillingService) CalculateCost(
+	promptTokens, completionTokens int,
+	llmModel *llmmodel.LLMModel,
+) (inputCost, outputCost, totalCost decimal.Decimal) {
+	// Calculate input cost (prompt tokens)
+	// InputPrice is cost per million tokens
+	inputCost = llmModel.InputPrice.
+		Mul(decimal.NewFromInt(int64(promptTokens))).
+		Div(decimal.NewFromInt(1000000))
+
+	// Calculate output cost (completion tokens)
+	// OutputPrice is cost per million tokens
+	outputCost = llmModel.OutputPrice.
+		Mul(decimal.NewFromInt(int64(completionTokens))).
+		Div(decimal.NewFromInt(1000000))
+
+	// Total cost
+	totalCost = inputCost.Add(outputCost)
+
+	return
+}
+
+// CalculateTotalTokens calculates the total token count
+func (b *BillingService) CalculateTotalTokens(
+	promptTokens, completionTokens int,
+) int {
+	return promptTokens + completionTokens
+}
+
+// CalculateCreditsFromTokens calculates credits to deduct based on tokens and model's cost_rate
+// Returns: inputCredits, outputCredits, totalCredits, error
+func (b *BillingService) CalculateCreditsFromTokens(
+	promptTokens,
+	completionTokens int,
+	modelID uuid.UUID,
+) (inputCredits, outputCredits, totalCredits int64, err error) {
+	quote, err := NewPricingEngine(b.db).QuoteTokens(context.Background(), PricingModelRef{
+		ModelID: modelID,
+		Source:  PricingModelSourceGlobal,
+	}, promptTokens, completionTokens)
+	if err != nil {
+		return 0, 0, 0, wrapPricingNotConfiguredError(err)
+	}
+	return quote.InputCredits, quote.OutputCredits, quote.TotalCredits, nil
+}
+
+// CalculateImageCredits is a compatibility wrapper around PricingEngine.
+func (b *BillingService) CalculateImageCredits(req *adapter.ImageRequest, modelID uuid.UUID) (int64, error) {
+	quote, err := NewPricingEngine(b.db).QuoteImage(context.Background(), PricingModelRef{
+		ModelID: modelID,
+		Source:  PricingModelSourceGlobal,
+	}, req)
+	if err != nil {
+		return 0, wrapPricingNotConfiguredError(err)
+	}
+	return quote.TotalCredits, nil
+}

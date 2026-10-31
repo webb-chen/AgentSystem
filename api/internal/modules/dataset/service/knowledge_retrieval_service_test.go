@@ -1,0 +1,375 @@
+package service
+
+import (
+	"context"
+	"regexp"
+	"strings"
+	"testing"
+	"time"
+
+	"github.com/DATA-DOG/go-sqlmock"
+	"github.com/webb-chen/AgentSystem/api/internal/dto"
+	workspace_model "github.com/webb-chen/AgentSystem/api/internal/modules/workspace/model"
+	"gorm.io/driver/postgres"
+	"gorm.io/gorm"
+)
+
+func TestListAccessibleDatasetsUsesOrganizationScopeAndFallsBackWhenSearchMisses(t *testing.T) {
+	db, mock := newKnowledgeMockDB(t)
+	svc := &KnowledgeRetrievalService{db: db}
+
+	expectAccessibleKnowledgeWorkspaces(mock, "workspace-1")
+	mock.ExpectQuery(regexp.QuoteMeta(`SELECT * FROM "datasets"`)).
+		WillReturnRows(datasetRows())
+	mock.ExpectQuery(regexp.QuoteMeta(`SELECT * FROM "datasets"`)).
+		WillReturnRows(datasetRows().AddRow("dataset-1", "org-1", "workspace-1", "故事大纲", "各类的故事大纲", "vendor", false, "account-1", time.Now()))
+
+	response, err := svc.ListAccessibleDatasets(context.Background(), KnowledgeScope{
+		OrganizationID: "org-1",
+		AccountID:      "account-1",
+	}, "看看系统中的知识库里的大纲", 10)
+	if err != nil {
+		t.Fatalf("ListAccessibleDatasets() error = %v", err)
+	}
+	if response.Status != KnowledgeListStatusFallback {
+		t.Fatalf("Status = %q, want %q", response.Status, KnowledgeListStatusFallback)
+	}
+	if !response.FallbackUsed {
+		t.Fatalf("FallbackUsed = false, want true")
+	}
+	if response.ResultCount != 1 || len(response.KnowledgeBases) != 1 {
+		t.Fatalf("response count mismatch: %#v", response)
+	}
+	if response.KnowledgeBases[0].DatasetID != "dataset-1" {
+		t.Fatalf("DatasetID = %q, want %q", response.KnowledgeBases[0].DatasetID, "dataset-1")
+	}
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Fatalf("sql expectations: %v", err)
+	}
+}
+
+func TestListAccessibleDatasetsReturnsNoResultsWhenNoWorkspaceAccess(t *testing.T) {
+	db, mock := newKnowledgeMockDB(t)
+	svc := &KnowledgeRetrievalService{db: db}
+
+	expectAccessibleKnowledgeWorkspaces(mock)
+
+	response, err := svc.ListAccessibleDatasets(context.Background(), KnowledgeScope{
+		OrganizationID: "org-1",
+		AccountID:      "account-1",
+	}, "refund", 10)
+	if err != nil {
+		t.Fatalf("ListAccessibleDatasets() error = %v", err)
+	}
+	if response.Status != KnowledgeListStatusNoResults {
+		t.Fatalf("Status = %q, want %q", response.Status, KnowledgeListStatusNoResults)
+	}
+	if response.ResultCount != 0 || len(response.KnowledgeBases) != 0 {
+		t.Fatalf("response has results: %#v", response)
+	}
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Fatalf("sql expectations: %v", err)
+	}
+}
+
+func TestListAccessibleDatasetCandidatesOrdersSelectedIDsWithValidPostgresINClause(t *testing.T) {
+	db, mock := newKnowledgeMockDB(t)
+	svc := &KnowledgeRetrievalService{db: db}
+
+	expectAccessibleKnowledgeWorkspaces(mock, "workspace-1")
+	mock.ExpectQuery(`SELECT count\(\*\) FROM "datasets" WHERE workspace_id IN \(\$1\)`).
+		WithArgs("workspace-1").
+		WillReturnRows(sqlmock.NewRows([]string{"count"}).AddRow(2))
+	mock.ExpectQuery(`SELECT \* FROM "datasets" WHERE workspace_id IN \(\$1\) ORDER BY CASE WHEN id IN \(\$2,\$3\) THEN 0 ELSE 1 END, LOWER\(name\) ASC, id ASC LIMIT \$4`).
+		WithArgs("workspace-1", "dataset-1", "dataset-2", 24).
+		WillReturnRows(datasetRows().
+			AddRow("dataset-1", "org-1", "workspace-1", "Selected one", "", "vendor", false, "account-1", time.Now()).
+			AddRow("dataset-2", "org-1", "workspace-1", "Selected two", "", "vendor", false, "account-1", time.Now()))
+
+	response, err := svc.ListAccessibleDatasetCandidates(context.Background(), KnowledgeScope{
+		OrganizationID: "org-1",
+		AccountID:      "account-1",
+	}, "", []string{"dataset-1", "dataset-2"}, true, 1, 24)
+	if err != nil {
+		t.Fatalf("ListAccessibleDatasetCandidates() error = %v", err)
+	}
+	if response.Total != 2 || len(response.KnowledgeBases) != 2 {
+		t.Fatalf("response count mismatch: %#v", response)
+	}
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Fatalf("sql expectations: %v", err)
+	}
+}
+
+func TestListAccessibleDatasetsDoesNotFallbackFromDirectEmptyPermissionSnapshot(t *testing.T) {
+	db, mock := newKnowledgeMockDB(t)
+	svc := &KnowledgeRetrievalService{db: db}
+
+	rows := sqlmock.NewRows([]string{"id", "role", "role_id", "permissions", "permission_source"}).
+		AddRow("workspace-1", workspace_model.WorkspaceRoleAdmin, workspace_model.WorkspaceBuiltinRoleAdminID, `[]`, workspace_model.WorkspaceMemberPermissionSourceDirect)
+	mock.ExpectQuery(`SELECT workspaces\.id, workspace_members\.role, workspace_members\.role_id, COALESCE\(workspace_members\.permissions::text, ''\) AS permissions, workspace_members\.permission_source FROM "workspaces" JOIN workspace_members ON workspace_members\.workspace_id = workspaces\.id WHERE workspaces\.organization_id = \$1 AND workspace_members\.account_id = \$2`).
+		WillReturnRows(rows)
+
+	response, err := svc.ListAccessibleDatasets(context.Background(), KnowledgeScope{
+		OrganizationID: "org-1",
+		AccountID:      "account-1",
+	}, "refund", 10)
+	if err != nil {
+		t.Fatalf("ListAccessibleDatasets() error = %v", err)
+	}
+	if response.Status != KnowledgeListStatusNoResults {
+		t.Fatalf("Status = %q, want %q", response.Status, KnowledgeListStatusNoResults)
+	}
+	if response.ResultCount != 0 || len(response.KnowledgeBases) != 0 {
+		t.Fatalf("response has results: %#v", response)
+	}
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Fatalf("sql expectations: %v", err)
+	}
+}
+
+func TestListAccessibleDatasetsFallsBackFromLegacyAdminRole(t *testing.T) {
+	db, mock := newKnowledgeMockDB(t)
+	svc := &KnowledgeRetrievalService{db: db}
+
+	rows := sqlmock.NewRows([]string{"id", "role", "role_id", "permissions", "permission_source"}).
+		AddRow("workspace-1", workspace_model.WorkspaceRoleAdmin, nil, `[]`, "")
+	mock.ExpectQuery(`SELECT workspaces\.id, workspace_members\.role, workspace_members\.role_id, COALESCE\(workspace_members\.permissions::text, ''\) AS permissions, workspace_members\.permission_source FROM "workspaces" JOIN workspace_members ON workspace_members\.workspace_id = workspaces\.id WHERE workspaces\.organization_id = \$1 AND workspace_members\.account_id = \$2`).
+		WillReturnRows(rows)
+	mock.ExpectQuery(regexp.QuoteMeta(`SELECT * FROM "datasets"`)).
+		WillReturnRows(datasetRows().AddRow("dataset-1", "org-1", "workspace-1", "Legacy", "legacy admin access", "vendor", false, "account-1", time.Now()))
+
+	response, err := svc.ListAccessibleDatasets(context.Background(), KnowledgeScope{
+		OrganizationID: "org-1",
+		AccountID:      "account-1",
+	}, "legacy", 10)
+	if err != nil {
+		t.Fatalf("ListAccessibleDatasets() error = %v", err)
+	}
+	if response.Status != KnowledgeListStatusSuccess {
+		t.Fatalf("Status = %q, want %q", response.Status, KnowledgeListStatusSuccess)
+	}
+	if response.ResultCount != 1 || len(response.KnowledgeBases) != 1 {
+		t.Fatalf("response count mismatch: %#v", response)
+	}
+	if response.KnowledgeBases[0].DatasetID != "dataset-1" {
+		t.Fatalf("DatasetID = %q, want %q", response.KnowledgeBases[0].DatasetID, "dataset-1")
+	}
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Fatalf("sql expectations: %v", err)
+	}
+}
+
+func TestAccessibleKnowledgeDatasetAllowsOrganizationScopedDataset(t *testing.T) {
+	db, mock := newKnowledgeMockDB(t)
+	svc := &KnowledgeRetrievalService{db: db}
+
+	expectAccessibleKnowledgeWorkspaces(mock, "workspace-1")
+	mock.ExpectQuery(regexp.QuoteMeta(`SELECT * FROM "datasets"`)).
+		WillReturnRows(datasetRows().AddRow("dataset-1", "org-1", "workspace-1", "故事大纲", "各类的故事大纲", "vendor", false, "account-1", time.Now()))
+
+	dataset, err := svc.accessibleKnowledgeDataset(context.Background(), "dataset-1", KnowledgeScope{
+		OrganizationID: "org-1",
+		AccountID:      "account-1",
+	}, false)
+	if err != nil {
+		t.Fatalf("accessibleKnowledgeDataset() error = %v", err)
+	}
+	if dataset.Name != "故事大纲" {
+		t.Fatalf("Name = %q, want %q", dataset.Name, "故事大纲")
+	}
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Fatalf("sql expectations: %v", err)
+	}
+}
+
+func TestAccessibleKnowledgeDatasetGrantSkipsAccountMembership(t *testing.T) {
+	db, mock := newKnowledgeMockDB(t)
+	svc := &KnowledgeRetrievalService{db: db}
+
+	mock.ExpectQuery(regexp.QuoteMeta(`SELECT * FROM "datasets"`)).
+		WillReturnRows(datasetRows().AddRow("dataset-1", "org-1", "workspace-1", "Stories", "Story corpus", "vendor", false, "account-1", time.Now()))
+
+	dataset, err := svc.accessibleKnowledgeDataset(context.Background(), "dataset-1", KnowledgeScope{
+		OrganizationID: "org-1",
+		WorkspaceID:    "workspace-1",
+		AccountID:      "revoked-binder",
+	}, true)
+	if err != nil {
+		t.Fatalf("accessibleKnowledgeDataset() error = %v", err)
+	}
+	if dataset.ID != "dataset-1" {
+		t.Fatalf("ID = %q, want dataset-1", dataset.ID)
+	}
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Fatalf("sql expectations: %v", err)
+	}
+}
+
+func TestKnowledgeResourcesAndContextBuildsSourceMarkedBlocks(t *testing.T) {
+	records := []scoredKnowledgeRecord{{
+		DatasetID:   "dataset-1",
+		DatasetName: "Product FAQ",
+		Record: dto.HitTestingRecordResponse{
+			Score:     0.91,
+			MatchType: "hybrid",
+			Segment: dto.SegmentResponse{
+				ID:         "segment-1",
+				DocumentID: "document-1",
+				Content:    "Refunds are available within 30 days.",
+				Document: dto.HitTestingDocumentResponse{
+					ID:             "document-1",
+					Name:           "Refund Policy",
+					DataSourceType: "upload",
+				},
+			},
+		},
+	}}
+
+	resources, contextText, blocks, err := knowledgeResourcesAndContext(records, "\n\n", 12000, "https://api.example.test")
+	if err != nil {
+		t.Fatalf("knowledgeResourcesAndContext() error = %v", err)
+	}
+	if len(resources) != 1 || len(blocks) != 1 {
+		t.Fatalf("resources=%d blocks=%d, want 1 each", len(resources), len(blocks))
+	}
+	if resources[0].Position != blocks[0].Position {
+		t.Fatalf("block position = %d, want resource position %d", blocks[0].Position, resources[0].Position)
+	}
+	if blocks[0].Source != "Product FAQ / Refund Policy" {
+		t.Fatalf("block source = %q", blocks[0].Source)
+	}
+	if !strings.Contains(contextText, "[1] Source: Product FAQ / Refund Policy") {
+		t.Fatalf("context missing source marker: %q", contextText)
+	}
+	if !strings.Contains(contextText, "Score: 0.9100") {
+		t.Fatalf("context missing score: %q", contextText)
+	}
+}
+
+func TestKnowledgeResourcesAndContextNormalizesImageURLs(t *testing.T) {
+	records := []scoredKnowledgeRecord{{
+		DatasetID:   "dataset-1",
+		DatasetName: "Herbs",
+		Record: dto.HitTestingRecordResponse{
+			Score: 0.91,
+			Segment: dto.SegmentResponse{
+				ID:         "segment-1",
+				DocumentID: "document-1",
+				Content:    "黄芪图：![figure](images/huangqi.png)",
+				Document: dto.HitTestingDocumentResponse{
+					ID:   "document-1",
+					Name: "黄芪",
+				},
+			},
+		},
+	}}
+
+	resources, contextText, _, err := knowledgeResourcesAndContext(records, "\n\n", 12000, "https://api.lingyoungai.com")
+	if err != nil {
+		t.Fatalf("knowledgeResourcesAndContext() error = %v", err)
+	}
+
+	want := "https://api.lingyoungai.com/images/huangqi.png"
+	if !strings.Contains(resources[0].Content, want) {
+		t.Fatalf("resource content missing normalized URL: %q", resources[0].Content)
+	}
+	if !strings.Contains(contextText, want) {
+		t.Fatalf("context missing normalized URL: %q", contextText)
+	}
+}
+
+func TestRetrieveAgentKnowledgeWithoutConfiguredDatasetsReturnsNoConfig(t *testing.T) {
+	db, mock := newKnowledgeMockDB(t)
+	svc := &KnowledgeRetrievalService{db: db}
+
+	mock.ExpectQuery(`SELECT .* FROM "agents_configs"`).
+		WillReturnRows(sqlmock.NewRows([]string{"dataset_configs", "configs", "retriever_resource", "agent_mode"}))
+
+	response, err := svc.RetrieveAgentKnowledge(context.Background(), KnowledgeRetrieveRequest{
+		Scope: KnowledgeScope{
+			AppID:     "agent-1",
+			AccountID: "account-1",
+		},
+		Query: "refund policy",
+	})
+	if err != nil {
+		t.Fatalf("RetrieveAgentKnowledge() error = %v", err)
+	}
+	if response.Status != KnowledgeRetrieveStatusNoConfig {
+		t.Fatalf("Status = %q, want %q", response.Status, KnowledgeRetrieveStatusNoConfig)
+	}
+	if response.ResultCount != 0 || len(response.Resources) != 0 {
+		t.Fatalf("response has results: %#v", response)
+	}
+	if len(response.Warnings) == 0 {
+		t.Fatalf("Warnings empty, want no config warning")
+	}
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Fatalf("sql expectations: %v", err)
+	}
+}
+
+func TestRetrieveAgentKnowledgeWithRuntimeDatasetsSkipsLegacyConfigFallback(t *testing.T) {
+	db, mock := newKnowledgeMockDB(t)
+	svc := &KnowledgeRetrievalService{db: db}
+
+	_, err := svc.RetrieveAgentKnowledge(context.Background(), KnowledgeRetrieveRequest{
+		Scope: KnowledgeScope{
+			AppID:          "agent-1",
+			OrganizationID: "org-1",
+			AccountID:      "account-1",
+		},
+		Query:           "refund policy",
+		DatasetIDs:      []string{"runtime-dataset"},
+		RetrievalConfig: map[string]interface{}{"top_k": float64(5)},
+	})
+	if err == nil || !strings.Contains(err.Error(), "knowledge retrieval service is not configured") {
+		t.Fatalf("RetrieveAgentKnowledge() error = %v, want direct retrieval configuration error", err)
+	}
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Fatalf("sql expectations: %v", err)
+	}
+}
+
+func newKnowledgeMockDB(t *testing.T) (*gorm.DB, sqlmock.Sqlmock) {
+	t.Helper()
+	sqlDB, mock, err := sqlmock.New()
+	if err != nil {
+		t.Fatalf("new sqlmock: %v", err)
+	}
+	t.Cleanup(func() {
+		_ = sqlDB.Close()
+	})
+	db, err := gorm.Open(postgres.New(postgres.Config{
+		Conn:                 sqlDB,
+		PreferSimpleProtocol: true,
+	}), &gorm.Config{})
+	if err != nil {
+		t.Fatalf("open gorm: %v", err)
+	}
+	return db, mock
+}
+
+func expectAccessibleKnowledgeWorkspaces(mock sqlmock.Sqlmock, workspaceIDs ...string) {
+	rows := sqlmock.NewRows([]string{"id", "role", "role_id", "permissions", "permission_source"})
+	for _, workspaceID := range workspaceIDs {
+		rows.AddRow(workspaceID, workspace_model.WorkspaceRoleMember, workspace_model.WorkspaceBuiltinRoleMemberID, `["knowledge_base.document.view"]`, workspace_model.WorkspaceMemberPermissionSourceDirect)
+	}
+	mock.ExpectQuery(`SELECT workspaces\.id, workspace_members\.role, workspace_members\.role_id, COALESCE\(workspace_members\.permissions::text, ''\) AS permissions, workspace_members\.permission_source FROM "workspaces" JOIN workspace_members ON workspace_members\.workspace_id = workspaces\.id WHERE workspaces\.organization_id = \$1 AND workspace_members\.account_id = \$2`).
+		WillReturnRows(rows)
+}
+
+func datasetRows() *sqlmock.Rows {
+	return sqlmock.NewRows([]string{
+		"id",
+		"organization_id",
+		"workspace_id",
+		"name",
+		"description",
+		"provider",
+		"enable_graph_flow",
+		"created_by",
+		"created_at",
+	})
+}

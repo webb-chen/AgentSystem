@@ -1,0 +1,1160 @@
+package service
+
+import (
+	"context"
+	"encoding/json"
+	"sort"
+	"strings"
+	"sync"
+	"time"
+
+	"github.com/google/uuid"
+	platformchannel "github.com/webb-chen/AgentSystem/api/internal/infra/platform/channel"
+	llmcache "github.com/webb-chen/AgentSystem/api/internal/modules/llm/cache"
+	channelmodel "github.com/webb-chen/AgentSystem/api/internal/modules/llm/channel/model"
+	channelrepo "github.com/webb-chen/AgentSystem/api/internal/modules/llm/channel/repository"
+	"github.com/webb-chen/AgentSystem/api/internal/modules/llm/channelprovider"
+	"github.com/webb-chen/AgentSystem/api/internal/modules/llm/llmmodel/model"
+	"github.com/webb-chen/AgentSystem/api/internal/modules/llm/llmmodel/repository"
+	providerrepo "github.com/webb-chen/AgentSystem/api/internal/modules/llm/provider/repository"
+	"github.com/webb-chen/AgentSystem/api/internal/modules/llm/shared"
+	"github.com/webb-chen/AgentSystem/api/internal/modules/llm/shared/types"
+	interfaces "github.com/webb-chen/AgentSystem/api/internal/modules/shared/interface"
+	"golang.org/x/sync/singleflight"
+)
+
+// ModelScene represents different business scenarios for model selection
+type ModelScene string
+
+const (
+	SceneChat      ModelScene = "chat"      // For workflow LLM nodes, agents
+	SceneEmbedding ModelScene = "embedding" // For knowledge base embedding
+	SceneRerank    ModelScene = "rerank"    // For reranking
+	SceneTTS       ModelScene = "tts"       // For text-to-speech
+	SceneSTT       ModelScene = "stt"       // For speech-to-text
+	SceneImage     ModelScene = "image"     // For image generation
+)
+
+// AgentRuntimeUseCase selects models that can execute the Agent runtime. It is
+// an availability query mode, not a value stored in a model's use_cases.
+const AgentRuntimeUseCase = "agent-runtime"
+
+// AvailableModel represents a simplified model for business use
+// Aligned with ModelHub structure for consistency
+type AvailableModel struct {
+	// Basic info
+	ID          uuid.UUID `json:"id"`
+	Name        string    `json:"model"`
+	DisplayName string    `json:"model_name"`
+	Provider    string    `json:"provider"`
+
+	// Pricing
+	Currency                    string          `json:"currency"`
+	InputPrice                  float64         `json:"input_price"`
+	OutputPrice                 float64         `json:"output_price"`
+	InputPriceConfigured        bool            `json:"input_price_configured"`
+	OutputPriceConfigured       bool            `json:"output_price_configured"`
+	CachedInputPrice            float64         `json:"cached_input_price"`
+	CacheReadPrice              float64         `json:"cache_read_price"`
+	CacheWritePrice             float64         `json:"cache_write_price"`
+	CacheWrite5mPrice           float64         `json:"cache_write_5m_price"`
+	CacheWrite1hPrice           float64         `json:"cache_write_1h_price"`
+	CacheReadPriceConfigured    bool            `json:"cache_read_price_configured"`
+	CacheWritePriceConfigured   bool            `json:"cache_write_price_configured"`
+	CacheWrite5mPriceConfigured bool            `json:"cache_write_5m_price_configured"`
+	CacheWrite1hPriceConfigured bool            `json:"cache_write_1h_price_configured"`
+	SyncedInputPrice            *float64        `json:"synced_input_price"`
+	SyncedOutputPrice           *float64        `json:"synced_output_price"`
+	SyncedCacheReadPrice        *float64        `json:"synced_cache_read_price"`
+	SyncedCacheWritePrice       *float64        `json:"synced_cache_write_price"`
+	SyncedCacheWrite5mPrice     *float64        `json:"synced_cache_write_5m_price"`
+	SyncedCacheWrite1hPrice     *float64        `json:"synced_cache_write_1h_price"`
+	InputPriceOverride          *float64        `json:"input_price_override"`
+	OutputPriceOverride         *float64        `json:"output_price_override"`
+	CacheReadPriceOverride      *float64        `json:"cache_read_price_override"`
+	CacheWritePriceOverride     *float64        `json:"cache_write_price_override"`
+	CacheWrite5mPriceOverride   *float64        `json:"cache_write_5m_price_override"`
+	CacheWrite1hPriceOverride   *float64        `json:"cache_write_1h_price_override"`
+	Pricing                     json.RawMessage `json:"pricing,omitempty"`
+	ImagePrices                 json.RawMessage `json:"image_prices,omitempty"`
+
+	// Context
+	ContextWindow   int `json:"context_window,omitempty"`
+	MaxOutputTokens int `json:"max_output_tokens,omitempty"`
+
+	// Modalities
+	InputModalities  []string `json:"input_modalities,omitempty"`
+	OutputModalities []string `json:"output_modalities,omitempty"`
+
+	// ModelHub-aligned capabilities (nested structures)
+	Endpoints  model.ModelEndpoints  `json:"endpoints"`
+	Features   model.ModelFeatures   `json:"features"`
+	Tools      model.ModelTools      `json:"tools"`
+	Parameters model.ModelParameters `json:"parameters"`
+
+	// Advanced metadata used by model-aware workbenches.
+	SupportedParameters []string                   `json:"supported_parameters,omitempty"`
+	ParametersMetadata  model.ParameterDefinitions `json:"parameters_metadata,omitempty"`
+	ConfigParameters    model.ConfigParameters     `json:"config_parameters,omitempty"`
+	DefaultParameters   model.JSONObject           `json:"default_parameters,omitempty"`
+	Capabilities        model.JSONObject           `json:"capabilities,omitempty"`
+	Video               model.JSONObject           `json:"video,omitempty"`
+
+	// Use cases array
+	UseCases []string `json:"use_cases,omitempty"`
+
+	// Passthrough support - custom models from channels
+	IsCustom      bool   `json:"is_custom,omitempty"`
+	SourceChannel string `json:"source_channel,omitempty"`
+}
+
+// AvailableModelsService provides fast access to available models for business use
+type AvailableModelsService interface {
+	// ListAvailable returns available models and optionally filters by provider and use case.
+	// NOTE: type-based filtering is deprecated; use use_case for capability filtering.
+	ListAvailable(ctx context.Context, organizationID uuid.UUID, provider string, useCase string) ([]*AvailableModel, error)
+	// RefreshCache forces a cache refresh for a tenant
+	RefreshCache(ctx context.Context, organizationID uuid.UUID) error
+	// InvalidateTenantCache invalidates cache for a specific tenant
+	InvalidateTenantCache(organizationID uuid.UUID)
+	// InvalidateGlobalCache is kept for callers that still notify global model changes.
+	InvalidateGlobalCache()
+	// SetOfficialRouteBootstrapper is kept for compatibility; listing available models is read-only.
+	SetOfficialRouteBootstrapper(bootstrapper interfaces.OfficialRouteBootstrapper)
+}
+
+// availableModelsService implements AvailableModelsService with in-memory caching
+type availableModelsService struct {
+	globalRepo         repository.ModelRepository
+	configRepo         repository.ModelConfigRepository
+	customRepo         repository.CustomModelRepository
+	routeRepo          channelrepo.TenantRouteRepository
+	globalProviderRepo providerrepo.ProviderRepository
+	providerConfigRepo providerrepo.ProviderConfigRepository
+	customProviderRepo providerrepo.CustomProviderRepository
+	channelProvider    platformchannel.ChannelProvider
+
+	// Tenant config cache (per-tenant)
+	tenantCache   map[uuid.UUID]*tenantCacheEntry
+	tenantCacheMu sync.RWMutex
+
+	availableCache   map[availableModelsCacheKey]*availableModelsCacheEntry
+	availableCacheMu sync.RWMutex
+
+	availableResponseCache   map[availableModelsCacheKey]*availableModelsResponseCacheEntry
+	availableResponseCacheMu sync.RWMutex
+	availableResponseGroup   singleflight.Group
+	observedGenerations      map[uuid.UUID]string
+	observedGenerationsMu    sync.Mutex
+
+	// Cache configuration
+	tenantCacheTTL    time.Duration
+	availableCacheTTL time.Duration
+}
+
+type tenantCacheEntry struct {
+	configs   map[uuid.UUID]*model.ModelConfig
+	customs   []*model.CustomModel
+	updatedAt time.Time
+}
+
+type availableModelsCacheKey struct {
+	organizationID uuid.UUID
+	provider       string
+	useCase        string
+}
+
+type availableModelsCacheEntry struct {
+	models    []*AvailableModel
+	updatedAt time.Time
+}
+
+type availableModelsResponseCacheEntry struct {
+	response         []byte
+	updatedAt        time.Time
+	generation       string
+	globalGeneration string
+}
+
+func availableModelsResponseSingleflightKey(key availableModelsCacheKey, generation string, globalGeneration string) string {
+	return strings.Join([]string{key.organizationID.String(), generation, globalGeneration, key.provider, key.useCase}, "\x00")
+}
+
+type availableModelsSuccessResponse struct {
+	Code    string                      `json:"code"`
+	Message string                      `json:"message"`
+	Data    availableModelsListResponse `json:"data"`
+}
+
+type availableModelsListResponse struct {
+	Items []*AvailableModel `json:"items"`
+	Total int               `json:"total"`
+}
+
+// NewAvailableModelsService creates a new available models service with caching
+func NewAvailableModelsService(
+	globalRepo repository.ModelRepository,
+	configRepo repository.ModelConfigRepository,
+	customRepo repository.CustomModelRepository,
+	routeRepo channelrepo.TenantRouteRepository,
+) AvailableModelsService {
+	return NewAvailableModelsServiceWithProviderRepos(
+		globalRepo,
+		configRepo,
+		customRepo,
+		routeRepo,
+		nil,
+		nil,
+		nil,
+	)
+}
+
+func NewAvailableModelsServiceWithProviderRepos(
+	globalRepo repository.ModelRepository,
+	configRepo repository.ModelConfigRepository,
+	customRepo repository.CustomModelRepository,
+	routeRepo channelrepo.TenantRouteRepository,
+	globalProviderRepo providerrepo.ProviderRepository,
+	providerConfigRepo providerrepo.ProviderConfigRepository,
+	customProviderRepo providerrepo.CustomProviderRepository,
+) AvailableModelsService {
+	svc := &availableModelsService{
+		globalRepo:             globalRepo,
+		configRepo:             configRepo,
+		customRepo:             customRepo,
+		routeRepo:              routeRepo,
+		globalProviderRepo:     globalProviderRepo,
+		providerConfigRepo:     providerConfigRepo,
+		customProviderRepo:     customProviderRepo,
+		tenantCache:            make(map[uuid.UUID]*tenantCacheEntry),
+		availableCache:         make(map[availableModelsCacheKey]*availableModelsCacheEntry),
+		availableResponseCache: make(map[availableModelsCacheKey]*availableModelsResponseCacheEntry),
+		observedGenerations:    make(map[uuid.UUID]string),
+		tenantCacheTTL:         2 * time.Minute,  // Tenant configs may change more often
+		availableCacheTTL:      30 * time.Second, // Full response cache absorbs hot polling with short staleness.
+	}
+
+	return svc
+}
+
+// SetChannelProvider supplies the cloud platform-channel catalog used to hydrate
+// official routes. It is intentionally optional so self-hosted deployments keep
+// using only persisted tenant routes.
+func (s *availableModelsService) SetChannelProvider(provider platformchannel.ChannelProvider) {
+	s.channelProvider = provider
+}
+
+// ListAvailableJSON returns the final API response body for the available-models endpoint.
+// It shares the same cache key and invalidation lifecycle as ListAvailable, avoiding
+// repeated clone and JSON encoding work on hot selector requests.
+func (s *availableModelsService) ListAvailableJSON(ctx context.Context, organizationID uuid.UUID, provider string, useCase string) ([]byte, error) {
+	provider = strings.TrimSpace(provider)
+	useCase = strings.TrimSpace(useCase)
+	cacheKey := availableModelsCacheKey{
+		organizationID: organizationID,
+		provider:       provider,
+		useCase:        useCase,
+	}
+	generation := llmcache.Generation(ctx, organizationID.String())
+	globalGeneration := llmcache.GlobalGeneration(ctx)
+	cacheEnabled := generation != "" && globalGeneration != ""
+	if cacheEnabled {
+		s.observeGeneration(organizationID, generation, globalGeneration)
+		if cached, ok := s.getAvailableResponseCache(cacheKey, generation, globalGeneration); ok {
+			return cached, nil
+		}
+	}
+	var sharedResponse []byte
+	if cacheEnabled && llmcache.GetJSON(ctx, "available", organizationID.String(), generation, []string{globalGeneration, provider, useCase}, &sharedResponse) {
+		return sharedResponse, nil
+	}
+
+	value, err, _ := s.availableResponseGroup.Do(availableModelsResponseSingleflightKey(cacheKey, generation, globalGeneration), func() (interface{}, error) {
+		fillCtx, cancel := llmcache.FillContext(ctx)
+		defer cancel()
+
+		if cacheEnabled {
+			s.observeGeneration(organizationID, generation, globalGeneration)
+			if cached, ok := s.getAvailableResponseCache(cacheKey, generation, globalGeneration); ok {
+				return cached, nil
+			}
+		}
+		var sharedResponse []byte
+		if cacheEnabled && llmcache.GetJSON(fillCtx, "available", organizationID.String(), generation, []string{globalGeneration, provider, useCase}, &sharedResponse) {
+			return sharedResponse, nil
+		}
+
+		models, sourceUpdatedAt, err := s.getAvailableModelsForCache(fillCtx, cacheKey, organizationID, provider, useCase)
+		if err != nil {
+			return nil, err
+		}
+
+		body, err := json.Marshal(availableModelsSuccessResponse{
+			Code:    "0",
+			Message: "success",
+			Data: availableModelsListResponse{
+				Items: models,
+				Total: len(models),
+			},
+		})
+		if err != nil {
+			return nil, err
+		}
+
+		if cacheEnabled {
+			s.setAvailableResponseCache(cacheKey, generation, globalGeneration, body, sourceUpdatedAt)
+			llmcache.SetJSON(fillCtx, "available", organizationID.String(), generation, []string{globalGeneration, provider, useCase}, body)
+		}
+		return cloneBytes(body), nil
+	})
+	if err != nil {
+		return nil, err
+	}
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	return cloneBytes(value.([]byte)), nil
+}
+
+// ListAvailable returns available models and optionally filters by provider and use case.
+func (s *availableModelsService) ListAvailable(ctx context.Context, organizationID uuid.UUID, provider string, useCase string) ([]*AvailableModel, error) {
+	provider = strings.TrimSpace(provider)
+	useCase = strings.TrimSpace(useCase)
+	cacheKey := availableModelsCacheKey{
+		organizationID: organizationID,
+		provider:       provider,
+		useCase:        useCase,
+	}
+	generation := llmcache.Generation(ctx, organizationID.String())
+	globalGeneration := llmcache.GlobalGeneration(ctx)
+	if generation != "" && globalGeneration != "" {
+		s.observeGeneration(organizationID, generation, globalGeneration)
+	}
+	models, _, err := s.getAvailableModelsForCache(ctx, cacheKey, organizationID, provider, useCase)
+	if err != nil {
+		return nil, err
+	}
+	return models, nil
+}
+
+func (s *availableModelsService) getAvailableModelsForCache(ctx context.Context, cacheKey availableModelsCacheKey, organizationID uuid.UUID, provider string, useCase string) ([]*AvailableModel, time.Time, error) {
+	if cached, updatedAt, ok := s.getAvailableCache(cacheKey); ok {
+		return cached, updatedAt, nil
+	}
+
+	result, err := s.listAvailableUncached(ctx, organizationID, provider, useCase)
+	if err != nil {
+		return nil, time.Time{}, err
+	}
+	updatedAt := s.setAvailableCache(cacheKey, result)
+	return cloneAvailableModels(result), updatedAt, nil
+}
+
+func (s *availableModelsService) listAvailableUncached(ctx context.Context, organizationID uuid.UUID, provider string, useCase string) ([]*AvailableModel, error) {
+	visibility, err := loadProviderVisibility(
+		ctx,
+		organizationID,
+		s.globalProviderRepo,
+		s.providerConfigRepo,
+		s.customProviderRepo,
+	)
+	if err != nil {
+		return nil, err
+	}
+
+	// Get tenant enabled routes to filter models
+	enabledRoutes, err := s.loadEnabledRoutes(ctx, organizationID)
+	if err != nil {
+		return nil, err
+	}
+
+	// Build set of available models from tenant routes
+	availableModelNames := make(map[string]bool)
+	for _, route := range enabledRoutes {
+		// Use unified GetEffectiveModels method
+		models := route.GetEffectiveModels()
+		for _, modelName := range models {
+			availableModelNames[modelName] = true
+		}
+	}
+
+	// Strict: a model is "available" only if it is backed by at least one enabled route.
+	// If we can't find any enabled route models, return an empty list.
+	if len(availableModelNames) == 0 {
+		return []*AvailableModel{}, nil
+	}
+
+	repositoryUseCase := useCase
+	if useCase == string(model.UseCaseAgent) || useCase == AgentRuntimeUseCase {
+		repositoryUseCase = ""
+	}
+	globalModels, err := s.listAvailableGlobalModels(ctx, availableModelNames, provider, repositoryUseCase)
+	if err != nil {
+		return nil, err
+	}
+
+	// Get tenant config from cache
+	tenantEntry, err := s.getTenantCache(ctx, organizationID)
+	if err != nil {
+		return nil, err
+	}
+
+	// Build result
+	result := make([]*AvailableModel, 0, len(availableModelNames))
+
+	// Filter and transform global models
+	for _, m := range globalModels {
+		// Filter by system-level enabled status (business control)
+		if !m.IsActive {
+			continue
+		}
+		if !visibility.Allows(m.Provider) {
+			continue
+		}
+		// Contract: every model must have provider + use_cases
+		if m.Provider == "" || len(m.UseCases) == 0 {
+			continue
+		}
+		effectiveUseCases := effectiveModelUseCasesForRoutes(enabledRoutes, m.Model, m.UseCases)
+		if !modelMatchesAvailableUseCase(effectiveUseCases, useCase) {
+			continue
+		}
+		if useCase == AgentRuntimeUseCase && !m.SupportsToolCall {
+			continue
+		}
+
+		// Filter by tenant routes - only include models available in tenant channels.
+		if !routeBacksModelForUseCase(enabledRoutes, m.Provider, m.Model, useCase, effectiveUseCases, false) {
+			continue
+		}
+
+		// Filter by provider if specified
+		if provider != "" && m.Provider != provider {
+			continue
+		}
+
+		// Check if model is enabled for this tenant
+		if cfg, ok := tenantEntry.configs[m.ID]; ok {
+			if !cfg.IsEnabled {
+				continue
+			}
+		}
+
+		// Transform to AvailableModel with new nested structure
+		costInput, _ := m.InputPrice.Float64()
+		costOutput, _ := m.OutputPrice.Float64()
+		cachedInputPrice, _ := m.CachedInputPrice.Float64()
+		cacheReadPrice, _ := m.CostCacheRead.Float64()
+		cacheWritePrice, _ := m.CostCacheWrite.Float64()
+		cacheWrite5mPrice, _ := m.CostCacheWrite5m.Float64()
+		cacheWrite1hPrice, _ := m.CostCacheWrite1h.Float64()
+		var syncedCacheReadPrice, syncedCacheWritePrice, syncedCacheWrite5mPrice, syncedCacheWrite1hPrice *float64
+		if m.CacheReadPriceConfigured {
+			syncedCacheReadPrice = &cacheReadPrice
+		}
+		if m.CacheWritePriceConfigured {
+			syncedCacheWritePrice = &cacheWritePrice
+		}
+		if m.CacheWrite5mPriceConfigured {
+			syncedCacheWrite5mPrice = &cacheWrite5mPrice
+		}
+		if m.CacheWrite1hPriceConfigured {
+			syncedCacheWrite1hPrice = &cacheWrite1hPrice
+		}
+		capabilities := capabilitiesFromDefaultParameters(m.DefaultParameters)
+		am := &AvailableModel{
+			ID:              m.ID,
+			Name:            m.Model,
+			DisplayName:     m.ModelName,
+			Provider:        m.Provider,
+			ContextWindow:   m.ContextWindow,
+			MaxOutputTokens: m.MaxOutputTokens,
+			InputModalities: cloneJSONArray(m.InputModalities), OutputModalities: cloneJSONArray(m.OutputModalities),
+
+			// Pricing
+			Currency:                    getCurrencyOrDefault(m.Currency),
+			InputPrice:                  costInput,
+			OutputPrice:                 costOutput,
+			InputPriceConfigured:        m.InputPriceConfigured,
+			OutputPriceConfigured:       m.OutputPriceConfigured,
+			CachedInputPrice:            cachedInputPrice,
+			CacheReadPrice:              cacheReadPrice,
+			CacheWritePrice:             cacheWritePrice,
+			CacheWrite5mPrice:           cacheWrite5mPrice,
+			CacheWrite1hPrice:           cacheWrite1hPrice,
+			CacheReadPriceConfigured:    m.CacheReadPriceConfigured,
+			CacheWritePriceConfigured:   m.CacheWritePriceConfigured,
+			CacheWrite5mPriceConfigured: m.CacheWrite5mPriceConfigured,
+			CacheWrite1hPriceConfigured: m.CacheWrite1hPriceConfigured,
+			SyncedInputPrice:            &costInput,
+			SyncedOutputPrice:           &costOutput,
+			SyncedCacheReadPrice:        syncedCacheReadPrice,
+			SyncedCacheWritePrice:       syncedCacheWritePrice,
+			SyncedCacheWrite5mPrice:     syncedCacheWrite5mPrice,
+			SyncedCacheWrite1hPrice:     syncedCacheWrite1hPrice,
+			Pricing:                     cloneRawJSON(m.Pricing),
+			ImagePrices:                 cloneRawJSON(m.ImagePrices),
+
+			// ModelHub-aligned nested structures
+			Endpoints: model.ModelEndpoints{
+				ChatCompletions:  m.ChatCompletions,
+				Responses:        m.Responses,
+				Realtime:         m.Realtime,
+				Assistants:       m.Assistants,
+				Batch:            m.Batch,
+				Embeddings:       m.Embeddings,
+				FineTuning:       m.FineTuning,
+				Vision:           m.SupportsVision,
+				ImageGeneration:  m.ImageGeneration,
+				SpeechGeneration: m.SpeechGeneration,
+				Transcription:    m.Transcription,
+				Translation:      m.Translation,
+				MusicGeneration:  m.MusicGeneration,
+				Moderation:       m.Moderation,
+				Videos:           m.Videos,
+				ImageEdit:        m.ImageEdit,
+			},
+			Features: model.ModelFeatures{
+				Streaming:        m.SupportsStreaming,
+				FunctionCalling:  m.SupportsToolCall,
+				StructuredOutput: m.SupportsStructuredOutput,
+				JsonMode:         m.SupportsJsonMode,
+				Reasoning:        m.SupportsReasoning,
+				SystemPrompt:     m.SystemPrompt,
+				Logprobs:         m.Logprobs,
+				WebSearch:        m.WebSearch,
+				FileSearch:       m.FileSearch,
+				CodeInterpreter:  m.CodeInterpreter,
+				ComputerUse:      m.ComputerUse,
+				Mcp:              m.Mcp,
+				ReasoningEffort:  m.ReasoningEffort,
+			},
+			Tools: model.ModelTools{
+				WebSearch:         m.WebSearch,
+				FileSearch:        m.FileSearch,
+				ImageGeneration:   m.ImageGeneration,
+				CodeInterpreter:   m.CodeInterpreter,
+				ComputerUse:       m.ComputerUse,
+				Mcp:               m.Mcp,
+				ParallelToolCalls: m.ParallelToolCalls,
+			},
+			Parameters: model.ModelParameters{
+				SupportsTemperature:      m.SupportsTemperature,
+				SupportsTopP:             m.SupportsTopP,
+				SupportsPresencePenalty:  m.SupportsPresencePenalty,
+				SupportsFrequencyPenalty: m.SupportsFrequencyPenalty,
+				SupportsLogitBias:        m.SupportsLogitBias,
+				SupportsSeed:             m.SupportsSeed,
+				SupportsStop:             m.SupportsStop,
+				MaxStopSequences:         m.MaxStopSequences,
+			},
+
+			// Use cases
+			UseCases:            []string(effectiveUseCases),
+			SupportedParameters: parameterDefinitionNames(m.SupportedParameters),
+			ParametersMetadata:  cloneParameterDefinitions(m.SupportedParameters),
+			ConfigParameters:    cloneConfigParameters(m.ConfigParameters),
+			DefaultParameters:   cloneJSONObject(m.DefaultParameters),
+			Capabilities:        capabilities,
+			Video:               videoFromCapabilities(capabilities),
+		}
+
+		// Apply tenant custom display name if set
+		if cfg, ok := tenantEntry.configs[m.ID]; ok && cfg.CustomDisplayName != "" {
+			am.DisplayName = cfg.CustomDisplayName
+		}
+		if cfg, ok := tenantEntry.configs[m.ID]; ok {
+			if cfg.InputPriceOverride != nil {
+				override, _ := cfg.InputPriceOverride.Float64()
+				am.InputPriceOverride = &override
+				am.InputPrice = override
+				am.InputPriceConfigured = true
+			}
+			if cfg.OutputPriceOverride != nil {
+				override, _ := cfg.OutputPriceOverride.Float64()
+				am.OutputPriceOverride = &override
+				am.OutputPrice = override
+				am.OutputPriceConfigured = true
+			}
+			if cfg.CacheReadPriceOverride != nil {
+				override, _ := cfg.CacheReadPriceOverride.Float64()
+				am.CacheReadPriceOverride = &override
+				am.CacheReadPrice = override
+				am.CacheReadPriceConfigured = true
+			}
+			if cfg.CacheWritePriceOverride != nil {
+				override, _ := cfg.CacheWritePriceOverride.Float64()
+				am.CacheWritePriceOverride = &override
+				am.CacheWritePrice = override
+				am.CacheWritePriceConfigured = true
+			}
+			if cfg.CacheWrite5mPriceOverride != nil {
+				override, _ := cfg.CacheWrite5mPriceOverride.Float64()
+				am.CacheWrite5mPriceOverride = &override
+				am.CacheWrite5mPrice = override
+				am.CacheWrite5mPriceConfigured = true
+			}
+			if cfg.CacheWrite1hPriceOverride != nil {
+				override, _ := cfg.CacheWrite1hPriceOverride.Float64()
+				am.CacheWrite1hPriceOverride = &override
+				am.CacheWrite1hPrice = override
+				am.CacheWrite1hPriceConfigured = true
+			}
+		}
+
+		result = append(result, am)
+	}
+
+	// Add tenant custom models
+	for _, m := range tenantEntry.customs {
+		if !visibility.Allows(m.Provider) {
+			continue
+		}
+		// Contract: every model must have provider + use_cases
+		if m.Provider == "" || len(m.UseCases) == 0 {
+			continue
+		}
+		effectiveUseCases := effectiveModelUseCasesForRoutes(enabledRoutes, m.Name, types.StringArray(m.UseCases))
+		if !modelMatchesAvailableUseCase(effectiveUseCases, useCase) {
+			continue
+		}
+		if useCase == AgentRuntimeUseCase && !m.SupportsToolCall {
+			continue
+		}
+
+		// Filter by tenant routes - only include models available in tenant channels.
+		if !routeBacksModelForUseCase(enabledRoutes, m.Provider, m.Name, useCase, effectiveUseCases, true) {
+			continue
+		}
+
+		// Filter by provider if specified
+		if provider != "" && m.Provider != provider {
+			continue
+		}
+
+		if !m.IsActive {
+			continue
+		}
+
+		capabilities := capabilitiesFromDefaultParameters(m.DefaultParameters)
+		customInputPrice, _ := m.InputPrice.Float64()
+		customOutputPrice, _ := m.OutputPrice.Float64()
+		customCacheReadPrice, _ := m.CostCacheRead.Float64()
+		customCacheWritePrice, _ := m.CostCacheWrite.Float64()
+		customCacheWrite5mPrice, _ := m.CostCacheWrite5m.Float64()
+		customCacheWrite1hPrice, _ := m.CostCacheWrite1h.Float64()
+		am := &AvailableModel{
+			ID:              m.ID,
+			Name:            m.Name,
+			DisplayName:     m.DisplayName,
+			Provider:        m.Provider,
+			ContextWindow:   m.ContextWindow,
+			MaxOutputTokens: m.MaxOutputTokens,
+			InputModalities: cloneJSONArray(m.InputModalities), OutputModalities: cloneJSONArray(m.OutputModalities),
+
+			// Pricing
+			Currency:                    "USD",
+			InputPrice:                  customInputPrice,
+			OutputPrice:                 customOutputPrice,
+			InputPriceConfigured:        m.InputPriceConfigured,
+			OutputPriceConfigured:       m.OutputPriceConfigured,
+			CacheReadPrice:              customCacheReadPrice,
+			CacheWritePrice:             customCacheWritePrice,
+			CacheWrite5mPrice:           customCacheWrite5mPrice,
+			CacheWrite1hPrice:           customCacheWrite1hPrice,
+			CacheReadPriceConfigured:    m.CacheReadPriceConfigured,
+			CacheWritePriceConfigured:   m.CacheWritePriceConfigured,
+			CacheWrite5mPriceConfigured: m.CacheWrite5mPriceConfigured,
+			CacheWrite1hPriceConfigured: m.CacheWrite1hPriceConfigured,
+
+			// ModelHub-aligned nested structures (aligned with global models)
+			Endpoints: model.ModelEndpoints{
+				ChatCompletions:  m.ChatCompletions,
+				Responses:        m.Responses,
+				Realtime:         m.Realtime,
+				Assistants:       m.Assistants,
+				Batch:            m.Batch,
+				Embeddings:       m.Embeddings,
+				FineTuning:       m.FineTuning,
+				ImageGeneration:  m.ImageGeneration,
+				Vision:           m.SupportsVision,
+				SpeechGeneration: m.SpeechGeneration,
+				Transcription:    m.Transcription,
+				Translation:      m.Translation,
+				Moderation:       m.Moderation,
+				Videos:           modelUseCasesContain(effectiveUseCases, string(model.UseCaseVideoGen)),
+				ImageEdit:        false,
+			},
+			Features: model.ModelFeatures{
+				Streaming:        m.SupportsStreaming,
+				FunctionCalling:  m.SupportsToolCall,
+				StructuredOutput: m.SupportsStructuredOutput,
+				JsonMode:         m.SupportsJsonMode,
+				Distillation:     m.Distillation,
+				Reasoning:        m.SupportsReasoning,
+				SystemPrompt:     m.SystemPrompt,
+				Logprobs:         m.Logprobs,
+				WebSearch:        m.WebSearch,
+				FileSearch:       m.FileSearch,
+				CodeInterpreter:  m.CodeInterpreter,
+				ComputerUse:      m.ComputerUse,
+				Mcp:              m.Mcp,
+				ReasoningEffort:  m.ReasoningEffort,
+			},
+			Tools: model.ModelTools{
+				WebSearch:         m.WebSearch,
+				FileSearch:        m.FileSearch,
+				ImageGeneration:   m.ImageGeneration,
+				CodeInterpreter:   m.CodeInterpreter,
+				ComputerUse:       m.ComputerUse,
+				Mcp:               m.Mcp,
+				ParallelToolCalls: m.ParallelToolCalls,
+			},
+			Parameters: model.ModelParameters{
+				SupportsTemperature:      m.SupportsTemperature,
+				SupportsTopP:             m.SupportsTopP,
+				SupportsPresencePenalty:  m.SupportsPresencePenalty,
+				SupportsFrequencyPenalty: m.SupportsFrequencyPenalty,
+				SupportsLogitBias:        m.SupportsLogitBias,
+				SupportsSeed:             m.SupportsSeed,
+				SupportsStop:             m.SupportsStop,
+				MaxStopSequences:         m.MaxStopSequences,
+			},
+
+			// Use cases
+			UseCases:            append([]string(nil), effectiveUseCases...),
+			SupportedParameters: parameterDefinitionNames(m.SupportedParameters),
+			ParametersMetadata:  cloneParameterDefinitions(m.SupportedParameters),
+			ConfigParameters:    cloneConfigParameters(m.ConfigParameters),
+			DefaultParameters:   cloneJSONObject(m.DefaultParameters),
+			Capabilities:        capabilities,
+			Video:               videoFromCapabilities(capabilities),
+		}
+		result = append(result, am)
+	}
+
+	return result, nil
+}
+
+func (s *availableModelsService) getAvailableCache(key availableModelsCacheKey) ([]*AvailableModel, time.Time, bool) {
+	s.availableCacheMu.RLock()
+	entry, ok := s.availableCache[key]
+	if ok && time.Since(entry.updatedAt) < s.availableCacheTTL {
+		models := cloneAvailableModels(entry.models)
+		updatedAt := entry.updatedAt
+		s.availableCacheMu.RUnlock()
+		return models, updatedAt, true
+	}
+	s.availableCacheMu.RUnlock()
+	return nil, time.Time{}, false
+}
+
+func (s *availableModelsService) setAvailableCache(key availableModelsCacheKey, models []*AvailableModel) time.Time {
+	updatedAt := time.Now()
+	s.availableCacheMu.Lock()
+	s.availableCache[key] = &availableModelsCacheEntry{
+		models:    cloneAvailableModels(models),
+		updatedAt: updatedAt,
+	}
+	s.availableCacheMu.Unlock()
+	return updatedAt
+}
+
+func (s *availableModelsService) getAvailableResponseCache(key availableModelsCacheKey, generation string, globalGeneration string) ([]byte, bool) {
+	s.availableResponseCacheMu.RLock()
+	entry, ok := s.availableResponseCache[key]
+	if ok && entry.generation == generation && entry.globalGeneration == globalGeneration && time.Since(entry.updatedAt) < s.availableCacheTTL {
+		response := cloneBytes(entry.response)
+		s.availableResponseCacheMu.RUnlock()
+		return response, true
+	}
+	s.availableResponseCacheMu.RUnlock()
+	return nil, false
+}
+
+func (s *availableModelsService) setAvailableResponseCache(key availableModelsCacheKey, generation string, globalGeneration string, response []byte, updatedAt time.Time) {
+	s.availableResponseCacheMu.Lock()
+	s.availableResponseCache[key] = &availableModelsResponseCacheEntry{
+		response:         cloneBytes(response),
+		updatedAt:        updatedAt,
+		generation:       generation,
+		globalGeneration: globalGeneration,
+	}
+	s.availableResponseCacheMu.Unlock()
+}
+
+func cloneBytes(src []byte) []byte {
+	if len(src) == 0 {
+		return []byte{}
+	}
+	return append([]byte(nil), src...)
+}
+
+func cloneAvailableModels(models []*AvailableModel) []*AvailableModel {
+	if len(models) == 0 {
+		return []*AvailableModel{}
+	}
+	cloned := make([]*AvailableModel, 0, len(models))
+	for _, item := range models {
+		if item == nil {
+			cloned = append(cloned, nil)
+			continue
+		}
+		modelCopy := *item
+		modelCopy.UseCases = append([]string(nil), item.UseCases...)
+		modelCopy.InputModalities = append([]string(nil), item.InputModalities...)
+		modelCopy.OutputModalities = append([]string(nil), item.OutputModalities...)
+		modelCopy.SupportedParameters = append([]string(nil), item.SupportedParameters...)
+		modelCopy.ParametersMetadata = cloneParameterDefinitions(item.ParametersMetadata)
+		modelCopy.ConfigParameters = cloneConfigParameters(item.ConfigParameters)
+		modelCopy.DefaultParameters = cloneJSONObject(item.DefaultParameters)
+		modelCopy.Capabilities = cloneJSONObject(item.Capabilities)
+		modelCopy.Video = cloneJSONObject(item.Video)
+		modelCopy.Pricing = cloneRawJSON(item.Pricing)
+		modelCopy.ImagePrices = cloneRawJSON(item.ImagePrices)
+		cloned = append(cloned, &modelCopy)
+	}
+	return cloned
+}
+
+func cloneRawJSON(src []byte) json.RawMessage {
+	if len(src) == 0 {
+		return nil
+	}
+	return append(json.RawMessage(nil), src...)
+}
+
+func modelUseCasesContain(useCases []string, target string) bool {
+	for _, useCase := range useCases {
+		if useCase == target {
+			return true
+		}
+	}
+	return false
+}
+
+func parameterDefinitionNames(params model.ParameterDefinitions) []string {
+	if len(params) == 0 {
+		return nil
+	}
+	names := make([]string, 0, len(params))
+	for _, param := range params {
+		if strings.TrimSpace(param.Name) == "" {
+			continue
+		}
+		names = append(names, param.Name)
+	}
+	return names
+}
+
+func cloneJSONArray(values types.JSONArray) []string {
+	if len(values) == 0 {
+		return nil
+	}
+	return append([]string(nil), []string(values)...)
+}
+
+func cloneParameterDefinitions(params model.ParameterDefinitions) model.ParameterDefinitions {
+	if len(params) == 0 {
+		return nil
+	}
+	return append(model.ParameterDefinitions(nil), params...)
+}
+
+func cloneConfigParameters(params model.ConfigParameters) model.ConfigParameters {
+	if len(params) == 0 {
+		return nil
+	}
+	return append(model.ConfigParameters(nil), params...)
+}
+
+func cloneJSONObject(src model.JSONObject) model.JSONObject {
+	if len(src) == 0 {
+		return nil
+	}
+	dst := make(model.JSONObject, len(src))
+	for key, value := range src {
+		dst[key] = cloneJSONValue(value)
+	}
+	return dst
+}
+
+func cloneJSONValue(value interface{}) interface{} {
+	switch typed := value.(type) {
+	case model.JSONObject:
+		return cloneJSONObject(typed)
+	case map[string]interface{}:
+		cloned := make(map[string]interface{}, len(typed))
+		for key, nested := range typed {
+			cloned[key] = cloneJSONValue(nested)
+		}
+		return cloned
+	case []interface{}:
+		cloned := make([]interface{}, len(typed))
+		for i, nested := range typed {
+			cloned[i] = cloneJSONValue(nested)
+		}
+		return cloned
+	default:
+		return typed
+	}
+}
+
+func capabilitiesFromDefaultParameters(defaults model.JSONObject) model.JSONObject {
+	if len(defaults) == 0 {
+		return nil
+	}
+	raw, ok := defaults["capabilities"]
+	if !ok {
+		return nil
+	}
+	switch capabilities := raw.(type) {
+	case model.JSONObject:
+		return cloneJSONObject(capabilities)
+	case map[string]interface{}:
+		if len(capabilities) == 0 {
+			return nil
+		}
+		cloned, ok := cloneJSONValue(capabilities).(map[string]interface{})
+		if !ok {
+			return nil
+		}
+		return model.JSONObject(cloned)
+	default:
+		return nil
+	}
+}
+
+func videoFromCapabilities(capabilities model.JSONObject) model.JSONObject {
+	if len(capabilities) == 0 {
+		return nil
+	}
+	raw, ok := capabilities["video"]
+	if !ok {
+		return nil
+	}
+	switch video := raw.(type) {
+	case model.JSONObject:
+		return cloneJSONObject(video)
+	case map[string]interface{}:
+		if len(video) == 0 {
+			return nil
+		}
+		cloned, ok := cloneJSONValue(video).(map[string]interface{})
+		if !ok {
+			return nil
+		}
+		return model.JSONObject(cloned)
+	default:
+		return nil
+	}
+}
+
+func (s *availableModelsService) SetOfficialRouteBootstrapper(_ interfaces.OfficialRouteBootstrapper) {
+}
+
+// RefreshCache forces a cache refresh for a tenant
+func (s *availableModelsService) RefreshCache(ctx context.Context, organizationID uuid.UUID) error {
+	s.InvalidateTenantCache(organizationID)
+	return s.refreshTenantCache(ctx, organizationID, true)
+}
+
+// InvalidateTenantCache invalidates cache for a specific tenant
+func (s *availableModelsService) InvalidateTenantCache(organizationID uuid.UUID) {
+	s.tenantCacheMu.Lock()
+	delete(s.tenantCache, organizationID)
+	s.tenantCacheMu.Unlock()
+	s.invalidateAvailableCacheForTenant(organizationID)
+	llmcache.Invalidate(context.Background(), organizationID.String())
+}
+
+// InvalidateGlobalCache clears the response cache because global model/provider changes can affect every tenant.
+func (s *availableModelsService) InvalidateGlobalCache() {
+	s.availableCacheMu.Lock()
+	s.availableCache = make(map[availableModelsCacheKey]*availableModelsCacheEntry)
+	s.availableCacheMu.Unlock()
+	s.availableResponseCacheMu.Lock()
+	s.availableResponseCache = make(map[availableModelsCacheKey]*availableModelsResponseCacheEntry)
+	s.availableResponseCacheMu.Unlock()
+	llmcache.InvalidateGlobal(context.Background())
+}
+
+// observeGeneration clears process-local source caches after another API process
+// invalidates the shared response generation. The first observation is only
+// recorded so an initial shared response fill can still reuse warm local data.
+func (s *availableModelsService) observeGeneration(organizationID uuid.UUID, generation string, globalGeneration string) {
+	current := strings.Join([]string{generation, globalGeneration}, "\x00")
+	s.observedGenerationsMu.Lock()
+	if s.observedGenerations == nil {
+		s.observedGenerations = make(map[uuid.UUID]string)
+	}
+	previous, observed := s.observedGenerations[organizationID]
+	if !observed || previous == current {
+		s.observedGenerations[organizationID] = current
+		s.observedGenerationsMu.Unlock()
+		return
+	}
+
+	s.tenantCacheMu.Lock()
+	delete(s.tenantCache, organizationID)
+	s.tenantCacheMu.Unlock()
+	s.invalidateAvailableCacheForTenant(organizationID)
+	s.observedGenerations[organizationID] = current
+	s.observedGenerationsMu.Unlock()
+}
+
+func (s *availableModelsService) invalidateAvailableCacheForTenant(organizationID uuid.UUID) {
+	s.availableCacheMu.Lock()
+	for key := range s.availableCache {
+		if key.organizationID == organizationID {
+			delete(s.availableCache, key)
+		}
+	}
+	s.availableCacheMu.Unlock()
+	s.availableResponseCacheMu.Lock()
+	for key := range s.availableResponseCache {
+		if key.organizationID == organizationID {
+			delete(s.availableResponseCache, key)
+		}
+	}
+	s.availableResponseCacheMu.Unlock()
+}
+
+func (s *availableModelsService) loadEnabledRoutes(ctx context.Context, organizationID uuid.UUID) ([]*channelmodel.LLMRoute, error) {
+	enabledRoutes, err := s.routeRepo.GetEnabledRoutes(ctx, organizationID)
+	if err != nil {
+		return nil, err
+	}
+	return platformchannel.HydrateOfficialRoutes(ctx, s.channelProvider, organizationID, enabledRoutes)
+}
+
+func (s *availableModelsService) listAvailableGlobalModels(ctx context.Context, availableModelNames map[string]bool, provider string, useCase string) ([]*model.LLMModel, error) {
+	if availableModelNames["*"] {
+		return s.globalRepo.ListAvailableFiltered(ctx, provider, useCase)
+	}
+
+	names := make([]string, 0, len(availableModelNames))
+	for name := range availableModelNames {
+		names = append(names, name)
+	}
+	sort.Strings(names)
+	return s.globalRepo.ListAvailableByNames(ctx, names, provider, useCase)
+}
+
+// containsUseCase checks if a use_case is present in the use_cases array
+func containsUseCase(useCases types.StringArray, target string) bool {
+	for _, uc := range useCases {
+		if uc == target {
+			return true
+		}
+	}
+	return false
+}
+
+func routeBacksModelForUseCase(routes []*channelmodel.LLMRoute, modelProvider, modelName, useCase string, useCases types.StringArray, customModel bool) bool {
+	if !modelMatchesAvailableUseCase(useCases, useCase) {
+		return false
+	}
+	requiresAgentProtocol := useCase == string(model.UseCaseAgent) || useCase == AgentRuntimeUseCase
+	trustCustomAgentLabel := customModel && containsUseCase(useCases, string(model.UseCaseAgent))
+	for _, route := range routes {
+		if route == nil {
+			continue
+		}
+		official := route.IsOfficial || route.Type == shared.RouteTypeMINGYINGKEJICloud
+		if !route.SupportsModelForProvider(modelProvider, modelName) {
+			continue
+		}
+		if !requiresAgentProtocol {
+			return true
+		}
+		if trustCustomAgentLabel {
+			return true
+		}
+		channelProvider := route.ChannelProvider
+		if official {
+			channelProvider = "mingyingkeji-cloud"
+		}
+		if channelprovider.SupportsAgentProtocol(channelProvider) {
+			return true
+		}
+	}
+	return false
+}
+
+func modelMatchesAvailableUseCase(useCases types.StringArray, useCase string) bool {
+	switch useCase {
+	case "":
+		return true
+	case AgentRuntimeUseCase:
+		return containsUseCase(useCases, string(model.UseCaseAgent)) ||
+			containsUseCase(useCases, string(model.UseCaseTextChat))
+	default:
+		return containsUseCase(useCases, useCase)
+	}
+}
+
+func effectiveModelUseCasesForRoutes(_ []*channelmodel.LLMRoute, _ string, useCases types.StringArray) types.StringArray {
+	return types.StringArray(model.NormalizeUseCases([]string(useCases)))
+}
+
+// getTenantCache returns tenant cache entry
+func (s *availableModelsService) getTenantCache(ctx context.Context, organizationID uuid.UUID) (*tenantCacheEntry, error) {
+	s.tenantCacheMu.RLock()
+	entry, ok := s.tenantCache[organizationID]
+	if ok && time.Since(entry.updatedAt) < s.tenantCacheTTL {
+		s.tenantCacheMu.RUnlock()
+		return entry, nil
+	}
+	s.tenantCacheMu.RUnlock()
+
+	// Cache miss or expired, refresh
+	return s.refreshTenantCacheAndReturn(ctx, organizationID, false)
+}
+
+// refreshTenantCacheAndReturn refreshes tenant cache and returns the result
+func (s *availableModelsService) refreshTenantCacheAndReturn(ctx context.Context, organizationID uuid.UUID, force bool) (*tenantCacheEntry, error) {
+	s.tenantCacheMu.Lock()
+	defer s.tenantCacheMu.Unlock()
+
+	// Double-check after acquiring write lock
+	if !force {
+		if entry, ok := s.tenantCache[organizationID]; ok && time.Since(entry.updatedAt) < s.tenantCacheTTL {
+			return entry, nil
+		}
+	}
+
+	configs, err := s.configRepo.ListAvailableConfigs(ctx, organizationID)
+	if err != nil {
+		return nil, err
+	}
+
+	// Fetch custom models from database
+	customs, _, err := s.customRepo.List(ctx, organizationID, nil, "", "", boolPtr(true), 0, 10000)
+	if err != nil {
+		return nil, err
+	}
+
+	// Build config map
+	configMap := make(map[uuid.UUID]*model.ModelConfig, len(configs))
+	for _, cfg := range configs {
+		configMap[cfg.ModelID] = cfg
+	}
+
+	entry := &tenantCacheEntry{
+		configs:   configMap,
+		customs:   customs,
+		updatedAt: time.Now(),
+	}
+	s.tenantCache[organizationID] = entry
+
+	return entry, nil
+}
+
+// refreshTenantCache refreshes tenant cache
+func (s *availableModelsService) refreshTenantCache(ctx context.Context, organizationID uuid.UUID, force bool) error {
+	_, err := s.refreshTenantCacheAndReturn(ctx, organizationID, force)
+	return err
+}
+
+// NOTE: type-based filtering is deprecated and intentionally not supported for /models/available.

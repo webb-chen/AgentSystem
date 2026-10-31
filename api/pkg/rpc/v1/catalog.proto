@@ -1,0 +1,158 @@
+syntax = "proto3";
+
+package mingyingkeji.rpc.v1;
+
+option go_package = "github.com/webb-chen/AgentSystem/api/pkg/rpc/v1;v1";
+
+service CatalogService {
+    rpc GetPublishedCatalog(GetPublishedCatalogRequest) returns (GetPublishedCatalogResponse);
+    rpc WatchCatalogPublishes(WatchCatalogPublishesRequest) returns (stream CatalogPublishEvent);
+}
+
+message WatchCatalogPublishesRequest {
+    int64 last_seen_version = 1;
+}
+
+message CatalogPublishEvent {
+    int64 version = 1;
+    int64 published_at = 2;
+}
+
+message GetPublishedCatalogRequest {
+    int64 version = 1;
+}
+
+message GetPublishedCatalogResponse {
+    int64 version = 1;
+    int64 published_at = 2;
+    repeated CatalogProvider providers = 3;
+    repeated CatalogModel models = 4;
+    repeated CatalogVendor vendors = 5;
+}
+
+message CatalogVendor {
+    string vendor = 1;
+    string vendor_name = 2;
+    string cn_name = 3;
+    string en_name = 4;
+    string description = 5;
+    string website = 6;
+    string country_code = 7;
+    string status = 8;
+    bool is_active = 9;
+    string metadata_json = 10;
+}
+
+message CatalogProvider {
+    string provider = 1;
+    string provider_name = 2;
+    string description = 3;
+    string tagline = 4;
+    string logo_url = 5;
+    string website = 6;
+    string api_docs_url = 7;
+    string pricing_url = 8;
+    string country_code = 9;
+    int32 founded_year = 10;
+    string status = 11;
+    bool is_active = 12;
+    bool is_system_enabled = 13;
+    string metadata_json = 14;
+}
+
+message CatalogModel {
+    string provider = 1;
+    string model = 2;
+    string model_name = 3;
+    string type = 4;
+    string family = 5;
+    string family_name = 6;
+    string status = 7;
+    string tagline = 8;
+    bool is_flagship = 9;
+    bool is_recommended = 10;
+    bool is_featured = 11;
+    bool is_new = 12;
+    string access_type = 13;
+    string currency = 14;
+    int32 context_window = 15;
+    int32 max_output_tokens = 16;
+    optional double input_price = 17;
+    optional double output_price = 18;
+    optional double cached_input_price = 19;
+    repeated string use_cases = 20;
+    repeated string input_modalities = 21;
+    repeated string output_modalities = 22;
+    string knowledge_cutoff = 23;
+    bool is_active = 24;
+    bool is_system_enabled = 25;
+    string supported_parameters_json = 26;
+    string config_parameters_json = 27;
+    CatalogModelEndpoints endpoints = 28;
+    CatalogModelFeatures features = 29;
+    CatalogModelTools tools = 30;
+    CatalogModelParameters parameters = 31;
+    string replacement_provider = 32;
+    string replacement_model = 33;
+    string deprecation_reason = 34;
+    string pricing_json = 35;
+    string vendor = 36;
+}
+
+message CatalogModelEndpoints {
+    bool chat_completions = 1;
+    bool responses = 2;
+    bool realtime = 3;
+    bool assistants = 4;
+    bool batch = 5;
+    bool embeddings = 6;
+    bool fine_tuning = 7;
+    bool image_generation = 8;
+    bool vision = 9;
+    bool speech_generation = 10;
+    bool transcription = 11;
+    bool translation = 12;
+    bool moderation = 13;
+    bool videos = 14;
+    bool image_edit = 15;
+    bool music_generation = 16;
+}
+
+message CatalogModelFeatures {
+    bool streaming = 1;
+    bool function_calling = 2;
+    bool structured_output = 3;
+    bool json_mode = 4;
+    bool distillation = 5;
+    bool reasoning = 6;
+    bool system_prompt = 7;
+    bool logprobs = 8;
+    bool web_search = 9;
+    bool file_search = 10;
+    bool code_interpreter = 11;
+    bool computer_use = 12;
+    bool mcp = 13;
+    bool reasoning_effort = 14;
+    bool attachment = 15;
+}
+
+message CatalogModelTools {
+    bool web_search = 1;
+    bool file_search = 2;
+    bool image_generation = 3;
+    bool code_interpreter = 4;
+    bool computer_use = 5;
+    bool mcp = 6;
+    bool parallel_tool_calls = 7;
+}
+
+message CatalogModelParameters {
+    bool temperature = 1;
+    bool top_p = 2;
+    bool presence_penalty = 3;
+    bool frequency_penalty = 4;
+    bool logit_bias = 5;
+    bool seed = 6;
+    bool stop = 7;
+    int32 max_stop_sequences = 8;
+}

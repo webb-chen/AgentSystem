@@ -1,0 +1,28 @@
+# Workflows
+
+This directory contains the public CI workflows for the monorepo.
+
+Current checks:
+
+- Repository hygiene checks from `./scripts/check-open-source.sh --worktree`
+- Web TypeScript checks
+- Registration and invitation gate: focused Go regression tests, scoped frontend ESLint, and frontend type checking
+- Sandbox Go tests from `cd sandbox && go test ./...`
+- Sandbox Kest black-box flows from `make test-sandbox-kest`
+
+Release workflows:
+
+- `vercel-web-deploy.yml` deploys the `web/` Next.js app to Vercel from `deploy-dev`; Vercel performs the production build.
+- `sync-deploy-dev.yml` updates `deploy-dev` only when `dev` changes web deployment paths, or when manually dispatched.
+- Required repository secrets: `VERCEL_TOKEN`, `VERCEL_ORG_ID`, and `VERCEL_PROJECT_ID`.
+- `docker-release.yml` publishes `webb-chen/AgentSystem-api`, `webb-chen/AgentSystem-web`, `webb-chen/AgentSystem-sandbox`, and `webb-chen/AgentSystem-runner` to Docker Hub.
+- Required repository secrets: `DOCKERHUB_USERNAME` and `DOCKERHUB_TOKEN`.
+- Pushing a `v*` tag publishes `version`, `latest`, and `sha-xxxxxxx` tags.
+- Manual dispatch can publish `sha-xxxxxxx` only, or an explicit version with optional `latest`.
+
+Keep CI focused on checks that are stable for external contributors. Add heavier integration tests behind explicit jobs or service-specific workflows.
+
+The `Registration and invitation gate` check is intentionally independent from known
+repository-wide test and lint baseline failures. Configure branch protection to require
+this named check for changes that can reach `dev` or `main`; do not replace it with a
+manual review of the full-suite output.

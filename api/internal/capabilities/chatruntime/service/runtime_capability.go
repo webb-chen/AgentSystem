@@ -1,0 +1,263 @@
+package service
+
+import (
+	"sort"
+	"strings"
+
+	runtimemodel "github.com/webb-chen/AgentSystem/api/internal/capabilities/chatruntime/model"
+)
+
+// BoundResourceGrant captures the account and time that authorized a bound runtime resource.
+type BoundResourceGrant struct {
+	BoundByAccountID string
+	BoundAtUnix      int64
+	GrantEnabled     bool
+}
+
+// RuntimeCapabilityConfig groups runtime-managed capabilities derived from RunConfig.
+type RuntimeCapabilityConfig struct {
+	AgentID                          string
+	BindingAuthorizations            []ResourceBindingAuthorization
+	Knowledge                        RuntimeKnowledgeCapability
+	Database                         RuntimeDatabaseCapability
+	Workflow                         RuntimeWorkflowCapability
+	IntegrationConnectionIDs         map[string]string
+	IntegrationSelectedConnectionIDs map[string][]string
+	Memory                           RuntimeMemoryCapability
+}
+
+type RuntimeKnowledgeCapability struct {
+	DatasetIDs      []string
+	Grant           BoundResourceGrant
+	RetrievalConfig map[string]interface{}
+}
+
+type RuntimeDatabaseCapability struct {
+	Bindings []AgentDatabaseBinding
+	Grant    BoundResourceGrant
+}
+
+type RuntimeWorkflowCapability struct {
+	Bindings []AgentWorkflowBinding
+	Grant    BoundResourceGrant
+}
+
+type RuntimeMemoryCapability struct {
+	AgentEnabled bool
+	AgentSlots   []AgentMemorySlotConfig
+	UserScope    string
+}
+
+func runtimeCapabilityConfigFromRunConfig(config RunConfig) RuntimeCapabilityConfig {
+	return RuntimeCapabilityConfig{
+		AgentID:               strings.TrimSpace(config.BillingAppID),
+		BindingAuthorizations: copyResourceBindingAuthorizations(config.BindingAuthorizations),
+		Knowledge: RuntimeKnowledgeCapability{
+			DatasetIDs:      append([]string(nil), config.KnowledgeDatasetIDs...),
+			Grant:           NewBoundResourceGrant(config.KnowledgeBoundByAccountID, config.KnowledgeBoundAtUnix),
+			RetrievalConfig: copyStringAnyMap(config.KnowledgeRetrievalConfig),
+		},
+		Database: RuntimeDatabaseCapability{
+			Bindings: copyAgentDatabaseBindings(config.DatabaseBindings),
+			Grant:    NewBoundResourceGrant(config.DatabaseBoundByAccountID, config.DatabaseBoundAtUnix),
+		},
+		Workflow: RuntimeWorkflowCapability{
+			Bindings: copyAgentWorkflowBindings(config.WorkflowBindings),
+			Grant:    NewBoundResourceGrant(config.WorkflowBoundByAccountID, config.WorkflowBoundAtUnix),
+		},
+		IntegrationConnectionIDs:         copyIntegrationConnectionIDs(config.IntegrationConnectionIDs),
+		IntegrationSelectedConnectionIDs: copyIntegrationSelectedConnectionIDs(config.IntegrationSelectedConnectionIDs),
+		Memory: RuntimeMemoryCapability{
+			AgentEnabled: config.AgentMemoryEnabled,
+			AgentSlots:   enabledAgentMemorySlots(config.AgentMemorySlots),
+			UserScope:    strings.TrimSpace(config.AgentMemoryUserScope),
+		},
+	}
+}
+
+func (c RuntimeCapabilityConfig) RuntimeParameters(scope Scope, billingAppType string) map[string]interface{} {
+	params := map[string]interface{}{
+		"organization_id": scope.OrganizationID.String(),
+	}
+	if len(c.BindingAuthorizations) > 0 {
+		params["agent_binding_authorizations"] = copyResourceBindingAuthorizations(c.BindingAuthorizations)
+		for _, authorization := range c.BindingAuthorizations {
+			switch strings.TrimSpace(authorization.BindingType) {
+			case "knowledge_dataset":
+				params["knowledge_binding_grant"] = true
+			case "database", "database_table":
+				params["database_binding_grant"] = true
+			case "workflow":
+				params["workflow_binding_grant"] = true
+			}
+		}
+	}
+	if scope.WorkspaceID != nil {
+		params["workspace_id"] = scope.WorkspaceID.String()
+	}
+	c.Knowledge.applyRuntimeParameters(params)
+	c.Database.applyRuntimeParameters(params)
+	c.Workflow.applyRuntimeParameters(params)
+	if connectionIDs := copyIntegrationConnectionIDs(c.IntegrationConnectionIDs); len(connectionIDs) > 0 {
+		params["integration_connection_ids"] = connectionIDs
+	}
+	if selectedConnectionIDs := copyIntegrationSelectedConnectionIDs(c.IntegrationSelectedConnectionIDs); len(selectedConnectionIDs) > 0 {
+		params["integration_selected_connection_ids"] = selectedConnectionIDs
+	}
+	c.Memory.applyRuntimeParameters(params)
+	if strings.EqualFold(strings.TrimSpace(billingAppType), runtimemodel.ConversationCallerAgent) && strings.TrimSpace(c.AgentID) != "" {
+		params["agent_id"] = strings.TrimSpace(c.AgentID)
+	}
+	return params
+}
+
+func copyResourceBindingAuthorizations(input []ResourceBindingAuthorization) []ResourceBindingAuthorization {
+	result := make([]ResourceBindingAuthorization, 0, len(input))
+	for _, authorization := range input {
+		authorization.BindingType = strings.TrimSpace(authorization.BindingType)
+		authorization.ResourceID = strings.TrimSpace(authorization.ResourceID)
+		authorization.ParentResourceID = strings.TrimSpace(authorization.ParentResourceID)
+		authorization.AccessMode = strings.TrimSpace(authorization.AccessMode)
+		if strings.EqualFold(authorization.BindingType, "integration_connection") {
+			authorization.AllowedActionIDs = normalizeRuntimeStringIDs(authorization.AllowedActionIDs)
+		} else {
+			authorization.AllowedActionIDs = nil
+		}
+		authorization.BoundByAccountID = strings.TrimSpace(authorization.BoundByAccountID)
+		if authorization.BindingType == "" || authorization.ResourceID == "" || authorization.AccessMode == "" || authorization.BoundByAccountID == "" || authorization.BoundAtUnix <= 0 {
+			continue
+		}
+		result = append(result, authorization)
+	}
+	return result
+}
+
+func copyIntegrationConnectionIDs(input map[string]string) map[string]string {
+	if len(input) == 0 {
+		return nil
+	}
+	result := make(map[string]string, len(input))
+	for integrationID, connectionID := range input {
+		integrationID = strings.ToLower(strings.TrimSpace(integrationID))
+		connectionID = strings.ToLower(strings.TrimSpace(connectionID))
+		if integrationID == "" || connectionID == "" {
+			continue
+		}
+		result[integrationID] = connectionID
+	}
+	if len(result) == 0 {
+		return nil
+	}
+	return result
+}
+
+func copyIntegrationSelectedConnectionIDs(input map[string][]string) map[string][]string {
+	if len(input) == 0 {
+		return nil
+	}
+	result := make(map[string][]string, len(input))
+	for integrationID, connectionIDs := range input {
+		integrationID = strings.ToLower(strings.TrimSpace(integrationID))
+		connectionIDs = normalizeRuntimeStringIDs(connectionIDs)
+		if integrationID == "" || len(connectionIDs) == 0 {
+			continue
+		}
+		result[integrationID] = connectionIDs
+	}
+	if len(result) == 0 {
+		return nil
+	}
+	return result
+}
+
+func normalizeRuntimeStringIDs(input []string) []string {
+	seen := make(map[string]struct{}, len(input))
+	result := make([]string, 0, len(input))
+	for _, value := range input {
+		value = strings.ToLower(strings.TrimSpace(value))
+		if value == "" {
+			continue
+		}
+		if _, exists := seen[value]; exists {
+			continue
+		}
+		seen[value] = struct{}{}
+		result = append(result, value)
+	}
+	sort.Strings(result)
+	return result
+}
+
+func (c RuntimeKnowledgeCapability) applyRuntimeParameters(params map[string]interface{}) {
+	if len(c.DatasetIDs) > 0 {
+		params["knowledge_dataset_ids"] = append([]string(nil), c.DatasetIDs...)
+	}
+	c.Grant.applyRuntimeParameters(params, "knowledge")
+	if len(c.RetrievalConfig) > 0 {
+		params["knowledge_retrieval_config"] = copyStringAnyMap(c.RetrievalConfig)
+	}
+}
+
+func (c RuntimeDatabaseCapability) applyRuntimeParameters(params map[string]interface{}) {
+	if len(c.Bindings) > 0 {
+		params["database_bindings"] = copyAgentDatabaseBindings(c.Bindings)
+	}
+	c.Grant.applyRuntimeParameters(params, "database")
+}
+
+func (c RuntimeWorkflowCapability) applyRuntimeParameters(params map[string]interface{}) {
+	if len(c.Bindings) > 0 {
+		params["workflow_bindings"] = copyAgentWorkflowBindings(c.Bindings)
+	}
+	c.Grant.applyRuntimeParameters(params, "workflow")
+}
+
+func (c RuntimeMemoryCapability) applyRuntimeParameters(params map[string]interface{}) {
+	if !c.AgentEnabled {
+		return
+	}
+	params["agent_memory_enabled"] = true
+	params["agent_memory_slots"] = append([]AgentMemorySlotConfig(nil), c.AgentSlots...)
+	if c.UserScope != "" {
+		params["user_scope"] = c.UserScope
+	}
+}
+
+func (g BoundResourceGrant) applyRuntimeParameters(params map[string]interface{}, prefix string) {
+	if strings.TrimSpace(g.BoundByAccountID) != "" {
+		params[prefix+"_bound_by_account_id"] = strings.TrimSpace(g.BoundByAccountID)
+	}
+	if g.BoundAtUnix > 0 {
+		params[prefix+"_binding_grant"] = g.GrantEnabled
+		params[prefix+"_bound_at_unix"] = g.BoundAtUnix
+	}
+}
+
+// NewBoundResourceGrant normalizes persisted binding grant fields.
+func NewBoundResourceGrant(boundByAccountID string, boundAtUnix int64) BoundResourceGrant {
+	boundByAccountID = strings.TrimSpace(boundByAccountID)
+	return BoundResourceGrant{
+		BoundByAccountID: boundByAccountID,
+		BoundAtUnix:      boundAtUnix,
+		GrantEnabled:     boundByAccountID != "" && boundAtUnix > 0,
+	}
+}
+
+// ResolveBoundResourceGrant returns the grant to persist for a resource binding.
+func ResolveBoundResourceGrant(previous BoundResourceGrant, currentConfigured bool, unchanged bool, actorAccountID string, nowUnix int64) BoundResourceGrant {
+	if !currentConfigured {
+		return BoundResourceGrant{}
+	}
+	if unchanged && previous.GrantEnabled {
+		return previous
+	}
+	actorAccountID = strings.TrimSpace(actorAccountID)
+	if actorAccountID == "" {
+		return previous
+	}
+	return BoundResourceGrant{
+		BoundByAccountID: actorAccountID,
+		BoundAtUnix:      nowUnix,
+		GrantEnabled:     nowUnix > 0,
+	}
+}

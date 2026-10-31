@@ -1,0 +1,127 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
+
+usage() {
+  cat <<'EOF'
+Usage: ./dev/start-docker [--china] [--core] [--runtime] [--knowledge] [--full]
+
+Options:
+  --china      Use recommended China mainland mirrors for Docker builds.
+  --core       Start only nginx, api, web, Postgres, and Redis.
+  --runtime    Start sandbox and runner services.
+  --knowledge  Start Weaviate and Neo4j services.
+  --full       Start all optional services.
+EOF
+}
+
+core_only=false
+
+append_compose_profile() {
+  local profile="$1"
+  case ",${COMPOSE_PROFILES:-}," in
+    *,"$profile",*)
+      ;;
+    "")
+      export COMPOSE_PROFILES="$profile"
+      ;;
+    *)
+      if [ -z "${COMPOSE_PROFILES:-}" ]; then
+        export COMPOSE_PROFILES="$profile"
+      else
+        export COMPOSE_PROFILES="${COMPOSE_PROFILES},${profile}"
+      fi
+      ;;
+  esac
+}
+
+set_compose_profiles() {
+  export COMPOSE_PROFILES="$1"
+}
+
+configure_china_build_env() {
+  export BUILD_REGION=cn
+  export APT_MIRROR="${APT_MIRROR:-mirrors.aliyun.com}"
+  export APT_SECURITY_MIRROR="${APT_SECURITY_MIRROR:-mirrors.aliyun.com}"
+  export APK_MIRROR="${APK_MIRROR:-mirrors.aliyun.com}"
+  export NPM_REGISTRY="${NPM_REGISTRY:-https://registry.npmmirror.com}"
+  export PIP_INDEX_URL="${PIP_INDEX_URL:-https://pypi.tuna.tsinghua.edu.cn/simple}"
+  export UV_INDEX_URL="${UV_INDEX_URL:-https://pypi.tuna.tsinghua.edu.cn/simple}"
+  export GOPROXY="${GOPROXY:-https://goproxy.cn,direct}"
+  echo "[start-docker] build region: china"
+}
+
+enable_runtime_profile() {
+  append_compose_profile runtime
+  export CODE_EXECUTION_ENDPOINT="${CODE_EXECUTION_ENDPOINT:-http://mingyingkeji-sandbox:2660}"
+  export PLUGIN_RUNNER_ENABLED="${PLUGIN_RUNNER_ENABLED:-true}"
+  export PLUGIN_RUNNER_URL="${PLUGIN_RUNNER_URL:-http://runner:2665}"
+  echo "[start-docker] enable runtime profile"
+}
+
+enable_knowledge_profile() {
+  append_compose_profile knowledge
+  export VECTOR_STORE="${VECTOR_STORE:-weaviate}"
+  export WEAVIATE_ENDPOINT="${WEAVIATE_ENDPOINT:-http://weaviate:8080}"
+  export NEO4J_URI="${NEO4J_URI:-bolt://neo4j:7687}"
+  echo "[start-docker] enable knowledge profile"
+}
+
+enable_core_stack() {
+  core_only=true
+  set_compose_profiles ""
+  export VECTOR_STORE=mock
+  export WEAVIATE_ENDPOINT=
+  export NEO4J_URI=
+  export CODE_EXECUTION_ENDPOINT=
+  export PLUGIN_RUNNER_ENABLED=false
+  echo "[start-docker] enable core stack"
+}
+
+enable_full_stack() {
+  enable_runtime_profile
+  enable_knowledge_profile
+}
+
+while [ "$#" -gt 0 ]; do
+  case "$1" in
+    --china)
+      configure_china_build_env
+      ;;
+    --core)
+      enable_core_stack
+      ;;
+    --runtime)
+      enable_runtime_profile
+      ;;
+    --knowledge)
+      enable_knowledge_profile
+      ;;
+    --full)
+      enable_full_stack
+      ;;
+    -h|--help)
+      usage
+      exit 0
+      ;;
+    *)
+      echo "[start-docker] unknown argument: $1" >&2
+      usage >&2
+      exit 1
+      ;;
+  esac
+  shift
+done
+
+if [ "$core_only" = false ] && [ -z "${COMPOSE_PROFILES:-}" ]; then
+  enable_full_stack
+fi
+
+echo "[start-docker] bootstrap repository"
+"$ROOT/dev/bootstrap"
+
+cd "$ROOT/docker"
+
+docker compose --env-file .env up -d --build

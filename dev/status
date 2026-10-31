@@ -1,0 +1,24 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
+
+echo "[root]"
+git -C "$ROOT" status --short --branch
+
+echo
+echo "[api]"
+git -C "$ROOT/api" status --short --branch || true
+
+echo
+echo "[web]"
+git -C "$ROOT/web" status --short --branch || true
+
+echo
+echo "[sandbox]"
+git -C "$ROOT/sandbox" status --short --branch || true
+
+echo
+echo "[runner]"
+git -C "$ROOT/runner" status --short --branch || true

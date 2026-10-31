@@ -1,0 +1,231 @@
+package service
+
+import (
+	"context"
+	"encoding/json"
+	"errors"
+	"strings"
+	"testing"
+	"time"
+
+	"github.com/stretchr/testify/require"
+	"github.com/webb-chen/AgentSystem/api/config"
+	"github.com/webb-chen/AgentSystem/api/internal/modules/llm/apikey/dto"
+	"github.com/webb-chen/AgentSystem/api/internal/modules/llm/apikey/model"
+	"github.com/webb-chen/AgentSystem/api/internal/modules/llm/apikey/repository"
+	"gorm.io/driver/sqlite"
+	"gorm.io/gorm"
+)
+
+func TestAPIKeyResponsesOnlyExposeFullKeyOnCreate(t *testing.T) {
+	svc, _ := newAPIKeyRedactionTestService(t)
+	ctx := context.Background()
+	organizationID := "11111111-1111-1111-1111-111111111111"
+
+	created, err := svc.CreateAPIKey(ctx, &dto.CreateAPIKeyRequest{
+		OrganizationID: &organizationID,
+		Name:           "production",
+		Count:          1,
+		QuotaType:      dto.QuotaTypeUnlimited,
+	})
+	require.NoError(t, err)
+	require.Len(t, created.Keys, 1)
+
+	fullKey := created.Keys[0].Key
+	require.NotEmpty(t, fullKey)
+	require.True(t, strings.HasPrefix(fullKey, "sk-"))
+	require.NotEmpty(t, created.Keys[0].KeyMasked)
+
+	keyID := created.Keys[0].ID
+	organizationIDs := []string{organizationID}
+
+	detail, err := svc.GetAPIKey(ctx, keyID, organizationIDs)
+	require.NoError(t, err)
+	requireRedactedAPIKeyResponse(t, detail, fullKey)
+
+	list, err := svc.ListAPIKeys(ctx, &dto.ListAPIKeyRequest{
+		OrganizationIDs: organizationIDs,
+		Page:            1,
+		Limit:           20,
+	})
+	require.NoError(t, err)
+	require.Len(t, list.Items, 1)
+	requireRedactedAPIKeyResponse(t, &list.Items[0], fullKey)
+
+	updatedName := "renamed"
+	updated, err := svc.UpdateAPIKey(ctx, keyID, organizationIDs, &dto.UpdateAPIKeyRequest{
+		Name: &updatedName,
+	})
+	require.NoError(t, err)
+	require.Equal(t, updatedName, updated.Name)
+	requireRedactedAPIKeyResponse(t, updated, fullKey)
+}
+
+func TestUpdateAPIKeyCanClearQuotaLimitAndExpiration(t *testing.T) {
+	svc, _ := newAPIKeyRedactionTestService(t)
+	ctx := context.Background()
+	organizationID := "11111111-1111-1111-1111-111111111111"
+	quotaAmount := int64(100)
+	expiresAt := time.Now().Add(time.Hour)
+
+	created, err := svc.CreateAPIKey(ctx, &dto.CreateAPIKeyRequest{
+		OrganizationID: &organizationID,
+		Name:           "limited",
+		Count:          1,
+		QuotaType:      dto.QuotaTypeCustom,
+		QuotaAmount:    &quotaAmount,
+		ExpiresAt:      &expiresAt,
+	})
+	require.NoError(t, err)
+	require.NotNil(t, created.Keys[0].QuotaLimit)
+	require.NotNil(t, created.Keys[0].ExpiresAt)
+
+	updated, err := svc.UpdateAPIKey(ctx, created.Keys[0].ID, []string{organizationID}, &dto.UpdateAPIKeyRequest{
+		ClearQuotaLimit: true,
+		ClearExpiresAt:  true,
+	})
+	require.NoError(t, err)
+	require.Nil(t, updated.QuotaLimit)
+	require.Nil(t, updated.ExpiresAt)
+	require.Zero(t, updated.RemainQuota)
+}
+
+func TestCreateAPIKeyCountBounds(t *testing.T) {
+	tests := []struct {
+		name      string
+		count     int
+		wantCount int
+		wantError bool
+	}{
+		{name: "default count", count: 0, wantCount: 1},
+		{name: "maximum count", count: 20, wantCount: 20},
+		{name: "above maximum", count: 21, wantError: true},
+		{name: "negative count", count: -1, wantError: true},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			svc, db := newAPIKeyRedactionTestService(t)
+			organizationID := "11111111-1111-1111-1111-111111111111"
+
+			created, err := svc.CreateAPIKey(context.Background(), &dto.CreateAPIKeyRequest{
+				OrganizationID: &organizationID,
+				Name:           "batch",
+				Count:          tt.count,
+				QuotaType:      dto.QuotaTypeUnlimited,
+			})
+
+			if tt.wantError {
+				require.Error(t, err)
+				var count int64
+				require.NoError(t, db.Model(&model.TenantAPIKey{}).Count(&count).Error)
+				require.Zero(t, count)
+				return
+			}
+
+			require.NoError(t, err)
+			require.Len(t, created.Keys, tt.wantCount)
+		})
+	}
+}
+
+func TestCreateAPIKeyRollsBackBatchWhenAnInsertFails(t *testing.T) {
+	svc, db := newAPIKeyRedactionTestService(t)
+	organizationID := "11111111-1111-1111-1111-111111111111"
+	createAttempts := 0
+	require.NoError(t, db.Callback().Create().Before("gorm:create").Register(
+		"test:fail_second_api_key_create",
+		func(tx *gorm.DB) {
+			if tx.Statement == nil || tx.Statement.Schema == nil || tx.Statement.Schema.Table != (model.TenantAPIKey{}).TableName() {
+				return
+			}
+			createAttempts++
+			if createAttempts == 2 {
+				tx.AddError(errors.New("forced second insert failure"))
+			}
+		},
+	))
+
+	_, err := svc.CreateAPIKey(context.Background(), &dto.CreateAPIKeyRequest{
+		OrganizationID: &organizationID,
+		Name:           "batch",
+		Count:          2,
+		QuotaType:      dto.QuotaTypeUnlimited,
+	})
+
+	require.ErrorContains(t, err, "forced second insert failure")
+	var count int64
+	require.NoError(t, db.Model(&model.TenantAPIKey{}).Count(&count).Error)
+	require.Zero(t, count)
+}
+
+func TestLegacyAPIKeyCRUDExcludesPersonalKeys(t *testing.T) {
+	svc, db := newAPIKeyRedactionTestService(t)
+	organizationID := "11111111-1111-1111-1111-111111111111"
+	workspaceID := "22222222-2222-2222-2222-222222222222"
+	principalID := "33333333-3333-3333-3333-333333333333"
+	principalType := "user"
+	personal := &model.TenantAPIKey{
+		OrganizationID: organizationID,
+		WorkspaceID:    &workspaceID,
+		PrincipalType:  &principalType,
+		PrincipalID:    &principalID,
+		KeyHash:        "personal-hash",
+		Name:           "personal",
+		Status:         "revoked",
+	}
+	require.NoError(t, db.Omit("Key").Create(personal).Error)
+
+	list, err := svc.ListAPIKeys(context.Background(), &dto.ListAPIKeyRequest{
+		OrganizationIDs: []string{organizationID}, Page: 1, Limit: 20,
+	})
+	require.NoError(t, err)
+	require.Empty(t, list.Items)
+
+	_, err = svc.GetAPIKey(context.Background(), personal.ID, []string{organizationID})
+	require.Error(t, err)
+	status := "active"
+	_, err = svc.UpdateAPIKey(context.Background(), personal.ID, []string{organizationID}, &dto.UpdateAPIKeyRequest{Status: &status})
+	require.Error(t, err)
+	_, err = svc.DeleteAPIKey(context.Background(), personal.ID, []string{organizationID})
+	require.Error(t, err)
+
+	var stored model.TenantAPIKey
+	require.NoError(t, db.First(&stored, "id = ?", personal.ID).Error)
+	require.Equal(t, "revoked", stored.Status)
+}
+
+func requireRedactedAPIKeyResponse(t *testing.T, response *dto.APIKeyResponse, fullKey string) {
+	t.Helper()
+
+	require.Empty(t, response.Key)
+	require.NotEmpty(t, response.KeyMasked)
+	require.NotEqual(t, fullKey, response.KeyMasked)
+
+	payload, err := json.Marshal(response)
+	require.NoError(t, err)
+	require.NotContains(t, string(payload), `"key":`)
+	require.NotContains(t, string(payload), fullKey)
+	require.Contains(t, string(payload), `"key_masked":`)
+}
+
+func newAPIKeyRedactionTestService(t *testing.T) (APIKeyService, *gorm.DB) {
+	t.Helper()
+
+	oldConfig := config.GlobalConfig
+	config.GlobalConfig = &config.Config{
+		Encryption: config.EncryptionConfig{
+			APIKeyEncryptionKey: "12345678901234567890123456789012",
+		},
+	}
+	t.Cleanup(func() {
+		config.GlobalConfig = oldConfig
+	})
+
+	db, err := gorm.Open(sqlite.Open(":memory:"), &gorm.Config{})
+	require.NoError(t, err)
+	require.NoError(t, db.AutoMigrate(&model.TenantAPIKey{}))
+
+	repo := repository.NewAPIKeyRepository(db)
+	return NewAPIKeyService(db, repo, nil, nil), db
+}

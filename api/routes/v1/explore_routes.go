@@ -1,0 +1,15 @@
+package v1
+
+import (
+	"github.com/gin-gonic/gin"
+	"github.com/webb-chen/AgentSystem/api/internal/modules/explore/handler"
+	"github.com/webb-chen/AgentSystem/api/internal/modules/explore/service"
+	interfaces "github.com/webb-chen/AgentSystem/api/internal/modules/shared/interface"
+)
+
+// RegisterExploreRoutes registers explore-related routes
+func RegisterExploreRoutes(router *gin.RouterGroup, accountService interfaces.AccountService) {
+	recommendedAppService := service.NewRecommendedAppService()
+	recommendedAppHandler := handler.NewRecommendedAppHandler(recommendedAppService, accountService)
+	recommendedAppHandler.RegisterRoutes(router)
+}

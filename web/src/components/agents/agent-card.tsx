@@ -1,0 +1,419 @@
+'use client';
+
+import React, { memo } from 'react';
+import Link from 'next/link';
+import { Card, CardContent } from '@/components/ui/card';
+import {
+  DropdownMenu,
+  DropdownMenuTrigger,
+  DropdownMenuContent,
+  DropdownMenuItem,
+} from '@/components/ui/dropdown-menu';
+import { ConfirmDialog } from '@/components/ui/confirm-dialog';
+import { DestructiveNameConfirmDialog } from '@/components/ui/destructive-name-confirm-dialog';
+
+import {
+  Workflow,
+  MoreHorizontal,
+  Trash2,
+  Edit,
+  Download,
+  MessageSquareText,
+  MoveRight,
+  Bot,
+} from 'lucide-react';
+import { useT } from '@/i18n';
+import { useDeleteAgent } from '@/hooks/agent/use-agents';
+import { AgentType, type Agent } from '@/services/types/agent';
+import { useState } from 'react';
+import { IconPreview } from '../common/icon-input/icon-preview';
+import AgentDialog from './agent-dialog';
+import { Badge } from '../ui/badge';
+import { useQueryClient } from '@tanstack/react-query';
+import { agentService } from '@/services';
+import { useExportWorkflow } from '@/hooks/workflow/use-workflow-import-export';
+import { ICON_BG, ICON_TEXT } from '@/lib/config';
+import { WorkspaceAssetMoveDialog } from '@/components/common/workspace-asset-move-dialog';
+import {
+  getAgentDetailBaseHref,
+  getAgentDetailDefaultHref,
+  isAgentRuntimeType,
+  isWorkflowRuntimeType,
+} from '@/utils/agent-detail-routes';
+import { AGENT_PERMISSION_ACTIONS, WORKFLOW_PERMISSION_ACTIONS } from '@/constants/permissions';
+import { useAccountPermissions } from '@/hooks/organization/use-account-permissions';
+import { AgentResourceBoundDialog } from '@/components/common/agent-resource-bound-dialog';
+import type { AgentResourceBoundImpact } from '@/services/types/common';
+import { getAgentResourceBoundImpact } from '@/utils/agent-resource-bound';
+import { toast } from 'sonner';
+
+interface AgentCardProps {
+  agent: Agent;
+  /** The page index where this agent resides in the paged list */
+  pageIndex: number;
+  /** Callback before navigating from the list into the agent detail page. */
+  onNavigate?: () => void;
+  /** Callback when agent is deleted; provides id and page index for incremental refetch */
+  onDeleted?: (id: string, pageIndex: number) => void;
+}
+
+function AgentCard({ agent, onDeleted, onNavigate, pageIndex }: AgentCardProps) {
+  const t = useT('agents');
+  const tCommon = useT('common');
+  const deleteMutation = useDeleteAgent();
+  const [confirmOpen, setConfirmOpen] = useState(false);
+  const [exportConfirmOpen, setExportConfirmOpen] = useState(false);
+  const [editOpen, setEditOpen] = useState(false);
+  const [moveOpen, setMoveOpen] = useState(false);
+  const [bindingImpact, setBindingImpact] = useState<AgentResourceBoundImpact | null>(null);
+  const [pendingDeleteImpact, setPendingDeleteImpact] = useState<AgentResourceBoundImpact | null>(
+    null
+  );
+  const [isCheckingDeleteImpact, setIsCheckingDeleteImpact] = useState(false);
+  const queryClient = useQueryClient();
+  const { exportWorkflow, isExporting } = useExportWorkflow();
+
+  // Permissions
+  const { hasAnyPermission } = useAccountPermissions();
+  const isAgentRuntime = isAgentRuntimeType(agent.agent_type);
+  const isWorkflowRuntime = isWorkflowRuntimeType(agent.agent_type);
+  const updatePermissionCodes = isWorkflowRuntime
+    ? WORKFLOW_PERMISSION_ACTIONS.update
+    : isAgentRuntime
+      ? AGENT_PERMISSION_ACTIONS.update
+      : [];
+  const exportPermissionCodes = isWorkflowRuntime ? WORKFLOW_PERMISSION_ACTIONS.export : [];
+  const deletePermissionCodes = isWorkflowRuntime
+    ? WORKFLOW_PERMISSION_ACTIONS.delete
+    : isAgentRuntime
+      ? AGENT_PERMISSION_ACTIONS.delete
+      : [];
+  const movePermissionCodes = isWorkflowRuntime
+    ? WORKFLOW_PERMISSION_ACTIONS.move
+    : isAgentRuntime
+      ? AGENT_PERMISSION_ACTIONS.move
+      : [];
+  const canCreateAgent = hasAnyPermission(AGENT_PERMISSION_ACTIONS.create);
+  const canImportAgent = hasAnyPermission(AGENT_PERMISSION_ACTIONS.import);
+  const canUpdateRuntime = hasAnyPermission(updatePermissionCodes);
+  const canExportRuntime = hasAnyPermission(exportPermissionCodes);
+  const canDeleteRuntime = hasAnyPermission(deletePermissionCodes);
+  const canMoveAssets = hasAnyPermission(movePermissionCodes);
+  const canConfigureAgentRuntime = hasAnyPermission(AGENT_PERMISSION_ACTIONS.runtimeConfigManage);
+  const canPublishAgent = hasAnyPermission(AGENT_PERMISSION_ACTIONS.publish);
+  const canManageAgentRuntimeAccess = hasAnyPermission(
+    AGENT_PERMISSION_ACTIONS.runtimeAccessManage
+  );
+  const canViewAgentLogs = hasAnyPermission(AGENT_PERMISSION_ACTIONS.logsView);
+  const canCreateWorkflow = hasAnyPermission(WORKFLOW_PERMISSION_ACTIONS.create);
+  const canImportWorkflow = hasAnyPermission(WORKFLOW_PERMISSION_ACTIONS.import);
+  const canRunWorkflowDraft = hasAnyPermission(WORKFLOW_PERMISSION_ACTIONS.runDraft);
+  const canPublishWorkflow = hasAnyPermission(WORKFLOW_PERMISSION_ACTIONS.publish);
+  const canConfigureWorkflowRuntime = hasAnyPermission(
+    WORKFLOW_PERMISSION_ACTIONS.runtimeConfigManage
+  );
+  const canManageWorkflowRuntimeAccess = hasAnyPermission(
+    WORKFLOW_PERMISSION_ACTIONS.runtimeAccessManage
+  );
+  const canViewWorkflowLogs = hasAnyPermission(WORKFLOW_PERMISSION_ACTIONS.logsView);
+  const canViewWorkflowTestLibrary = hasAnyPermission(WORKFLOW_PERMISSION_ACTIONS.view);
+  const canShowActions = canUpdateRuntime || canExportRuntime || canDeleteRuntime || canMoveAssets;
+  const shouldPrefetchAgentDetail = canUpdateRuntime || canExportRuntime || canDeleteRuntime;
+  const canOpenAgentRuntimeEditor =
+    isAgentRuntime &&
+    (canCreateAgent ||
+      canImportAgent ||
+      canUpdateRuntime ||
+      canConfigureAgentRuntime ||
+      canPublishAgent ||
+      canManageAgentRuntimeAccess);
+  const canOpenWorkflowEditor =
+    isWorkflowRuntime &&
+    (canCreateWorkflow ||
+      canImportWorkflow ||
+      canUpdateRuntime ||
+      canRunWorkflowDraft ||
+      canPublishWorkflow ||
+      canConfigureWorkflowRuntime ||
+      canManageWorkflowRuntimeAccess);
+  const defaultAgentDetailHref = getAgentDetailDefaultHref(agent.id, agent.agent_type, {
+    canView: true,
+    canOpenEditor: isAgentRuntime ? canOpenAgentRuntimeEditor : canOpenWorkflowEditor,
+    canManageRuntimeAccess: isWorkflowRuntime && canManageWorkflowRuntimeAccess,
+    canViewRuntimeLogs: isAgentRuntime ? canViewAgentLogs : canViewWorkflowLogs,
+    canViewBatchTest: isWorkflowRuntime && (canViewWorkflowTestLibrary || canViewWorkflowLogs),
+    canRunBatchTest: isWorkflowRuntime && canRunWorkflowDraft,
+    isPublished: agent.is_published,
+    preferBatchTestLibrary: canViewWorkflowTestLibrary,
+  });
+  const canOpenAgentDetail = Boolean(defaultAgentDetailHref);
+  const agentHref = defaultAgentDetailHref ?? getAgentDetailBaseHref(agent.id, agent.agent_type);
+  const modeText =
+    agent.agent_type === AgentType.AGENT
+      ? t('modes.agent')
+      : agent.agent_type === AgentType.WORKFLOW
+        ? t('modes.workflow')
+        : t('modes.conversational');
+  const ModeIcon =
+    agent.agent_type === AgentType.AGENT
+      ? Bot
+      : agent.agent_type === AgentType.WORKFLOW
+        ? Workflow
+        : MessageSquareText;
+  const isWebAppOffline = agent.is_published && agent.web_app_status === 'inactive';
+  const isPublishedOnline = agent.is_published && agent.web_app_status === 'active';
+  const statusText = isWebAppOffline
+    ? t('status.webappOffline')
+    : isPublishedOnline
+      ? t('status.published')
+      : t('status.draft');
+  const statusClassName = isWebAppOffline
+    ? 'bg-destructive/10 text-destructive font-normal border-destructive/40'
+    : isPublishedOnline
+      ? 'bg-success/10 text-success font-normal border-success'
+      : 'bg-muted text-muted-foreground font-normal';
+
+  const deleteRuntime = async (impact?: AgentResourceBoundImpact) => {
+    if (!canDeleteRuntime) return;
+    try {
+      await deleteMutation.mutateAsync({
+        agentId: agent.id,
+        confirmation: impact
+          ? { agent_binding_action: 'unbind', impact_token: impact.impact_token }
+          : undefined,
+      });
+      setConfirmOpen(false);
+      setBindingImpact(null);
+      setPendingDeleteImpact(null);
+      onDeleted?.(agent.id, pageIndex);
+    } catch (error) {
+      const nextImpact = getAgentResourceBoundImpact(error);
+      if (!nextImpact) return;
+      setConfirmOpen(false);
+      setPendingDeleteImpact(null);
+      setBindingImpact(nextImpact);
+    }
+  };
+
+  const requestDeleteRuntime = async () => {
+    if (!canDeleteRuntime || isCheckingDeleteImpact) return;
+    setPendingDeleteImpact(null);
+    setIsCheckingDeleteImpact(true);
+    try {
+      const response = await agentService.previewAgentDeleteImpact(agent.id);
+      if (response.data) {
+        setPendingDeleteImpact(response.data);
+      }
+      setConfirmOpen(true);
+    } catch {
+      toast.error(tCommon('agentResourceBound.previewFailed'));
+    } finally {
+      setIsCheckingDeleteImpact(false);
+    }
+  };
+
+  const confirmDeleteRuntime = () => {
+    if (pendingDeleteImpact) {
+      setConfirmOpen(false);
+      setBindingImpact(pendingDeleteImpact);
+      setPendingDeleteImpact(null);
+      return;
+    }
+    void deleteRuntime();
+  };
+
+  const cardContent = (
+    <Card className="flex h-full shrink-0 flex-col border border-border/80 shadow-sm transition-colors hover:border-border hover:bg-muted/20 hover:shadow-sm">
+      <CardContent className="flex h-full min-w-0 flex-1 flex-col p-4">
+        <div className="flex items-start justify-between gap-3">
+          <div className="flex h-10 w-10 shrink-0 items-center justify-center">
+            <IconPreview
+              icon={
+                (() => {
+                  try {
+                    const iconData = JSON.parse(agent.icon || '{}');
+                    return iconData?.icon || '';
+                  } catch (_e) {
+                    return agent.name.slice(0, 2).toUpperCase() || ICON_TEXT;
+                  }
+                })() ||
+                agent.name.slice(0, 2).toUpperCase() ||
+                ICON_TEXT
+              }
+              iconType={agent.icon_type}
+              src={agent.icon_type === 'image' ? agent.icon_url || '' : ''}
+              iconBackground={
+                agent.icon_type === 'image'
+                  ? ''
+                  : (() => {
+                      try {
+                        const iconData = JSON.parse(agent.icon || '{}');
+                        return iconData?.icon_background || ICON_BG;
+                      } catch (_e) {
+                        return '';
+                      }
+                    })()
+              }
+              editable={false}
+              size="sm"
+            />
+          </div>
+          <div className="shrink-0">
+            <Badge variant="outline" className={`text-[11px] ${statusClassName}`}>
+              {statusText}
+            </Badge>
+          </div>
+        </div>
+        <h3
+          className="mt-3 line-clamp-2 min-h-10 break-all text-sm font-semibold leading-5 text-foreground"
+          title={agent.name}
+        >
+          {agent.name || t('noName')}
+        </h3>
+        <p className="mt-3 line-clamp-2 min-h-10 text-xs leading-5 text-muted-foreground">
+          {agent.description || t('noDescription')}
+        </p>
+        <div className="mt-auto flex items-center gap-2 pr-8 text-xs text-muted-foreground">
+          <ModeIcon className="h-4 w-4 shrink-0" />
+          <span className="truncate">{modeText}</span>
+        </div>
+      </CardContent>
+    </Card>
+  );
+
+  return (
+    <div className="relative h-48">
+      {canOpenAgentDetail ? (
+        <Link href={agentHref} className="block h-full" onClick={onNavigate}>
+          {cardContent}
+        </Link>
+      ) : (
+        <div className="h-full">{cardContent}</div>
+      )}
+      {/* Show only actions backed by the corresponding permission. */}
+      {canShowActions && (
+        <div className="absolute bottom-2 right-2">
+          <DropdownMenu
+            onOpenChange={open => {
+              if (open && shouldPrefetchAgentDetail) {
+                // Prefetch agent detail when actions menu opens
+                queryClient.prefetchQuery({
+                  queryKey: ['agents', 'detail', agent.id],
+                  queryFn: () => agentService.getAgent(agent.id),
+                  staleTime: 5 * 60 * 1000,
+                  gcTime: 10 * 60 * 1000,
+                });
+              }
+            }}
+          >
+            <DropdownMenuTrigger asChild>
+              <button className="rounded-md p-1 text-muted-foreground hover:bg-muted hover:text-foreground">
+                <MoreHorizontal className="h-4 w-4" />
+              </button>
+            </DropdownMenuTrigger>
+            <DropdownMenuContent align="end">
+              {canUpdateRuntime && (
+                <DropdownMenuItem inset onSelect={() => setEditOpen(true)}>
+                  <Edit className="h-4 w-4" />
+                  {t('actions.edit')}
+                </DropdownMenuItem>
+              )}
+              {canExportRuntime && (
+                <DropdownMenuItem
+                  inset
+                  disabled={isExporting}
+                  onSelect={() => setExportConfirmOpen(true)}
+                >
+                  <Download className="h-4 w-4" />
+                  {t('actions.exportYaml')}
+                </DropdownMenuItem>
+              )}
+              {canMoveAssets && (
+                <DropdownMenuItem inset onSelect={() => setMoveOpen(true)}>
+                  <MoveRight className="h-4 w-4" />
+                  {tCommon('assetMove.title')}
+                </DropdownMenuItem>
+              )}
+              {canDeleteRuntime && (
+                <DropdownMenuItem
+                  variant="destructive"
+                  inset
+                  disabled={isCheckingDeleteImpact}
+                  onSelect={() => void requestDeleteRuntime()}
+                >
+                  <Trash2 className="h-4 w-4" />
+                  {t('actions.delete')}
+                </DropdownMenuItem>
+              )}
+            </DropdownMenuContent>
+          </DropdownMenu>
+        </div>
+      )}
+      {/* Unified create/edit dialog in edit mode */}
+      <AgentDialog open={editOpen} mode="edit" agentId={agent.id} onOpenChange={setEditOpen} />
+      <WorkspaceAssetMoveDialog
+        open={moveOpen}
+        onOpenChange={setMoveOpen}
+        assetType="agent"
+        assetId={agent.id}
+        assetName={agent.name}
+      />
+      <ConfirmDialog
+        open={exportConfirmOpen}
+        onOpenChange={setExportConfirmOpen}
+        title={t('exportConfirmTitle', { name: agent.name })}
+        description={t('exportConfirmDescription')}
+        confirmText={t('actions.exportYaml')}
+        cancelText={tCommon('close')}
+        onConfirm={() => {
+          if (!canExportRuntime) return;
+          void exportWorkflow({
+            agentId: agent.id,
+            version: agent.is_published ? 'published' : 'draft',
+          });
+          setExportConfirmOpen(false);
+        }}
+        loading={isExporting}
+      />
+      {/* Delete confirmation dialog outside dropdown */}
+      <DestructiveNameConfirmDialog
+        open={confirmOpen}
+        onOpenChange={open => {
+          setConfirmOpen(open);
+          if (!open) setPendingDeleteImpact(null);
+        }}
+        title={t(isWorkflowRuntime ? 'deleteWorkflowConfirmTitle' : 'deleteConfirmTitle', {
+          name: agent.name,
+        })}
+        description={t(
+          isWorkflowRuntime ? 'deleteWorkflowConfirmDescription' : 'deleteConfirmDescription'
+        )}
+        itemName={agent.name}
+        itemNameLabel={tCommon('confirmDialog.itemNameLabel')}
+        confirmationLabel={tCommon('confirmDialog.typeNameLabel')}
+        confirmationPlaceholder={tCommon('confirmDialog.typeNamePlaceholder')}
+        confirmationTooltipText={tCommon('confirmDialog.typeNameTooltip')}
+        confirmText={tCommon('delete')}
+        confirmingText={tCommon('statusLabels.deleting')}
+        cancelText={tCommon('cancel')}
+        onConfirm={confirmDeleteRuntime}
+        loading={deleteMutation.isPending}
+      />
+      <AgentResourceBoundDialog
+        open={Boolean(bindingImpact)}
+        impact={bindingImpact}
+        loading={deleteMutation.isPending}
+        onOpenChange={open => {
+          if (!open) setBindingImpact(null);
+        }}
+        onConfirm={() => {
+          if (bindingImpact) void deleteRuntime(bindingImpact);
+        }}
+      />
+    </div>
+  );
+}
+
+AgentCard.displayName = 'AgentCard';
+
+export default memo(AgentCard);

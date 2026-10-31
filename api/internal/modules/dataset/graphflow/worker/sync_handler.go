@@ -1,0 +1,566 @@
+package worker
+
+import (
+	"context"
+	"encoding/json"
+	"fmt"
+	"time"
+
+	"github.com/google/uuid"
+	"github.com/hibiken/asynq"
+	"github.com/webb-chen/AgentSystem/api/internal/modules/dataset/graphflow"
+	"github.com/webb-chen/AgentSystem/api/internal/modules/dataset/graphflow/model"
+	datasetmodel "github.com/webb-chen/AgentSystem/api/internal/modules/dataset/model"
+	"github.com/webb-chen/AgentSystem/api/pkg/lock"
+	"github.com/webb-chen/AgentSystem/api/pkg/logger"
+	"github.com/webb-chen/AgentSystem/api/pkg/queue"
+	"github.com/webb-chen/AgentSystem/api/pkg/ratelimit"
+	pkgredis "github.com/webb-chen/AgentSystem/api/pkg/redis"
+)
+
+// NewSyncHandler creates a handler for Neo4j sync tasks
+func NewSyncHandler(svc *graphflow.Service, taskManager *queue.TaskManager, limiter *ratelimit.KBLimiter) func(context.Context, *asynq.Task) error {
+	return func(ctx context.Context, t *asynq.Task) error {
+		// Parse payload
+		var payload GraphFlowTaskPayload
+		if err := json.Unmarshal(t.Payload(), &payload); err != nil {
+			return fmt.Errorf("json.Unmarshal failed: %v: %w", err, asynq.SkipRetry)
+		}
+
+		taskID, err := uuid.Parse(payload.TaskID)
+		if err != nil {
+			return fmt.Errorf("failed to parse task_id: %v: %w", err, asynq.SkipRetry)
+		}
+
+		// Panic recovery
+		defer func() {
+			if r := recover(); r != nil {
+				err := fmt.Errorf("sync worker panicked: %v", r)
+				logger.Error("Sync panic recovery", err)
+				svc.TaskRepo.UpdateTaskFailed(ctx, taskID, err.Error())
+				panic(r)
+			}
+		}()
+
+		logger.Info("Starting GraphFlow Neo4j sync", map[string]interface{}{
+			"task_id": taskID.String(),
+		})
+
+		// 1. Get the GraphFlow task from DB
+		graphFlowTask, err := svc.TaskRepo.GetByID(ctx, taskID)
+		if err != nil {
+			svc.TaskRepo.UpdateTaskFailed(ctx, taskID, fmt.Sprintf("failed to get graphflow task: %v", err))
+			return fmt.Errorf("failed to get graphflow task: %v: %w", err, asynq.SkipRetry)
+		}
+		if graphFlowTask == nil {
+			svc.TaskRepo.UpdateTaskFailed(ctx, taskID, fmt.Sprintf("graphflow task not found: %s", taskID))
+			return fmt.Errorf("graphflow task not found: %s: %w", taskID, asynq.SkipRetry)
+		}
+
+		// Check for idempotency - skip if already completed or failed
+		if graphFlowTask.Status == "completed" || graphFlowTask.Status == "failed" {
+			logger.Info("Task already processed, skipping", map[string]interface{}{
+				"task_id": taskID.String(),
+				"status":  graphFlowTask.Status,
+			})
+			return nil
+		}
+		if err := validateActiveRunTask(ctx, svc, graphFlowTask); err != nil {
+			return fmt.Errorf("graph sync task belongs to an inactive run: %v: %w", err, asynq.SkipRetry)
+		}
+
+		// 2. Update task status to processing
+		if err := svc.TaskRepo.UpdateTaskProcessing(ctx, taskID); err != nil {
+			logger.Error("Failed to update task status to processing", err)
+		}
+		lastReportedProgress := 0
+		reportProgress := func(progress int) {
+			if progress <= lastReportedProgress || progress >= 100 {
+				return
+			}
+			if err := svc.TaskRepo.UpdateTaskProgress(ctx, taskID, progress); err != nil {
+				logger.Warn("Failed to update graph sync progress", map[string]interface{}{
+					"task_id":  taskID.String(),
+					"progress": progress,
+					"error":    err.Error(),
+				})
+				return
+			}
+			lastReportedProgress = progress
+		}
+		reportProgress(1)
+
+		// Apply Rate Limiting
+		kbID := graphFlowTask.KBID
+		kbIDStr := kbID.String()
+		if allowed, err := limiter.Allow(ctx, kbIDStr); err != nil {
+			svc.TaskRepo.UpdateTaskFailed(ctx, taskID, fmt.Sprintf("rate limit check failed: %v", err))
+			return fmt.Errorf("rate limit check failed: %w", err)
+		} else if !allowed {
+			return fmt.Errorf("rate limit exceeded for KB %s, retrying later", kbIDStr)
+		}
+		defer func() {
+			releaseContext, cancelRelease := context.WithTimeout(context.Background(), 5*time.Second)
+			defer cancelRelease()
+			if err := limiter.Release(releaseContext, kbIDStr); err != nil {
+				logger.Error("Failed to release rate limit token", err)
+			}
+		}()
+
+		kbID = graphFlowTask.KBID
+
+		// A run is serialized at the database level, but graph_sync mutates the
+		// shared Neo4j projection and can also be retried independently. Keep a
+		// KB-scoped distributed mutex as a final safety boundary so two workers
+		// can never project the same knowledge base concurrently.
+		redisClient := pkgredis.GetClient()
+		if redisClient == nil {
+			return fmt.Errorf("redis client is not configured for graph sync lock")
+		}
+		lockKey := lock.GraphFlowLockKey(kbIDStr, lock.LockOpSync)
+		kbLock := lock.NewRedisLock(redisClient, lockKey, lock.DefaultLockTTL)
+		acquired, err := kbLock.Acquire(ctx)
+		if err != nil {
+			return fmt.Errorf("acquire graph sync lock for KB %s: %w", kbIDStr, err)
+		}
+		if !acquired {
+			return fmt.Errorf("graph sync lock for KB %s is held by another worker", kbIDStr)
+		}
+
+		workContext, cancelWork := context.WithCancel(ctx)
+		ctx = workContext
+		heartbeatContext, stopHeartbeat := context.WithCancel(context.Background())
+		heartbeatDone := make(chan struct{})
+		go func() {
+			defer close(heartbeatDone)
+			ticker := time.NewTicker(lock.DefaultLockTTL / 3)
+			defer ticker.Stop()
+			for {
+				select {
+				case <-heartbeatContext.Done():
+					return
+				case <-ticker.C:
+					extended, extendErr := kbLock.Extend(heartbeatContext, lock.DefaultLockTTL)
+					if extendErr != nil || !extended {
+						if extendErr != nil {
+							logger.Error("Failed to extend graph sync lock", extendErr)
+						} else {
+							logger.Error("Failed to extend graph sync lock", lock.ErrLockNotHeld)
+						}
+						cancelWork()
+						return
+					}
+				}
+			}
+		}()
+		defer func() {
+			stopHeartbeat()
+			<-heartbeatDone
+			cancelWork()
+			releaseContext, cancelRelease := context.WithTimeout(context.Background(), 5*time.Second)
+			defer cancelRelease()
+			if err := kbLock.Release(releaseContext); err != nil && err != lock.ErrLockNotHeld {
+				logger.Error("Failed to release graph sync lock", err)
+			}
+		}()
+
+		// Check if Neo4j client is configured
+		if svc.Neo4jClient == nil {
+			logger.Warn("Neo4j client not configured, skipping sync", nil)
+			svc.TaskRepo.UpdateTaskCompleted(ctx, taskID)
+			checkAndUpdateDocumentStatus(ctx, svc, graphFlowTask)
+			return nil
+		}
+		if err := svc.Neo4jClient.EnsureProjectionSchema(ctx); err != nil {
+			svc.TaskRepo.UpdateTaskFailed(ctx, taskID, fmt.Sprintf("failed to ensure Neo4j projection schema: %v", err))
+			return fmt.Errorf("failed to ensure Neo4j projection schema: %w", err)
+		}
+		reportProgress(3)
+
+		// Cleanup tasks own the projections produced by their document. Graph
+		// sync must not sweep knowledge-base-wide pending deletes: doing so lets
+		// an unrelated add run inherit old cleanup failures and blocks the run.
+		reportProgress(5)
+
+		// 3. Sync pending entities in batches
+		nodesSynced := 0
+		edgesSynced := 0
+
+		pendingEntities, err := svc.EntityRepo.FindPendingSync(ctx, kbID)
+		if err != nil {
+			svc.TaskRepo.UpdateTaskFailed(ctx, taskID, fmt.Sprintf("failed to get pending entities: %v", err))
+			return fmt.Errorf("failed to get pending entities: %v: %w", err, asynq.SkipRetry)
+		}
+
+		if len(pendingEntities) > 0 {
+			// Initialize embedding service
+			embedSvc, _ := svc.GetEmbeddingService(ctx, kbID.String())
+
+			// Batch entities for Neo4j creation
+			entityBatchSize := 50
+			for i := 0; i < len(pendingEntities); i += entityBatchSize {
+				end := i + entityBatchSize
+				if end > len(pendingEntities) {
+					end = len(pendingEntities)
+				}
+				batch := pendingEntities[i:end]
+
+				// Prepare Neo4j data
+				nodesData := make([]map[string]interface{}, 0, len(batch))
+				syncedIDs := make([]uuid.UUID, 0, len(batch))
+
+				// SameAs relationships to creating
+				sameAsRels := make([]map[string]interface{}, 0)
+
+				// If embedding service is available, batch embed the entity names
+				embeddings := make([][]float32, len(batch))
+				if embedSvc != nil {
+					texts := make([]string, len(batch))
+					for j, e := range batch {
+						texts[j] = fmt.Sprintf("%s (%s)", e.Name, e.Type)
+						if e.Description != "" {
+							texts[j] = fmt.Sprintf("%s: %s", texts[j], e.Description)
+						}
+					}
+					// EmbedTexts uses batch API internally
+					vecs, err := embedSvc.EmbedTexts(ctx, texts)
+					if err == nil && len(vecs) == len(batch) {
+						for j, v := range vecs {
+							embeddings[j] = make([]float32, len(v))
+							for k, val := range v {
+								embeddings[j][k] = float32(val)
+							}
+						}
+					}
+				}
+
+				for j, entity := range batch {
+					props := map[string]interface{}{
+						"id":                  entity.ID.String(),
+						"name":                entity.Name,
+						"canonical_name":      entity.CanonicalName,
+						"kb_id":               entity.KBID.String(),
+						"source_count":        entity.SourceCount,
+						"active_source_count": entity.ActiveSourceCount,
+						"content_revision":    entity.ContentRevision,
+						"visibility_revision": entity.VisibilityRevision,
+					}
+					if len(embeddings[j]) > 0 {
+						props["embedding"] = embeddings[j]
+
+						// Check for similar entity to merge
+						// Threshold 0.92 for high confidence
+						similarID, err := svc.Neo4jClient.FindSimilarEntity(ctx, entity.KBID.String(), embeddings[j], 0.92)
+						if err == nil && similarID != "" {
+							logger.Info("Found similar entity, creating SAME_AS link", map[string]interface{}{
+								"new_entity":  entity.Name,
+								"existing_id": similarID,
+							})
+							sameAsRels = append(sameAsRels, map[string]interface{}{
+								"from": entity.ID.String(),
+								"to":   similarID,
+							})
+						}
+					}
+					nodesData = append(nodesData, props)
+					syncedIDs = append(syncedIDs, entity.ID)
+				}
+
+				// Unified Batch Creation in Neo4j
+				// Actually, the label in CreateNode was entity.Type.
+				// Let's refine the loop to group by type.
+				batchTypeGroups := make(map[string][]map[string]interface{})
+				for j, entity := range batch {
+					batchTypeGroups[entity.Type] = append(batchTypeGroups[entity.Type], nodesData[j])
+				}
+
+				for label, labelNodes := range batchTypeGroups {
+					if err := svc.Neo4jClient.CreateNodesBatch(ctx, label, labelNodes); err != nil {
+						logger.Error(fmt.Sprintf("Failed to batch create Neo4j nodes for label %s", label), err)
+						svc.TaskRepo.UpdateTaskFailed(ctx, taskID, fmt.Sprintf("failed to create Neo4j nodes: %v", err))
+						return fmt.Errorf("failed to create Neo4j nodes: %w", err)
+					}
+				}
+
+				// Create SAME_AS relationships
+				if len(sameAsRels) > 0 {
+					// Use SAME_AS relationship type
+					// Since CreateRelationshipsBatch expects a specific format, we can adapt it or call a specific method
+					// But our map structure is different ("from", "to"). Let's map it.
+					// Or better: Create a direct batch call for SAME_AS using transaction/query in Neo4jClient?
+					// For now, let's use the valid format for CreateRelationshipsBatch: "head_id", "tail_id", "properties"
+
+					sameAsBatch := make([]map[string]interface{}, len(sameAsRels))
+					for k, r := range sameAsRels {
+						sameAsBatch[k] = map[string]interface{}{
+							"head_id": r["from"],
+							"tail_id": r["to"],
+							"properties": map[string]interface{}{
+								"weight": 1.0,
+								"type":   "semantic_merge",
+							},
+						}
+					}
+
+					if err := svc.Neo4jClient.CreateRelationshipsBatch(ctx, "SAME_AS", sameAsBatch); err != nil {
+						logger.Error("Failed to create SAME_AS relationships", err)
+					}
+				}
+
+				// Update PG in one batch
+				if err := svc.EntityRepo.UpdateGraphStateBatch(ctx, syncedIDs, "synced"); err != nil {
+					logger.Error("Failed to update entity batch graph state", err)
+				}
+				nodesSynced += len(syncedIDs)
+				reportProgress(5 + 20*end/len(pendingEntities))
+			}
+		}
+		reportProgress(25)
+
+		// 4. Sync pending relationships in batches
+		pendingRelationships, err := svc.RelationshipRepo.FindPendingSync(ctx, kbID)
+		if err != nil {
+			svc.TaskRepo.UpdateTaskFailed(ctx, taskID, fmt.Sprintf("failed to get pending relationships: %v", err))
+			return fmt.Errorf("failed to get pending relationships: %v: %w", err, asynq.SkipRetry)
+		}
+
+		if len(pendingRelationships) > 0 {
+			relBatchSize := 100
+			for i := 0; i < len(pendingRelationships); i += relBatchSize {
+				end := i + relBatchSize
+				if end > len(pendingRelationships) {
+					end = len(pendingRelationships)
+				}
+				batch := pendingRelationships[i:end]
+
+				// Group by relation type for UNWIND
+				typeGroups := make(map[string][]map[string]interface{})
+				syncedIDs := make([]uuid.UUID, 0, len(batch))
+
+				for _, rel := range batch {
+					typeGroups[rel.RelationType] = append(typeGroups[rel.RelationType], map[string]interface{}{
+						"head_id": rel.HeadEntityID.String(),
+						"tail_id": rel.TailEntityID.String(),
+						"kb_id":   rel.KBID.String(),
+						"properties": map[string]interface{}{
+							"id":                  rel.ID.String(),
+							"kb_id":               rel.KBID.String(),
+							"weight":              rel.Weight,
+							"active_weight":       rel.ActiveWeight,
+							"content_revision":    rel.ContentRevision,
+							"visibility_revision": rel.VisibilityRevision,
+						},
+					})
+					syncedIDs = append(syncedIDs, rel.ID)
+				}
+
+				for rType, relsData := range typeGroups {
+					if err := svc.Neo4jClient.CreateRelationshipsBatch(ctx, rType, relsData); err != nil {
+						logger.Error(fmt.Sprintf("Failed to batch create Neo4j relationships of type %s", rType), err)
+						svc.TaskRepo.UpdateTaskFailed(ctx, taskID, fmt.Sprintf("failed to create Neo4j relationships: %v", err))
+						return fmt.Errorf("failed to create Neo4j relationships: %w", err)
+					}
+				}
+
+				// Update PG in one batch
+				if err := svc.RelationshipRepo.UpdateGraphStateBatch(ctx, syncedIDs, "synced"); err != nil {
+					logger.Error("Failed to update relationship batch graph state", err)
+				}
+				edgesSynced += len(syncedIDs)
+				reportProgress(25 + 20*end/len(pendingRelationships))
+			}
+
+		}
+		reportProgress(45)
+
+		// 4.5 Sync Aligned Mentions (creating provenance links)
+		// Fetch mentions that are 'aligned' but not yet 'synced'
+		// Note: We use a limit to batch processing if there are too many, but here we try to do a reasonable chunk
+		// Since we want to clear the queue, we loop until empty or hit a safety limit.
+		mentionsSynced := 0
+		reportProgress(50)
+		for {
+			pendingMentions, err := svc.EntityMentionRepo.FindAlignedSync(ctx, kbID, 500) // Batch 500
+			if err != nil {
+				logger.Error("Failed to fetching aligned mentions", err)
+				// Don't fail the whole task, just log? Or strictly fail?
+				// Strict fail is safer for data consistency.
+				svc.TaskRepo.UpdateTaskFailed(ctx, taskID, fmt.Sprintf("failed to get aligned mentions: %v", err))
+				return fmt.Errorf("failed to get aligned mentions: %w", err)
+			}
+
+			if len(pendingMentions) == 0 {
+				break
+			}
+
+			// Prepare Neo4j Batch
+			mentionsBatch := make([]map[string]interface{}, len(pendingMentions))
+			idsToUpdate := make([]uuid.UUID, len(pendingMentions))
+
+			for i, m := range pendingMentions {
+				if m.EntityID == nil {
+					continue // Should not happen for 'aligned' status
+				}
+				mentionsBatch[i] = map[string]interface{}{
+					"segment_id": m.SegmentID.String(),
+					"entity_id":  m.EntityID.String(),
+					"properties": map[string]interface{}{
+						"confidence": m.Confidence,
+						// "id": m.ID.String(), // relationship ID optional
+					},
+				}
+				idsToUpdate[i] = m.ID
+			}
+
+			// Exec Neo4j Sync
+			if err := svc.Neo4jClient.CreateMentionsBatch(ctx, mentionsBatch); err != nil {
+				logger.Error("Failed to sync mentions batch to Neo4j", err)
+				svc.TaskRepo.UpdateTaskFailed(ctx, taskID, fmt.Sprintf("failed to sync mentions: %v", err))
+				return fmt.Errorf("failed to sync mentions: %w", err)
+			}
+
+			// Update Status to 'synced'
+			if err := svc.EntityMentionRepo.UpdateBatchStatus(ctx, idsToUpdate, "synced", nil); err != nil {
+				logger.Error("Failed to update mention status to synced", err)
+			}
+
+			mentionsSynced += len(pendingMentions)
+			reportProgress(55)
+
+			// Safety break if too many? For now just rely on loop.
+			if len(pendingMentions) < 500 {
+				break
+			}
+		}
+		reportProgress(60)
+
+		var visibilityDataset datasetmodel.Dataset
+		if err := svc.DB.WithContext(ctx).First(&visibilityDataset, "id = ?", kbID).Error; err != nil {
+			svc.TaskRepo.UpdateTaskFailed(ctx, taskID, fmt.Sprintf("failed to load graph visibility revision: %v", err))
+			return fmt.Errorf("failed to load graph visibility revision: %w", err)
+		}
+		project := func(progress func(completed, total int)) error {
+			if graphFlowTask.RunID != nil {
+				return svc.ProjectVisibilityProjectionForRun(ctx, kbID, visibilityDataset.GraphVisibilityRevision, *graphFlowTask.RunID, progress)
+			}
+			return svc.ProjectVisibilityProjection(ctx, kbID, visibilityDataset.GraphVisibilityRevision, progress)
+		}
+		if err := project(func(completed, total int) {
+			if total <= 0 {
+				reportProgress(95)
+				return
+			}
+			reportProgress(60 + 35*completed/total)
+		}); err != nil {
+			svc.TaskRepo.UpdateTaskFailed(ctx, taskID, fmt.Sprintf("failed to refresh graph visibility projection: %v", err))
+			return fmt.Errorf("failed to refresh graph visibility projection: %w", err)
+		}
+
+		// 5. Update current task status to completed
+		if err := svc.TaskRepo.UpdateTaskCompleted(ctx, taskID); err != nil {
+			logger.Error("Failed to update task status to completed", err)
+		}
+
+		logger.Info("GraphFlow Neo4j sync completed", map[string]interface{}{
+			"kb_id":           kbID.String(),
+			"nodes_synced":    nodesSynced,
+			"edges_synced":    edgesSynced,
+			"mentions_synced": mentionsSynced,
+		})
+
+		// 6. Start vector sync only after all Neo4j nodes have been written.
+		if err := enqueueVectorSyncTask(ctx, svc, taskManager, graphFlowTask); err != nil {
+			return err
+		}
+
+		// 7. Check if both sync tasks are completed and update document status
+		checkAndUpdateDocumentStatus(ctx, svc, graphFlowTask)
+
+		return nil
+	}
+}
+
+func enqueueVectorSyncTask(ctx context.Context, svc *graphflow.Service, taskManager *queue.TaskManager, graphSyncTask *model.GraphFlowTask) error {
+	if taskManager == nil {
+		return fmt.Errorf("task manager is not configured")
+	}
+
+	var vectorTask model.GraphFlowTask
+	query := svc.DB.WithContext(ctx).
+		Where("document_id = ? AND task_type = ?", graphSyncTask.DocumentID, "vector_sync")
+	if graphSyncTask.RunID != nil {
+		query = query.Where("run_id = ?", *graphSyncTask.RunID)
+	} else {
+		query = query.Where("run_id IS NULL")
+	}
+	if err := query.Order("created_at DESC").First(&vectorTask).Error; err != nil {
+		return fmt.Errorf("find vector_sync task after graph sync: %w", err)
+	}
+	if vectorTask.Status == "completed" {
+		return nil
+	}
+
+	queued, err := NewGraphFlowTask(TypeGraphFlowVectorSync, vectorTask.ID.String(), taskManager)
+	if err != nil {
+		svc.TaskRepo.UpdateTaskFailed(ctx, vectorTask.ID, fmt.Sprintf("failed to create task: %v", err))
+		return fmt.Errorf("create vector_sync task: %w", err)
+	}
+	if err := enqueueOrReactivateGraphFlowTask(taskManager, queued, vectorTask.ID.String()); err != nil {
+		svc.TaskRepo.UpdateTaskFailed(ctx, vectorTask.ID, fmt.Sprintf("failed to enqueue: %v", err))
+		return fmt.Errorf("enqueue vector_sync task: %w", err)
+	}
+
+	logger.Info("Vector sync task enqueued after graph sync", map[string]interface{}{
+		"task_id":     vectorTask.ID.String(),
+		"document_id": graphSyncTask.DocumentID.String(),
+	})
+	return nil
+}
+
+// checkAndUpdateDocumentStatus checks if both sync tasks are completed and updates document status
+func checkAndUpdateDocumentStatus(ctx context.Context, svc *graphflow.Service, currentTask *model.GraphFlowTask) {
+	// Check if both graph_sync and vector_sync tasks are completed
+	allCompleted, err := svc.TaskRepo.AreTasksCompletedByTypes(ctx, currentTask.DocumentID, []string{"graph_sync", "vector_sync"})
+	if err != nil {
+		logger.Error("Failed to check task completion status", err)
+		return
+	}
+
+	if allCompleted {
+		// Update document indexing status to completed
+		if err := svc.DocumentRepo.UpdateDocumentIndexingStatus(ctx, currentTask.DocumentID.String(), "completed"); err != nil {
+			logger.Error("Failed to update document indexing status", err)
+			return
+		}
+
+		// Update segment graph indexing status to indexed ONLY if it was extracted (to prevent overwriting failed segments)
+		if err := svc.DocumentRepo.UpdateSegmentGraphIndexingStatusByDocumentID(ctx, currentTask.DocumentID.String(), "indexed", "extracted"); err != nil {
+			logger.Error("Failed to update segment graph indexing status to indexed", err)
+		}
+
+		logger.Info("All GraphFlow tasks completed, document marked as completed", map[string]interface{}{
+			"document_id": currentTask.DocumentID.String(),
+		})
+	} else {
+		// Get incomplete tasks for debugging
+		incompleteTasks, err := svc.TaskRepo.GetIncompleteTasksByTypes(ctx, currentTask.DocumentID, []string{"graph_sync", "vector_sync"})
+		if err != nil {
+			logger.Error("Failed to get incomplete tasks", err)
+		}
+
+		incompleteTaskInfo := make([]map[string]interface{}, 0, len(incompleteTasks))
+		for _, task := range incompleteTasks {
+			incompleteTaskInfo = append(incompleteTaskInfo, map[string]interface{}{
+				"task_id":   task.ID.String(),
+				"task_type": task.TaskType,
+				"status":    task.Status,
+			})
+		}
+
+		logger.Info("Not all GraphFlow tasks completed yet", map[string]interface{}{
+			"document_id":      currentTask.DocumentID.String(),
+			"task_type":        currentTask.TaskType,
+			"incomplete_tasks": incompleteTaskInfo,
+		})
+	}
+}

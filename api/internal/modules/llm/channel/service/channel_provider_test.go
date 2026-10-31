@@ -1,0 +1,1980 @@
+package service
+
+import (
+	"context"
+	"errors"
+	"testing"
+
+	"github.com/google/uuid"
+	"github.com/stretchr/testify/require"
+	appconfig "github.com/webb-chen/AgentSystem/api/config"
+	channeldto "github.com/webb-chen/AgentSystem/api/internal/modules/llm/channel/dto"
+	channelmodel "github.com/webb-chen/AgentSystem/api/internal/modules/llm/channel/model"
+	channelrepo "github.com/webb-chen/AgentSystem/api/internal/modules/llm/channel/repository"
+	"github.com/webb-chen/AgentSystem/api/internal/modules/llm/channelprovider"
+	credentialdto "github.com/webb-chen/AgentSystem/api/internal/modules/llm/credential/dto"
+	credentialmodel "github.com/webb-chen/AgentSystem/api/internal/modules/llm/credential/model"
+	credentialsvc "github.com/webb-chen/AgentSystem/api/internal/modules/llm/credential/service"
+	"github.com/webb-chen/AgentSystem/api/internal/modules/llm/credential/upstreamstate"
+	"github.com/webb-chen/AgentSystem/api/internal/modules/llm/gateway"
+	llmmodelmodel "github.com/webb-chen/AgentSystem/api/internal/modules/llm/llmmodel/model"
+	llmmodelrepo "github.com/webb-chen/AgentSystem/api/internal/modules/llm/llmmodel/repository"
+	llmmodelsvc "github.com/webb-chen/AgentSystem/api/internal/modules/llm/llmmodel/service"
+	adapter "github.com/webb-chen/AgentSystem/api/internal/modules/llm/protocol/adapters"
+	providermodel "github.com/webb-chen/AgentSystem/api/internal/modules/llm/provider/model"
+	providerrepo "github.com/webb-chen/AgentSystem/api/internal/modules/llm/provider/repository"
+	"github.com/webb-chen/AgentSystem/api/internal/modules/llm/shared"
+	interfaces "github.com/webb-chen/AgentSystem/api/internal/modules/shared/interface"
+	"gorm.io/driver/sqlite"
+	"gorm.io/gorm"
+)
+
+var (
+	_ channelrepo.TenantRouteRepository     = (*fakeTenantRouteRepo)(nil)
+	_ credentialsvc.TenantCredentialService = (*fakeTenantCredentialService)(nil)
+	_ llmmodelrepo.ModelRepository          = (*fakeModelRepo)(nil)
+	_ llmmodelrepo.ModelConfigRepository    = (*fakeModelConfigRepo)(nil)
+	_ providerrepo.CustomProviderRepository = (*fakeCustomProviderRepo)(nil)
+	_ llmmodelrepo.CustomModelRepository    = (*fakeCustomModelRepo)(nil)
+	_ ChannelValidator                      = (*fakeChannelValidator)(nil)
+	_ llmmodelsvc.AvailableModelsService    = (*fakeAvailableModelsService)(nil)
+)
+
+func setLLMAllowPrivateBaseURL(t *testing.T, allow bool) {
+	t.Helper()
+	previous := appconfig.GlobalConfig
+	next := &appconfig.Config{}
+	if previous != nil {
+		copied := *previous
+		next = &copied
+	}
+	next.LLM.AllowPrivateBaseURL = allow
+	appconfig.GlobalConfig = next
+	t.Cleanup(func() {
+		appconfig.GlobalConfig = previous
+	})
+}
+
+func openChannelPricingTestDB(t *testing.T) *gorm.DB {
+	t.Helper()
+	db, err := gorm.Open(sqlite.Open(":memory:"), &gorm.Config{})
+	require.NoError(t, err)
+	require.NoError(t, db.Exec(`CREATE TABLE llm_models (
+		id text PRIMARY KEY,
+		provider text,
+		name text,
+		input_price decimal,
+		output_price decimal,
+		input_price_configured boolean,
+		output_price_configured boolean,
+		image_prices json
+	)`).Error)
+	require.NoError(t, db.Exec(`CREATE TABLE llm_model_configs (
+		id text PRIMARY KEY,
+		organization_id text,
+		model_id text,
+		input_price_override decimal,
+		output_price_override decimal,
+		deleted_at datetime
+	)`).Error)
+	require.NoError(t, db.Exec(`CREATE TABLE llm_pricing_fallback_overrides (
+		organization_id text PRIMARY KEY,
+		enabled boolean,
+		rules json,
+		updated_by text,
+		created_at datetime,
+		updated_at datetime
+	)`).Error)
+	return db
+}
+
+type fakeTenantRouteRepo struct {
+	created   *channelmodel.LLMRoute
+	updated   *channelmodel.LLMRoute
+	routeByID *channelmodel.LLMRoute
+	routes    []*channelmodel.LLMRoute
+	getErr    error
+}
+
+func (f *fakeTenantRouteRepo) Create(_ context.Context, route *channelmodel.LLMRoute) error {
+	if route.ID == uuid.Nil {
+		route.ID = uuid.New()
+	}
+	f.created = route
+	return nil
+}
+
+func (f *fakeTenantRouteRepo) BatchCreate(context.Context, []*channelmodel.LLMRoute) error {
+	return errors.New("not implemented")
+}
+
+func (f *fakeTenantRouteRepo) GetByID(_ context.Context, _, _ uuid.UUID) (*channelmodel.LLMRoute, error) {
+	if f.getErr != nil {
+		return nil, f.getErr
+	}
+	if f.routeByID == nil {
+		return nil, errors.New("not implemented")
+	}
+	return f.routeByID, nil
+}
+
+func (f *fakeTenantRouteRepo) List(context.Context, uuid.UUID, *bool, int, int) ([]*channelmodel.LLMRoute, int64, error) {
+	if f.routes != nil {
+		return f.routes, int64(len(f.routes)), nil
+	}
+	return nil, 0, errors.New("not implemented")
+}
+
+func (f *fakeTenantRouteRepo) Update(_ context.Context, route *channelmodel.LLMRoute) error {
+	f.updated = routeClone(route)
+	return nil
+}
+
+func (f *fakeTenantRouteRepo) UpdateWithExpectedCredential(_ context.Context, route *channelmodel.LLMRoute, _ *uuid.UUID) error {
+	f.updated = routeClone(route)
+	return nil
+}
+
+func (f *fakeTenantRouteRepo) Delete(context.Context, uuid.UUID, uuid.UUID) error {
+	return errors.New("not implemented")
+}
+
+func (f *fakeTenantRouteRepo) GetEnabledRoutes(context.Context, uuid.UUID) ([]*channelmodel.LLMRoute, error) {
+	return nil, errors.New("not implemented")
+}
+
+func (f *fakeTenantRouteRepo) FindByModel(context.Context, uuid.UUID, string) ([]*channelmodel.LLMRoute, error) {
+	return nil, errors.New("not implemented")
+}
+
+func (f *fakeTenantRouteRepo) CountByCredentialID(context.Context, uuid.UUID, uuid.UUID) (int64, error) {
+	return 0, errors.New("not implemented")
+}
+
+func (f *fakeTenantRouteRepo) GetDistinctProviders(context.Context, uuid.UUID) ([]string, error) {
+	return nil, errors.New("not implemented")
+}
+
+func (f *fakeTenantRouteRepo) GetPlatformChannels(context.Context) ([]*channelmodel.LLMRoute, error) {
+	return nil, errors.New("not implemented")
+}
+
+func routeClone(route *channelmodel.LLMRoute) *channelmodel.LLMRoute {
+	if route == nil {
+		return nil
+	}
+	cloned := *route
+	if route.Models != nil {
+		cloned.Models = append([]string(nil), route.Models...)
+	}
+	if route.Tags != nil {
+		cloned.Tags = append([]string(nil), route.Tags...)
+	}
+	if route.ModelMaps != nil {
+		cloned.ModelMaps = mapsClone(route.ModelMaps)
+	}
+	if route.ParamOverride != nil {
+		cloned.ParamOverride = mapsClone(route.ParamOverride)
+	}
+	if route.HeaderOverride != nil {
+		cloned.HeaderOverride = mapsClone(route.HeaderOverride)
+	}
+	if route.ValidationReport != nil {
+		cloned.ValidationReport = mapsClone(route.ValidationReport)
+	}
+	return &cloned
+}
+
+func TestPrivateRouteCredentialIDRejectsCrossTenantAndOfficialRoutes(t *testing.T) {
+	organizationID := uuid.New()
+	channelID := uuid.New()
+
+	t.Run("cross tenant is not found", func(t *testing.T) {
+		svc := &channelService{tenantRouteRepo: &fakeTenantRouteRepo{getErr: gorm.ErrRecordNotFound}}
+		_, err := svc.privateRouteCredentialID(context.Background(), organizationID, channelID)
+		if !errors.Is(err, ErrRouteNotFound) {
+			t.Fatalf("privateRouteCredentialID() error = %v, want ErrRouteNotFound", err)
+		}
+	})
+
+	t.Run("official route is rejected", func(t *testing.T) {
+		svc := &channelService{tenantRouteRepo: &fakeTenantRouteRepo{routeByID: &channelmodel.LLMRoute{
+			ID:             channelID,
+			OrganizationID: organizationID,
+			Type:           shared.RouteTypeMINGYINGKEJICloud,
+			IsOfficial:     true,
+		}}}
+		_, err := svc.privateRouteCredentialID(context.Background(), organizationID, channelID)
+		if !errors.Is(err, ErrInvalidRouteType) {
+			t.Fatalf("privateRouteCredentialID() error = %v, want ErrInvalidRouteType", err)
+		}
+	})
+}
+
+func mapsClone(src map[string]interface{}) map[string]interface{} {
+	if src == nil {
+		return nil
+	}
+	dst := make(map[string]interface{}, len(src))
+	for k, v := range src {
+		dst[k] = v
+	}
+	return dst
+}
+
+type fakeTenantCredentialService struct {
+	createdReq *credentialdto.CreateTenantCredentialRequest
+	updatedReq *credentialdto.UpdateTenantCredentialRequest
+	cred       *credentialmodel.TenantCredential
+	nextCred   *credentialmodel.TenantCredential
+}
+
+func (f *fakeTenantCredentialService) Create(context.Context, uuid.UUID, *credentialdto.CreateTenantCredentialRequest) (*credentialmodel.TenantCredential, error) {
+	return nil, errors.New("not implemented")
+}
+
+func (f *fakeTenantCredentialService) GetOrCreateByAPIKey(_ context.Context, _ uuid.UUID, req *credentialdto.CreateTenantCredentialRequest) (*credentialmodel.TenantCredential, bool, error) {
+	f.createdReq = req
+	if f.nextCred != nil {
+		return f.nextCred, true, nil
+	}
+	if f.cred == nil {
+		f.cred = &credentialmodel.TenantCredential{
+			ID:              uuid.New(),
+			ChannelProvider: req.ChannelProvider,
+			APIBaseURL:      req.APIBaseURL,
+		}
+	}
+	return f.cred, true, nil
+}
+
+func (f *fakeTenantCredentialService) GetByID(context.Context, uuid.UUID, uuid.UUID) (*credentialmodel.TenantCredential, error) {
+	if f.cred == nil {
+		return nil, errors.New("not found")
+	}
+	return f.cred, nil
+}
+
+func (f *fakeTenantCredentialService) List(context.Context, uuid.UUID, *credentialdto.ListCredentialRequest) ([]*credentialmodel.TenantCredential, int64, error) {
+	return nil, 0, errors.New("not implemented")
+}
+
+func (f *fakeTenantCredentialService) Update(_ context.Context, _ uuid.UUID, _ uuid.UUID, req *credentialdto.UpdateTenantCredentialRequest) (*credentialmodel.TenantCredential, error) {
+	f.updatedReq = req
+	if f.cred == nil {
+		f.cred = &credentialmodel.TenantCredential{ID: uuid.New()}
+	}
+	if req.ChannelProvider != nil {
+		f.cred.ChannelProvider = *req.ChannelProvider
+	}
+	if req.APIBaseURL != nil {
+		f.cred.APIBaseURL = *req.APIBaseURL
+	}
+	return f.cred, nil
+}
+
+func (f *fakeTenantCredentialService) Delete(context.Context, uuid.UUID, uuid.UUID) error {
+	return errors.New("not implemented")
+}
+
+func (f *fakeTenantCredentialService) GetDecryptedAPIKey(context.Context, uuid.UUID, uuid.UUID) (string, error) {
+	if f.cred == nil {
+		return "", errors.New("not found")
+	}
+	return "test-api-key", nil
+}
+
+func (f *fakeTenantCredentialService) TestCredential(context.Context, uuid.UUID, uuid.UUID, string, string) (*credentialdto.TestCredentialResult, error) {
+	return nil, errors.New("not implemented")
+}
+
+type fakeChannelValidator struct {
+	lastOrganizationID uuid.UUID
+	lastProvider       string
+	lastAPIKey         string
+	lastTestProvider   string
+	lastTestAPIKey     string
+	lastTestBaseURL    string
+	lastTestModel      string
+	lastTestMethod     string
+	lastTestStream     *bool
+	testStreams        []*bool
+	createCalls        int
+	validateCalls      int
+	report             map[string]interface{}
+	err                error
+	testCalls          int
+	testResult         *channelprovider.TestResult
+	testResults        map[string]*channelprovider.TestResult
+	testErr            error
+}
+
+func (f *fakeChannelValidator) ValidateModels(_ context.Context, organizationID uuid.UUID, channelProvider, apiKey, _ string, models []string) (*channelprovider.ValidationResult, error) {
+	f.validateCalls++
+	f.lastOrganizationID = organizationID
+	f.lastProvider = channelProvider
+	f.lastAPIKey = apiKey
+	if f.err != nil {
+		if f.report != nil {
+			return &channelprovider.ValidationResult{
+				Report:           f.report,
+				NormalizedModels: append([]string(nil), models...),
+			}, f.err
+		}
+		return nil, f.err
+	}
+	if f.report != nil {
+		return &channelprovider.ValidationResult{
+			Report:           f.report,
+			NormalizedModels: append([]string(nil), models...),
+		}, nil
+	}
+	return &channelprovider.ValidationResult{
+		Report: map[string]interface{}{
+			"provider": channelProvider,
+			"models":   models,
+		},
+		NormalizedModels: append([]string(nil), models...),
+	}, nil
+}
+
+func (f *fakeChannelValidator) ValidateModelsForCreation(_ context.Context, organizationID uuid.UUID, channelProvider, apiKey, _ string, models []string) (*channelprovider.ValidationResult, error) {
+	f.createCalls++
+	f.lastOrganizationID = organizationID
+	f.lastProvider = channelProvider
+	f.lastAPIKey = apiKey
+	if f.err != nil {
+		if f.report != nil {
+			return &channelprovider.ValidationResult{
+				Report:           f.report,
+				NormalizedModels: append([]string(nil), models...),
+			}, f.err
+		}
+		return nil, f.err
+	}
+	if f.report != nil {
+		return &channelprovider.ValidationResult{
+			Report:           f.report,
+			NormalizedModels: append([]string(nil), models...),
+		}, nil
+	}
+	return &channelprovider.ValidationResult{
+		Report: map[string]interface{}{
+			"provider": channelProvider,
+			"models":   models,
+		},
+		NormalizedModels: append([]string(nil), models...),
+	}, nil
+}
+
+func (f *fakeChannelValidator) TestModel(_ context.Context, organizationID uuid.UUID, channelProvider, apiKey string, apiBaseURL, modelName, testMethod string, stream *bool) (*channelprovider.TestResult, error) {
+	f.testCalls++
+	f.lastOrganizationID = organizationID
+	f.lastTestProvider = channelProvider
+	f.lastTestAPIKey = apiKey
+	f.lastTestBaseURL = apiBaseURL
+	f.lastTestModel = modelName
+	f.lastTestMethod = testMethod
+	f.lastTestStream = stream
+	f.testStreams = append(f.testStreams, stream)
+	if f.testErr != nil {
+		return nil, f.testErr
+	}
+	if f.testResults != nil {
+		if result, ok := f.testResults[modelName]; ok {
+			return result, nil
+		}
+	}
+	if f.testResult != nil {
+		return f.testResult, nil
+	}
+	return &channelprovider.TestResult{
+		Success:        true,
+		Status:         channelprovider.TestStatusSuccess,
+		Message:        "ok",
+		ResponseTimeMs: 12,
+		Model:          modelName,
+		UseCase:        "chat",
+	}, nil
+}
+
+type fakeModelRepo struct {
+	models []*llmmodelmodel.LLMModel
+}
+
+func (f *fakeModelRepo) Create(context.Context, *llmmodelmodel.LLMModel) error {
+	return errors.New("not implemented")
+}
+func (f *fakeModelRepo) GetByID(context.Context, uuid.UUID) (*llmmodelmodel.LLMModel, error) {
+	return nil, errors.New("not implemented")
+}
+func (f *fakeModelRepo) GetByName(_ context.Context, name string) (*llmmodelmodel.LLMModel, error) {
+	for _, model := range f.models {
+		if model != nil && model.Model == name {
+			return model, nil
+		}
+	}
+	return nil, nil
+}
+func (f *fakeModelRepo) ListByNames(_ context.Context, names []string) ([]*llmmodelmodel.LLMModel, error) {
+	result := make([]*llmmodelmodel.LLMModel, 0, len(names))
+	for _, name := range names {
+		for _, model := range f.models {
+			if model != nil && model.Model == name {
+				result = append(result, model)
+				break
+			}
+		}
+	}
+	return result, nil
+}
+func (f *fakeModelRepo) ListAvailableByNames(_ context.Context, names []string, provider string, useCase string) ([]*llmmodelmodel.LLMModel, error) {
+	return nil, errors.New("not implemented")
+}
+func (f *fakeModelRepo) ListAvailableFiltered(_ context.Context, provider string, useCase string) ([]*llmmodelmodel.LLMModel, error) {
+	return nil, errors.New("not implemented")
+}
+func (f *fakeModelRepo) GetByProviderAndName(_ context.Context, provider string, name string) (*llmmodelmodel.LLMModel, error) {
+	for _, model := range f.models {
+		if model != nil && model.Provider == provider && model.Model == name {
+			return model, nil
+		}
+	}
+	return nil, gorm.ErrRecordNotFound
+}
+func (f *fakeModelRepo) List(context.Context, *uuid.UUID, string, string, string, *bool, int, int) ([]*llmmodelmodel.LLMModel, int64, error) {
+	return append([]*llmmodelmodel.LLMModel(nil), f.models...), int64(len(f.models)), nil
+}
+func (f *fakeModelRepo) Update(context.Context, *llmmodelmodel.LLMModel) error {
+	return errors.New("not implemented")
+}
+func (f *fakeModelRepo) Delete(context.Context, uuid.UUID) error {
+	return errors.New("not implemented")
+}
+func (f *fakeModelRepo) ListByProvider(context.Context, string) ([]*llmmodelmodel.LLMModel, error) {
+	return nil, errors.New("not implemented")
+}
+
+type fakeModelConfigRepo struct {
+	configs map[uuid.UUID]*llmmodelmodel.ModelConfig
+	upserts []*llmmodelmodel.ModelConfig
+}
+
+func (f *fakeModelConfigRepo) Create(context.Context, *llmmodelmodel.ModelConfig) error {
+	return errors.New("not implemented")
+}
+func (f *fakeModelConfigRepo) GetByID(context.Context, uuid.UUID, uuid.UUID) (*llmmodelmodel.ModelConfig, error) {
+	return nil, errors.New("not implemented")
+}
+func (f *fakeModelConfigRepo) GetByModelID(_ context.Context, organizationID, modelID uuid.UUID) (*llmmodelmodel.ModelConfig, error) {
+	if f.configs == nil {
+		return nil, gorm.ErrRecordNotFound
+	}
+	cfg, ok := f.configs[modelID]
+	if !ok || cfg == nil || cfg.OrganizationID != organizationID {
+		return nil, gorm.ErrRecordNotFound
+	}
+	return cfg, nil
+}
+func (f *fakeModelConfigRepo) List(context.Context, uuid.UUID, *bool, int, int) ([]*llmmodelmodel.ModelConfig, int64, error) {
+	return nil, 0, errors.New("not implemented")
+}
+func (f *fakeModelConfigRepo) ListAvailableConfigs(context.Context, uuid.UUID) ([]*llmmodelmodel.ModelConfig, error) {
+	return nil, errors.New("not implemented")
+}
+func (f *fakeModelConfigRepo) Update(context.Context, *llmmodelmodel.ModelConfig) error {
+	return errors.New("not implemented")
+}
+func (f *fakeModelConfigRepo) Delete(context.Context, uuid.UUID, uuid.UUID) error {
+	return errors.New("not implemented")
+}
+func (f *fakeModelConfigRepo) Upsert(_ context.Context, config *llmmodelmodel.ModelConfig) error {
+	cloned := *config
+	f.upserts = append(f.upserts, &cloned)
+	if f.configs == nil {
+		f.configs = make(map[uuid.UUID]*llmmodelmodel.ModelConfig)
+	}
+	f.configs[config.ModelID] = &cloned
+	return nil
+}
+func (f *fakeModelConfigRepo) BatchCreate(context.Context, []*llmmodelmodel.ModelConfig) error {
+	return errors.New("not implemented")
+}
+
+type fakeCustomProviderRepo struct {
+	created  []*providermodel.CustomProvider
+	updated  []*providermodel.CustomProvider
+	bySlug   map[string]*providermodel.CustomProvider
+	provider *providermodel.CustomProvider
+}
+
+func (f *fakeCustomProviderRepo) Create(_ context.Context, provider *providermodel.CustomProvider) error {
+	if provider.ID == uuid.Nil {
+		provider.ID = uuid.New()
+	}
+	f.created = append(f.created, provider)
+	if f.bySlug == nil {
+		f.bySlug = make(map[string]*providermodel.CustomProvider)
+	}
+	f.bySlug[provider.Provider] = provider
+	f.provider = provider
+	return nil
+}
+
+func (f *fakeCustomProviderRepo) GetByID(context.Context, uuid.UUID, uuid.UUID) (*providermodel.CustomProvider, error) {
+	return nil, errors.New("not implemented")
+}
+
+func (f *fakeCustomProviderRepo) GetByProvider(_ context.Context, _ uuid.UUID, provider string) (*providermodel.CustomProvider, error) {
+	if f.bySlug != nil {
+		if found, ok := f.bySlug[provider]; ok {
+			return found, nil
+		}
+	}
+	if f.provider != nil && f.provider.Provider == provider {
+		return f.provider, nil
+	}
+	return nil, gorm.ErrRecordNotFound
+}
+
+func (f *fakeCustomProviderRepo) List(context.Context, uuid.UUID, *bool, int, int) ([]*providermodel.CustomProvider, int64, error) {
+	return nil, 0, errors.New("not implemented")
+}
+
+func (f *fakeCustomProviderRepo) Update(_ context.Context, provider *providermodel.CustomProvider) error {
+	f.updated = append(f.updated, provider)
+	if f.bySlug == nil {
+		f.bySlug = make(map[string]*providermodel.CustomProvider)
+	}
+	f.bySlug[provider.Provider] = provider
+	return nil
+}
+
+func (f *fakeCustomProviderRepo) Delete(context.Context, uuid.UUID, uuid.UUID) error {
+	return errors.New("not implemented")
+}
+
+func (f *fakeCustomProviderRepo) ExistsByProvider(context.Context, uuid.UUID, string) (bool, error) {
+	return false, errors.New("not implemented")
+}
+
+type fakeCustomModelRepo struct {
+	created []*llmmodelmodel.CustomModel
+	updated []*llmmodelmodel.CustomModel
+	byName  map[string]*llmmodelmodel.CustomModel
+}
+
+func (f *fakeCustomModelRepo) Create(_ context.Context, m *llmmodelmodel.CustomModel) error {
+	if m.ID == uuid.Nil {
+		m.ID = uuid.New()
+	}
+	f.created = append(f.created, m)
+	if f.byName == nil {
+		f.byName = make(map[string]*llmmodelmodel.CustomModel)
+	}
+	f.byName[m.Name] = m
+	return nil
+}
+
+func (f *fakeCustomModelRepo) GetByID(context.Context, uuid.UUID, uuid.UUID) (*llmmodelmodel.CustomModel, error) {
+	return nil, errors.New("not implemented")
+}
+
+func (f *fakeCustomModelRepo) GetByProviderAndName(_ context.Context, _ uuid.UUID, _ uuid.UUID, name string) (*llmmodelmodel.CustomModel, error) {
+	if f.byName != nil {
+		if found, ok := f.byName[name]; ok {
+			return found, nil
+		}
+	}
+	return nil, gorm.ErrRecordNotFound
+}
+
+func (f *fakeCustomModelRepo) GetByProviderAndModel(_ context.Context, _ uuid.UUID, _ string, name string) (*llmmodelmodel.CustomModel, error) {
+	if f.byName != nil {
+		if found, ok := f.byName[name]; ok {
+			return found, nil
+		}
+	}
+	return nil, gorm.ErrRecordNotFound
+}
+
+func (f *fakeCustomModelRepo) ListByNames(_ context.Context, _ uuid.UUID, names []string, _ *bool) ([]*llmmodelmodel.CustomModel, error) {
+	result := make([]*llmmodelmodel.CustomModel, 0, len(names))
+	for _, name := range names {
+		if f.byName != nil {
+			if found, ok := f.byName[name]; ok {
+				result = append(result, found)
+			}
+		}
+	}
+	return result, nil
+}
+
+func (f *fakeCustomModelRepo) List(context.Context, uuid.UUID, *uuid.UUID, string, string, *bool, int, int) ([]*llmmodelmodel.CustomModel, int64, error) {
+	return nil, 0, errors.New("not implemented")
+}
+
+func (f *fakeCustomModelRepo) Update(_ context.Context, m *llmmodelmodel.CustomModel) error {
+	f.updated = append(f.updated, m)
+	if f.byName == nil {
+		f.byName = make(map[string]*llmmodelmodel.CustomModel)
+	}
+	f.byName[m.Name] = m
+	return nil
+}
+
+func (f *fakeCustomModelRepo) Delete(context.Context, uuid.UUID, uuid.UUID) error {
+	return errors.New("not implemented")
+}
+
+func (f *fakeCustomModelRepo) ListByProvider(context.Context, uuid.UUID, uuid.UUID) ([]*llmmodelmodel.CustomModel, error) {
+	return nil, errors.New("not implemented")
+}
+
+type fakeAvailableModelsService struct {
+	invalidated []uuid.UUID
+}
+
+func (f *fakeAvailableModelsService) ListAvailable(context.Context, uuid.UUID, string, string) ([]*llmmodelsvc.AvailableModel, error) {
+	return nil, errors.New("not implemented")
+}
+func (f *fakeAvailableModelsService) RefreshCache(context.Context, uuid.UUID) error {
+	return errors.New("not implemented")
+}
+func (f *fakeAvailableModelsService) InvalidateTenantCache(organizationID uuid.UUID) {
+	f.invalidated = append(f.invalidated, organizationID)
+}
+func (f *fakeAvailableModelsService) InvalidateGlobalCache() {}
+func (f *fakeAvailableModelsService) SetOfficialRouteBootstrapper(interfaces.OfficialRouteBootstrapper) {
+}
+
+func TestCreateRoute_UsesExplicitChannelProvider(t *testing.T) {
+	repo := &fakeTenantRouteRepo{}
+	credSvc := &fakeTenantCredentialService{}
+	validator := &fakeChannelValidator{}
+	svc := &channelService{
+		tenantRouteRepo:   repo,
+		tenantCredService: credSvc,
+		validator:         validator,
+		modelRepo:         &fakeModelRepo{},
+	}
+
+	orgID := uuid.New()
+	view, err := svc.CreateRoute(context.Background(), orgID, &channeldto.CreateRouteRequest{
+		Name:            "Cohere Proxy",
+		ChannelProvider: "cohere",
+		APIKey:          "test-key",
+		APIBaseURL:      "https://api.cohere.com",
+		Models:          []string{"command-r"},
+	})
+
+	require.NoError(t, err)
+	require.Equal(t, "cohere", validator.lastProvider)
+	require.Equal(t, 1, validator.createCalls)
+	require.Equal(t, 0, validator.validateCalls)
+	require.NotNil(t, credSvc.createdReq)
+	require.Equal(t, "cohere", credSvc.createdReq.ChannelProvider)
+	require.NotNil(t, repo.created)
+	require.Equal(t, "cohere", repo.created.ChannelProvider)
+	require.Equal(t, "cohere", view.ChannelProvider)
+}
+
+func TestCreateRoute_RejectsValidationFailureWithoutPersistence(t *testing.T) {
+	repo := &fakeTenantRouteRepo{}
+	credSvc := &fakeTenantCredentialService{}
+	validator := &fakeChannelValidator{
+		report: map[string]interface{}{"provider": "openai"},
+		err:    errors.New("model gpt-4o validation failed: unauthorized"),
+	}
+	svc := &channelService{
+		tenantRouteRepo:   repo,
+		tenantCredService: credSvc,
+		validator:         validator,
+		modelRepo:         &fakeModelRepo{},
+	}
+
+	_, err := svc.CreateRoute(context.Background(), uuid.New(), &channeldto.CreateRouteRequest{
+		Name:            "Broken OpenAI",
+		ChannelProvider: "openai",
+		APIKey:          "bad-key",
+		Models:          []string{"gpt-4o"},
+	})
+
+	require.Error(t, err)
+	require.Nil(t, repo.created)
+	require.Nil(t, credSvc.createdReq)
+}
+
+func TestCreateRoute_RejectsUnsupportedNativeProtocol(t *testing.T) {
+	repo := &fakeTenantRouteRepo{}
+	credSvc := &fakeTenantCredentialService{}
+	validator := &fakeChannelValidator{}
+	svc := &channelService{
+		tenantRouteRepo:   repo,
+		tenantCredService: credSvc,
+		validator:         validator,
+		modelRepo:         &fakeModelRepo{},
+	}
+
+	_, err := svc.CreateRoute(context.Background(), uuid.New(), &channeldto.CreateRouteRequest{
+		Name:            "Mistral Route",
+		ChannelProvider: "mistral",
+		APIKey:          "test-key",
+		Models:          []string{"mistral-large"},
+		NativeProtocols: channelmodel.NativeProtocolConfig{
+			OpenAIResponses: channelmodel.NativeProtocolEndpoint{Enabled: true},
+		},
+	})
+
+	require.Error(t, err)
+	require.Contains(t, err.Error(), "native_protocols.openai_responses")
+	require.Equal(t, 0, validator.createCalls)
+	require.Nil(t, repo.created)
+	require.Nil(t, credSvc.createdReq)
+}
+
+func TestCreateRoute_ReturnsValidationWarningsInView(t *testing.T) {
+	repo := &fakeTenantRouteRepo{}
+	credSvc := &fakeTenantCredentialService{}
+	validator := &fakeChannelValidator{
+		report: map[string]interface{}{
+			"provider":         "openai",
+			"warning_messages": []string{"sampled validation warning"},
+		},
+	}
+	svc := &channelService{
+		tenantRouteRepo:   repo,
+		tenantCredService: credSvc,
+		validator:         validator,
+		modelRepo:         &fakeModelRepo{},
+	}
+
+	view, err := svc.CreateRoute(context.Background(), uuid.New(), &channeldto.CreateRouteRequest{
+		Name:            "Sampled OpenAI",
+		ChannelProvider: "openai",
+		APIKey:          "test-key",
+		Models:          []string{"gpt-4o", "gpt-4.1"},
+	})
+
+	require.NoError(t, err)
+	require.Equal(t, []string{"sampled validation warning"}, view.Warnings)
+}
+
+func TestCreateRoute_AutoEnablesOnlyModelsWithoutExistingConfig(t *testing.T) {
+	modelID := uuid.New()
+	existingModelID := uuid.New()
+	orgID := uuid.New()
+
+	repo := &fakeTenantRouteRepo{}
+	credSvc := &fakeTenantCredentialService{}
+	validator := &fakeChannelValidator{}
+	configRepo := &fakeModelConfigRepo{
+		configs: map[uuid.UUID]*llmmodelmodel.ModelConfig{
+			existingModelID: {
+				OrganizationID: orgID,
+				ModelID:        existingModelID,
+				IsEnabled:      false,
+			},
+		},
+	}
+	availableSvc := &fakeAvailableModelsService{}
+	svc := &channelService{
+		tenantRouteRepo:   repo,
+		tenantCredService: credSvc,
+		validator:         validator,
+		modelRepo: &fakeModelRepo{
+			models: []*llmmodelmodel.LLMModel{
+				{ID: modelID, Model: "gpt-4o"},
+				{ID: existingModelID, Model: "deepseek-chat"},
+			},
+		},
+		modelConfigRepo: configRepo,
+		availableModels: availableSvc,
+	}
+
+	_, err := svc.CreateRoute(context.Background(), orgID, &channeldto.CreateRouteRequest{
+		Name:            "OpenAI Route",
+		ChannelProvider: "openai",
+		APIKey:          "test-key",
+		Models:          []string{"gpt-4o", "deepseek-chat", "gpt-4o", "*"},
+	})
+
+	require.NoError(t, err)
+	require.Len(t, configRepo.upserts, 1)
+	require.Equal(t, modelID, configRepo.upserts[0].ModelID)
+	require.True(t, configRepo.upserts[0].IsEnabled)
+	require.Equal(t, llmmodelmodel.AccessScopeAll, configRepo.upserts[0].AccessScope)
+	require.Equal(t, []uuid.UUID{orgID}, availableSvc.invalidated)
+}
+
+func TestUpdateRoute_UsesCreationValidationLogic(t *testing.T) {
+	credID := uuid.New()
+	repo := &fakeTenantRouteRepo{
+		routeByID: &channelmodel.LLMRoute{
+			ID:              uuid.New(),
+			OrganizationID:  uuid.New(),
+			Type:            "PRIVATE",
+			CredentialID:    &credID,
+			Name:            "Existing Route",
+			ChannelProvider: "qwen",
+			Models:          []string{"qwen2.5-14b-instruct"},
+			IsEnabled:       true,
+		},
+	}
+	credSvc := &fakeTenantCredentialService{
+		cred: &credentialmodel.TenantCredential{ID: credID},
+	}
+	validator := &fakeChannelValidator{
+		report: map[string]interface{}{
+			"provider":         "qwen",
+			"warning_messages": []string{"representative models failed validation: qwen-image-2.0 [image-gen] (unauthorized)"},
+			"failed_models": []map[string]interface{}{
+				{"model": "qwen-image-2.0", "use_case": "image-gen", "message": "unauthorized"},
+			},
+		},
+	}
+	svc := &channelService{
+		tenantRouteRepo:   repo,
+		tenantCredService: credSvc,
+		validator:         validator,
+		modelRepo:         &fakeModelRepo{},
+	}
+
+	view, err := svc.UpdateRoute(context.Background(), repo.routeByID.OrganizationID, repo.routeByID.ID, &channeldto.UpdateRouteRequest{
+		Models: []string{"qwen2.5-14b-instruct", "qwen-image-2.0"},
+	})
+
+	require.NoError(t, err)
+	require.Equal(t, 1, validator.createCalls)
+	require.Equal(t, 0, validator.validateCalls)
+	require.NotNil(t, repo.updated)
+	require.Equal(t, []string{"qwen2.5-14b-instruct", "qwen-image-2.0"}, repo.updated.Models)
+	require.Equal(t, []string{"representative models failed validation: qwen-image-2.0 [image-gen] (unauthorized)"}, view.Warnings)
+	require.Contains(t, view.ValidationReport, "failed_models")
+}
+
+func TestUpdateRoute_RebindsInsteadOfMutatingSharedCredential(t *testing.T) {
+	organizationID := uuid.New()
+	routeID := uuid.New()
+	sharedCredentialID := uuid.New()
+	replacementCredentialID := uuid.New()
+	replacementKey := "replacement-api-key"
+	repo := &fakeTenantRouteRepo{
+		routeByID: &channelmodel.LLMRoute{
+			ID:              routeID,
+			OrganizationID:  organizationID,
+			Type:            shared.RouteTypePrivate,
+			CredentialID:    &sharedCredentialID,
+			Name:            "Qwen Route",
+			ChannelProvider: "qwen",
+			APIBaseURL:      "https://dashscope.aliyuncs.com/compatible-mode/v1",
+			Models:          []string{"qwen-plus"},
+			IsEnabled:       true,
+		},
+	}
+	credSvc := &fakeTenantCredentialService{
+		cred: &credentialmodel.TenantCredential{
+			ID:              sharedCredentialID,
+			ChannelProvider: "qwen",
+			APIBaseURL:      "https://dashscope.aliyuncs.com/compatible-mode/v1",
+		},
+		nextCred: &credentialmodel.TenantCredential{
+			ID:              replacementCredentialID,
+			ChannelProvider: "qwen",
+			APIBaseURL:      "https://dashscope.aliyuncs.com/compatible-mode/v1",
+		},
+	}
+	svc := &channelService{
+		tenantRouteRepo:   repo,
+		tenantCredService: credSvc,
+		validator:         &fakeChannelValidator{},
+		modelRepo: &fakeModelRepo{
+			models: []*llmmodelmodel.LLMModel{{ID: uuid.New(), Model: "qwen-plus"}},
+		},
+	}
+
+	_, err := svc.UpdateRoute(context.Background(), organizationID, routeID, &channeldto.UpdateRouteRequest{
+		APIKey: &replacementKey,
+	})
+
+	require.NoError(t, err)
+	require.Nil(t, credSvc.updatedReq, "a route edit must never mutate its attached credential")
+	require.NotNil(t, credSvc.createdReq)
+	require.Equal(t, replacementKey, credSvc.createdReq.APIKey)
+	require.NotNil(t, repo.updated)
+	require.NotNil(t, repo.updated.CredentialID)
+	require.Equal(t, replacementCredentialID, *repo.updated.CredentialID)
+}
+
+func TestUpdateRoute_RejectsUnsupportedNativeProtocol(t *testing.T) {
+	credID := uuid.New()
+	orgID := uuid.New()
+	routeID := uuid.New()
+	repo := &fakeTenantRouteRepo{
+		routeByID: &channelmodel.LLMRoute{
+			ID:              routeID,
+			OrganizationID:  orgID,
+			Type:            "PRIVATE",
+			CredentialID:    &credID,
+			Name:            "Existing Route",
+			ChannelProvider: "mistral",
+			Models:          []string{"mistral-large"},
+			IsEnabled:       true,
+		},
+	}
+	svc := &channelService{
+		tenantRouteRepo:   repo,
+		tenantCredService: &fakeTenantCredentialService{cred: &credentialmodel.TenantCredential{ID: credID}},
+		validator:         &fakeChannelValidator{},
+		modelRepo:         &fakeModelRepo{},
+	}
+
+	_, err := svc.UpdateRoute(context.Background(), orgID, routeID, &channeldto.UpdateRouteRequest{
+		NativeProtocols: &channelmodel.NativeProtocolConfig{
+			AnthropicMessages: channelmodel.NativeProtocolEndpoint{Enabled: true},
+		},
+	})
+
+	require.Error(t, err)
+	require.Contains(t, err.Error(), "native_protocols.anthropic_messages")
+	require.Nil(t, repo.updated)
+}
+
+func TestUpdateRoute_AutoEnablesNewModelsWithoutOverwritingExistingConfig(t *testing.T) {
+	credID := uuid.New()
+	orgID := uuid.New()
+	modelID := uuid.New()
+	existingModelID := uuid.New()
+
+	repo := &fakeTenantRouteRepo{
+		routeByID: &channelmodel.LLMRoute{
+			ID:              uuid.New(),
+			OrganizationID:  orgID,
+			Type:            "PRIVATE",
+			CredentialID:    &credID,
+			Name:            "Existing Route",
+			ChannelProvider: "openai",
+			Models:          []string{"gpt-4o"},
+			IsEnabled:       true,
+		},
+	}
+	credSvc := &fakeTenantCredentialService{
+		cred: &credentialmodel.TenantCredential{ID: credID},
+	}
+	configRepo := &fakeModelConfigRepo{
+		configs: map[uuid.UUID]*llmmodelmodel.ModelConfig{
+			existingModelID: {
+				OrganizationID: orgID,
+				ModelID:        existingModelID,
+				IsEnabled:      false,
+			},
+		},
+	}
+	availableSvc := &fakeAvailableModelsService{}
+	svc := &channelService{
+		tenantRouteRepo:   repo,
+		tenantCredService: credSvc,
+		validator:         &fakeChannelValidator{},
+		modelRepo: &fakeModelRepo{
+			models: []*llmmodelmodel.LLMModel{
+				{ID: modelID, Model: "gpt-4.1"},
+				{ID: existingModelID, Model: "deepseek-chat"},
+			},
+		},
+		modelConfigRepo: configRepo,
+		availableModels: availableSvc,
+	}
+
+	_, err := svc.UpdateRoute(context.Background(), orgID, repo.routeByID.ID, &channeldto.UpdateRouteRequest{
+		Models: []string{"gpt-4.1", "deepseek-chat"},
+	})
+
+	require.NoError(t, err)
+	require.Len(t, configRepo.upserts, 1)
+	require.Equal(t, modelID, configRepo.upserts[0].ModelID)
+	require.True(t, configRepo.upserts[0].IsEnabled)
+	require.Equal(t, []uuid.UUID{orgID}, availableSvc.invalidated)
+}
+
+func TestUpdateOfficialChannelSettingsInvalidatesAvailableModelsCache(t *testing.T) {
+	orgID := uuid.New()
+	routeID := uuid.New()
+	enabled := false
+	availableSvc := &fakeAvailableModelsService{}
+	repo := &fakeTenantRouteRepo{
+		routes: []*channelmodel.LLMRoute{
+			{
+				ID:              routeID,
+				OrganizationID:  orgID,
+				IsOfficial:      true,
+				ChannelProvider: "mingyingkeji-cloud",
+				IsEnabled:       true,
+			},
+		},
+	}
+	svc := &channelService{
+		tenantRouteRepo: repo,
+		availableModels: availableSvc,
+	}
+
+	updated, err := svc.UpdateOfficialChannelSettings(context.Background(), orgID, &channeldto.UpdateOfficialChannelSettingsRequest{
+		GroupID:   "mingyingkeji-cloud",
+		IsEnabled: &enabled,
+	})
+	require.NoError(t, err)
+	require.Equal(t, int64(1), updated)
+	require.NotNil(t, repo.updated)
+	require.False(t, repo.updated.IsEnabled)
+	require.Equal(t, []uuid.UUID{orgID}, availableSvc.invalidated)
+}
+
+func TestCreateRoute_OpenAICompatibleRequiresBaseURL(t *testing.T) {
+	repo := &fakeTenantRouteRepo{}
+	credSvc := &fakeTenantCredentialService{}
+	validator := &fakeChannelValidator{}
+	svc := &channelService{
+		tenantRouteRepo:   repo,
+		tenantCredService: credSvc,
+		validator:         validator,
+		modelRepo:         &fakeModelRepo{},
+	}
+
+	_, err := svc.CreateRoute(context.Background(), uuid.New(), &channeldto.CreateRouteRequest{
+		Name:            "Compatible Proxy",
+		ChannelProvider: "openai-compatible",
+		APIKey:          "test-key",
+		Models:          []string{"gpt-4o"},
+	})
+
+	require.Error(t, err)
+	require.Contains(t, err.Error(), "api_base_url")
+	require.Nil(t, repo.created)
+	require.Nil(t, credSvc.createdReq)
+}
+
+func TestCreateRoute_OpenAICompatibleRequiresAPIKey(t *testing.T) {
+	repo := &fakeTenantRouteRepo{}
+	credSvc := &fakeTenantCredentialService{}
+	validator := &fakeChannelValidator{}
+	svc := &channelService{
+		tenantRouteRepo:   repo,
+		tenantCredService: credSvc,
+		validator:         validator,
+		modelRepo:         &fakeModelRepo{},
+	}
+
+	_, err := svc.CreateRoute(context.Background(), uuid.New(), &channeldto.CreateRouteRequest{
+		Name:            "Compatible Proxy",
+		ChannelProvider: "openai-compatible",
+		APIBaseURL:      "https://proxy.example.com/v1",
+		Models:          []string{"gpt-4o"},
+	})
+
+	require.Error(t, err)
+	require.Contains(t, err.Error(), "api_key")
+	require.Equal(t, 0, validator.createCalls)
+	require.Nil(t, repo.created)
+	require.Nil(t, credSvc.createdReq)
+}
+
+func TestCreateRoute_RejectsPrivateBaseURLBeforeValidation(t *testing.T) {
+	repo := &fakeTenantRouteRepo{}
+	credSvc := &fakeTenantCredentialService{}
+	validator := &fakeChannelValidator{}
+	svc := &channelService{
+		tenantRouteRepo:   repo,
+		tenantCredService: credSvc,
+		validator:         validator,
+		modelRepo:         &fakeModelRepo{},
+	}
+
+	_, err := svc.CreateRoute(context.Background(), uuid.New(), &channeldto.CreateRouteRequest{
+		Name:            "Internal Proxy",
+		ChannelProvider: "openai-compatible",
+		APIKey:          "test-key",
+		APIBaseURL:      "http://127.0.0.1:8080/v1",
+		Models:          []string{"gpt-4o"},
+	})
+
+	require.Error(t, err)
+	require.ErrorContains(t, err, "api_base_url")
+	require.Equal(t, 0, validator.createCalls)
+	require.Nil(t, repo.created)
+	require.Nil(t, credSvc.createdReq)
+}
+
+func TestCreateRoute_OllamaRejectsPrivateBaseURLByDefault(t *testing.T) {
+	repo := &fakeTenantRouteRepo{}
+	credSvc := &fakeTenantCredentialService{}
+	validator := &fakeChannelValidator{}
+	svc := &channelService{
+		tenantRouteRepo:   repo,
+		tenantCredService: credSvc,
+		validator:         validator,
+		modelRepo:         &fakeModelRepo{},
+	}
+
+	_, err := svc.CreateRoute(context.Background(), uuid.New(), &channeldto.CreateRouteRequest{
+		Name:            "Local Ollama",
+		ChannelProvider: "ollama",
+		APIBaseURL:      "http://localhost:11434",
+		Models:          []string{"qwen3.5:4b"},
+	})
+
+	require.Error(t, err)
+	require.ErrorContains(t, err, "api_base_url")
+	require.Equal(t, 0, validator.createCalls)
+	require.Nil(t, repo.created)
+	require.Nil(t, credSvc.createdReq)
+}
+
+func TestCreateRoute_OllamaAllowsEmptyAPIKey(t *testing.T) {
+	setLLMAllowPrivateBaseURL(t, true)
+	repo := &fakeTenantRouteRepo{}
+	credSvc := &fakeTenantCredentialService{}
+	validator := &fakeChannelValidator{}
+	svc := &channelService{
+		tenantRouteRepo:   repo,
+		tenantCredService: credSvc,
+		validator:         validator,
+		modelRepo:         &fakeModelRepo{},
+	}
+
+	view, err := svc.CreateRoute(context.Background(), uuid.New(), &channeldto.CreateRouteRequest{
+		Name:            "Local Ollama",
+		ChannelProvider: "ollama",
+		APIBaseURL:      "http://localhost:11434",
+		Models:          []string{"qwen3.5:4b"},
+	})
+
+	require.NoError(t, err)
+	require.Equal(t, "ollama", validator.lastProvider)
+	require.Equal(t, "", validator.lastAPIKey)
+	require.NotNil(t, credSvc.createdReq)
+	require.Equal(t, "ollama", credSvc.createdReq.ChannelProvider)
+	require.Equal(t, "", credSvc.createdReq.APIKey)
+	require.NotNil(t, repo.created)
+	require.Equal(t, "PRIVATE", string(repo.created.Type))
+	require.False(t, repo.created.IsOfficial)
+	require.Equal(t, "ollama", view.ChannelProvider)
+}
+
+func TestCreateRoute_OllamaUpsertsCustomProviderAndModels(t *testing.T) {
+	setLLMAllowPrivateBaseURL(t, true)
+	repo := &fakeTenantRouteRepo{}
+	credSvc := &fakeTenantCredentialService{}
+	validator := &fakeChannelValidator{}
+	customProviderRepo := &fakeCustomProviderRepo{}
+	customModelRepo := &fakeCustomModelRepo{}
+	svc := &channelService{
+		tenantRouteRepo:    repo,
+		tenantCredService:  credSvc,
+		validator:          validator,
+		modelRepo:          &fakeModelRepo{},
+		customProviderRepo: customProviderRepo,
+		customModelRepo:    customModelRepo,
+		ollamaModelLister: func(context.Context, string, string) ([]adapter.Model, error) {
+			return []adapter.Model{
+				{Name: "qwen3.5:4b", Type: "chat", Capabilities: []string{"chat"}},
+				{Name: "nomic-embed-text:latest", Type: "embedding", Capabilities: []string{"embedding"}},
+				{Name: "dengcao/Qwen3-Reranker-8B:Q4_K_M", Type: "unsupported"},
+			}, nil
+		},
+	}
+
+	_, err := svc.CreateRoute(context.Background(), uuid.New(), &channeldto.CreateRouteRequest{
+		Name:            "Local Ollama",
+		ChannelProvider: "ollama",
+		APIBaseURL:      "http://localhost:11434",
+		Models:          []string{"qwen3.5:4b", "nomic-embed-text:latest"},
+	})
+
+	require.NoError(t, err)
+	require.Len(t, customProviderRepo.created, 1)
+	require.Equal(t, "ollama", customProviderRepo.created[0].Provider)
+	require.Len(t, customModelRepo.created, 2)
+	require.Equal(t, []string{"text-chat"}, []string(customModelRepo.created[0].UseCases))
+	require.Equal(t, []string{"embedding"}, []string(customModelRepo.created[1].UseCases))
+}
+
+func TestCreateRoute_OllamaExactBaseURLUpsertsChatModelWithoutDiscovery(t *testing.T) {
+	setLLMAllowPrivateBaseURL(t, true)
+	repo := &fakeTenantRouteRepo{}
+	credSvc := &fakeTenantCredentialService{}
+	validator := &fakeChannelValidator{}
+	customProviderRepo := &fakeCustomProviderRepo{}
+	customModelRepo := &fakeCustomModelRepo{}
+	svc := &channelService{
+		tenantRouteRepo:    repo,
+		tenantCredService:  credSvc,
+		validator:          validator,
+		modelRepo:          &fakeModelRepo{models: []*llmmodelmodel.LLMModel{{Model: "qwen3.5:4b", ChatCompletions: true}}},
+		customProviderRepo: customProviderRepo,
+		customModelRepo:    customModelRepo,
+		ollamaModelLister: func(context.Context, string, string) ([]adapter.Model, error) {
+			t.Fatal("ollama exact mode should not auto-discover models")
+			return nil, nil
+		},
+	}
+
+	_, err := svc.CreateRoute(context.Background(), uuid.New(), &channeldto.CreateRouteRequest{
+		Name:            "Exact Ollama Chat",
+		ChannelProvider: "ollama",
+		APIBaseURL:      "http://localhost:11434/custom-endpoint#",
+		Models:          []string{"qwen3.5:4b"},
+	})
+
+	require.NoError(t, err)
+	require.Len(t, customProviderRepo.created, 1)
+	require.Equal(t, "http://localhost:11434/custom-endpoint#", customProviderRepo.created[0].APIBaseURL)
+	require.Len(t, customModelRepo.created, 1)
+	require.Equal(t, []string{"text-chat"}, []string(customModelRepo.created[0].UseCases))
+}
+
+func TestCreateRoute_OllamaExactBaseURLUpsertsEmbeddingModelWithoutDiscovery(t *testing.T) {
+	setLLMAllowPrivateBaseURL(t, true)
+	repo := &fakeTenantRouteRepo{}
+	credSvc := &fakeTenantCredentialService{}
+	validator := &fakeChannelValidator{}
+	customProviderRepo := &fakeCustomProviderRepo{}
+	customModelRepo := &fakeCustomModelRepo{}
+	svc := &channelService{
+		tenantRouteRepo:    repo,
+		tenantCredService:  credSvc,
+		validator:          validator,
+		modelRepo:          &fakeModelRepo{models: []*llmmodelmodel.LLMModel{{Model: "nomic-embed-text:latest", Embeddings: true}}},
+		customProviderRepo: customProviderRepo,
+		customModelRepo:    customModelRepo,
+		ollamaModelLister: func(context.Context, string, string) ([]adapter.Model, error) {
+			t.Fatal("ollama exact mode should not auto-discover models")
+			return nil, nil
+		},
+	}
+
+	_, err := svc.CreateRoute(context.Background(), uuid.New(), &channeldto.CreateRouteRequest{
+		Name:            "Exact Ollama Embed",
+		ChannelProvider: "ollama",
+		APIBaseURL:      "http://localhost:11434/embedding-endpoint #",
+		Models:          []string{"nomic-embed-text:latest"},
+	})
+
+	require.NoError(t, err)
+	require.Len(t, customModelRepo.created, 1)
+	require.Equal(t, []string{"embedding"}, []string(customModelRepo.created[0].UseCases))
+}
+
+func TestCreateRoute_OllamaExactBaseURLRejectsMixedUseCases(t *testing.T) {
+	setLLMAllowPrivateBaseURL(t, true)
+	svc := &channelService{
+		tenantRouteRepo:   &fakeTenantRouteRepo{},
+		tenantCredService: &fakeTenantCredentialService{},
+		validator:         &fakeChannelValidator{},
+		modelRepo: &fakeModelRepo{
+			models: []*llmmodelmodel.LLMModel{
+				{Model: "qwen3.5:4b", ChatCompletions: true},
+				{Model: "nomic-embed-text:latest", Embeddings: true},
+			},
+		},
+		customProviderRepo: &fakeCustomProviderRepo{},
+		customModelRepo:    &fakeCustomModelRepo{},
+		ollamaModelLister: func(context.Context, string, string) ([]adapter.Model, error) {
+			t.Fatal("ollama exact mode should not auto-discover models")
+			return nil, nil
+		},
+	}
+
+	_, err := svc.CreateRoute(context.Background(), uuid.New(), &channeldto.CreateRouteRequest{
+		Name:            "Mixed Exact Ollama",
+		ChannelProvider: "ollama",
+		APIBaseURL:      "http://localhost:11434/custom-endpoint#",
+		Models:          []string{"qwen3.5:4b", "nomic-embed-text:latest"},
+	})
+
+	require.Error(t, err)
+	require.ErrorContains(t, err, "single use case")
+}
+
+func TestCreateRoute_OllamaExactBaseURLRejectsUnknownModelWithoutDiscovery(t *testing.T) {
+	setLLMAllowPrivateBaseURL(t, true)
+	svc := &channelService{
+		tenantRouteRepo:    &fakeTenantRouteRepo{},
+		tenantCredService:  &fakeTenantCredentialService{},
+		validator:          &fakeChannelValidator{},
+		modelRepo:          &fakeModelRepo{},
+		customProviderRepo: &fakeCustomProviderRepo{},
+		customModelRepo:    &fakeCustomModelRepo{},
+		ollamaModelLister: func(context.Context, string, string) ([]adapter.Model, error) {
+			t.Fatal("ollama exact mode should not auto-discover models")
+			return nil, nil
+		},
+	}
+
+	_, err := svc.CreateRoute(context.Background(), uuid.New(), &channeldto.CreateRouteRequest{
+		Name:            "Unknown Exact Ollama",
+		ChannelProvider: "ollama",
+		APIBaseURL:      "http://localhost:11434/custom-endpoint#",
+		Models:          []string{"qwen3.5:4b"},
+	})
+
+	require.Error(t, err)
+	require.ErrorContains(t, err, "local model library")
+}
+
+func TestCreateRoute_OllamaRejectsUnsupportedRerankModel(t *testing.T) {
+	setLLMAllowPrivateBaseURL(t, true)
+	svc := &channelService{
+		tenantRouteRepo:    &fakeTenantRouteRepo{},
+		tenantCredService:  &fakeTenantCredentialService{},
+		validator:          &fakeChannelValidator{},
+		modelRepo:          &fakeModelRepo{},
+		customProviderRepo: &fakeCustomProviderRepo{},
+		customModelRepo:    &fakeCustomModelRepo{},
+		ollamaModelLister: func(context.Context, string, string) ([]adapter.Model, error) {
+			return []adapter.Model{
+				{Name: "dengcao/Qwen3-Reranker-8B:Q4_K_M", Type: "unsupported"},
+			}, nil
+		},
+	}
+
+	_, err := svc.CreateRoute(context.Background(), uuid.New(), &channeldto.CreateRouteRequest{
+		Name:            "Local Ollama",
+		ChannelProvider: "ollama",
+		APIBaseURL:      "http://localhost:11434",
+		Models:          []string{"dengcao/Qwen3-Reranker-8B:Q4_K_M"},
+	})
+
+	require.ErrorContains(t, err, "is not supported by this adapter")
+}
+
+func TestDiscoverOllamaModels_MapsUseCases(t *testing.T) {
+	setLLMAllowPrivateBaseURL(t, true)
+	svc := &channelService{
+		ollamaModelLister: func(context.Context, string, string) ([]adapter.Model, error) {
+			return []adapter.Model{
+				{Name: "qwen3.5:4b", Type: "chat", Capabilities: []string{"chat"}},
+				{Name: "nomic-embed-text:latest", Type: "embedding", Capabilities: []string{"embedding"}},
+				{Name: "dengcao/Qwen3-Reranker-8B:Q4_K_M", Type: "unsupported"},
+			}, nil
+		},
+	}
+
+	result, err := svc.DiscoverOllamaModels(context.Background(), &channeldto.DiscoverOllamaModelsRequest{
+		APIBaseURL: "http://localhost:11434",
+	})
+
+	require.NoError(t, err)
+	require.Equal(t, 3, result.Total)
+	require.Equal(t, "text-chat", result.Models[0].UseCase)
+	require.Equal(t, "embedding", result.Models[1].UseCase)
+	require.Equal(t, "unsupported", result.Models[2].UseCase)
+}
+
+func TestDiscoverDraftChannelModels_ReturnsUnsupportedWhenListingIsUnsupported(t *testing.T) {
+	svc := &channelService{}
+
+	result, err := svc.DiscoverDraftChannelModels(context.Background(), &channeldto.DiscoverDraftChannelModelsRequest{
+		ChannelProvider: "openai-compatible",
+		APIKey:          "sk-test",
+		APIBaseURL:      "https://proxy.example.com/v1/chat/completions#",
+	})
+
+	require.NoError(t, err)
+	require.NotNil(t, result)
+	require.False(t, result.ListingSupported)
+	require.Equal(t, 0, result.Total)
+	require.Empty(t, result.Models)
+}
+
+func TestDiscoverOllamaModels_RejectsExactBaseURL(t *testing.T) {
+	svc := &channelService{
+		ollamaModelLister: func(context.Context, string, string) ([]adapter.Model, error) {
+			t.Fatal("ollama exact mode should not auto-discover models")
+			return nil, nil
+		},
+	}
+
+	_, err := svc.DiscoverOllamaModels(context.Background(), &channeldto.DiscoverOllamaModelsRequest{
+		APIBaseURL: "http://localhost:11434/custom-endpoint#",
+	})
+
+	require.Error(t, err)
+	require.ErrorContains(t, err, "does not support auto-discover")
+}
+
+func TestDraftTestChannelModel_UsesValidatorAndReturnsNormalizedResult(t *testing.T) {
+	validator := &fakeChannelValidator{
+		testResult: &channelprovider.TestResult{
+			Success:        true,
+			Status:         channelprovider.TestStatusSuccess,
+			Message:        "ok",
+			ResponseTimeMs: 34,
+			Model:          "gpt-4o",
+			UseCase:        "chat",
+		},
+	}
+	svc := &channelService{
+		tenantRouteRepo:   &fakeTenantRouteRepo{},
+		tenantCredService: &fakeTenantCredentialService{},
+		validator:         validator,
+		modelRepo:         &fakeModelRepo{},
+	}
+
+	result, err := svc.TestDraftChannelModel(context.Background(), uuid.New(), &channeldto.DraftTestChannelModelRequest{
+		ChannelProvider: "openai-compatible",
+		APIKey:          "test-key",
+		APIBaseURL:      "https://proxy.example.com/v1",
+		Model:           "gpt-4o",
+	})
+
+	require.NoError(t, err)
+	require.Equal(t, "openai-compatible", validator.lastTestProvider)
+	require.Equal(t, "https://proxy.example.com/v1", validator.lastTestBaseURL)
+	require.Equal(t, "gpt-4o", validator.lastTestModel)
+	require.Equal(t, true, result.Success)
+	require.Equal(t, channelprovider.TestStatusSuccess, result.Status)
+	require.Equal(t, "chat", result.UseCase)
+	require.Equal(t, "chat", result.TestMethod)
+	require.Equal(t, int64(34), result.ResponseTimeMs)
+	require.Nil(t, validator.lastTestStream)
+}
+
+func TestDraftTestChannelModel_OllamaAllowsEmptyAPIKey(t *testing.T) {
+	setLLMAllowPrivateBaseURL(t, true)
+	validator := &fakeChannelValidator{}
+	svc := &channelService{
+		tenantRouteRepo:   &fakeTenantRouteRepo{},
+		tenantCredService: &fakeTenantCredentialService{},
+		validator:         validator,
+		modelRepo:         &fakeModelRepo{},
+	}
+
+	result, err := svc.TestDraftChannelModel(context.Background(), uuid.New(), &channeldto.DraftTestChannelModelRequest{
+		ChannelProvider: "ollama",
+		APIBaseURL:      "http://localhost:11434",
+		Model:           "qwen3.5:4b",
+	})
+
+	require.NoError(t, err)
+	require.True(t, result.Success)
+	require.Equal(t, "ollama", validator.lastTestProvider)
+	require.Equal(t, "", validator.lastTestAPIKey)
+}
+
+func TestDraftTestChannelModel_RejectsPrivateBaseURLBeforeValidation(t *testing.T) {
+	validator := &fakeChannelValidator{}
+	svc := &channelService{
+		tenantRouteRepo:   &fakeTenantRouteRepo{},
+		tenantCredService: &fakeTenantCredentialService{},
+		validator:         validator,
+		modelRepo:         &fakeModelRepo{},
+	}
+
+	result, err := svc.TestDraftChannelModel(context.Background(), uuid.New(), &channeldto.DraftTestChannelModelRequest{
+		ChannelProvider: "openai-compatible",
+		APIKey:          "test-key",
+		APIBaseURL:      "http://127.0.0.1:8080/v1",
+		Model:           "gpt-4o",
+	})
+
+	require.NoError(t, err)
+	require.NotNil(t, result)
+	require.False(t, result.Success)
+	require.Contains(t, result.Message, "api_base_url")
+	require.Empty(t, validator.lastTestProvider)
+}
+
+func TestUpdateRoute_RejectsPrivateBaseURLBeforeMutation(t *testing.T) {
+	credID := uuid.New()
+	orgID := uuid.New()
+	routeID := uuid.New()
+	privateBaseURL := "http://127.0.0.1:8080/v1"
+	repo := &fakeTenantRouteRepo{
+		routeByID: &channelmodel.LLMRoute{
+			ID:              routeID,
+			OrganizationID:  orgID,
+			Type:            "PRIVATE",
+			CredentialID:    &credID,
+			Name:            "Existing Route",
+			ChannelProvider: "openai-compatible",
+			APIBaseURL:      "https://api.example.com/v1",
+			Models:          []string{"gpt-4o"},
+			IsEnabled:       true,
+		},
+	}
+	credSvc := &fakeTenantCredentialService{
+		cred: &credentialmodel.TenantCredential{ID: credID, ChannelProvider: "openai-compatible"},
+	}
+	validator := &fakeChannelValidator{}
+	svc := &channelService{
+		tenantRouteRepo:   repo,
+		tenantCredService: credSvc,
+		validator:         validator,
+		modelRepo:         &fakeModelRepo{},
+	}
+
+	_, err := svc.UpdateRoute(context.Background(), orgID, routeID, &channeldto.UpdateRouteRequest{
+		APIBaseURL: &privateBaseURL,
+	})
+
+	require.Error(t, err)
+	require.ErrorContains(t, err, "api_base_url")
+	require.Equal(t, 0, validator.createCalls)
+	require.Nil(t, repo.updated)
+	require.Nil(t, credSvc.updatedReq)
+}
+
+func TestUpdateRoute_OllamaCanClearAPIKey(t *testing.T) {
+	setLLMAllowPrivateBaseURL(t, true)
+	credID := uuid.New()
+	orgID := uuid.New()
+	repo := &fakeTenantRouteRepo{
+		routeByID: &channelmodel.LLMRoute{
+			ID:              uuid.New(),
+			OrganizationID:  orgID,
+			Type:            "PRIVATE",
+			CredentialID:    &credID,
+			Name:            "Existing Route",
+			ChannelProvider: "ollama",
+			APIBaseURL:      "http://localhost:11434",
+			Models:          []string{"qwen3.5:4b"},
+			IsEnabled:       true,
+		},
+	}
+	credSvc := &fakeTenantCredentialService{
+		cred: &credentialmodel.TenantCredential{ID: credID, ChannelProvider: "ollama"},
+	}
+	validator := &fakeChannelValidator{}
+	svc := &channelService{
+		tenantRouteRepo:   repo,
+		tenantCredService: credSvc,
+		validator:         validator,
+		modelRepo:         &fakeModelRepo{},
+	}
+
+	emptyKey := ""
+	_, err := svc.UpdateRoute(context.Background(), orgID, repo.routeByID.ID, &channeldto.UpdateRouteRequest{
+		APIKey: &emptyKey,
+	})
+
+	require.NoError(t, err)
+	require.Equal(t, "", validator.lastAPIKey)
+	require.Nil(t, credSvc.updatedReq)
+	require.NotNil(t, credSvc.createdReq)
+	require.Equal(t, "", credSvc.createdReq.APIKey)
+}
+
+func TestTestChannelModel_ReusesValidatorResultShape(t *testing.T) {
+	routeID := uuid.New()
+	credentialID := uuid.New()
+	repo := &fakeTenantRouteRepo{
+		routeByID: &channelmodel.LLMRoute{
+			ID:              routeID,
+			OrganizationID:  uuid.New(),
+			ChannelProvider: "openai-compatible",
+			APIBaseURL:      "https://proxy.example.com/v1",
+			CredentialID:    &credentialID,
+		},
+	}
+	credSvc := &fakeTenantCredentialService{
+		cred: &credentialmodel.TenantCredential{ID: credentialID},
+	}
+	validator := &fakeChannelValidator{
+		testResult: &channelprovider.TestResult{
+			Success:        true,
+			Status:         channelprovider.TestStatusSuccess,
+			Message:        "ok",
+			ResponseTimeMs: 56,
+			Model:          "gpt-4o",
+			UseCase:        "chat",
+		},
+	}
+	svc := &channelService{
+		tenantRouteRepo:   repo,
+		tenantCredService: credSvc,
+		validator:         validator,
+		modelRepo:         &fakeModelRepo{},
+	}
+
+	stream := true
+	result, err := svc.TestChannelModel(context.Background(), routeID, repo.routeByID.OrganizationID, "gpt-4o", "", &stream)
+
+	require.NoError(t, err)
+	require.Equal(t, true, result.Success)
+	require.Equal(t, channelprovider.TestStatusSuccess, result.Status)
+	require.Equal(t, "gpt-4o", result.Model)
+	require.Equal(t, "chat", result.UseCase)
+	require.Equal(t, "chat", result.TestMethod)
+	require.Equal(t, int64(56), result.ResponseTimeMs)
+	require.Equal(t, "openai-compatible", validator.lastTestProvider)
+	require.NotNil(t, validator.lastTestStream)
+	require.True(t, *validator.lastTestStream)
+}
+
+func TestTestChannelModel_RecordsInvalidProviderKey(t *testing.T) {
+	db := openChannelUpstreamStateTestDB(t)
+	routeID := uuid.New()
+	organizationID := uuid.New()
+	credentialID := uuid.New()
+	state := &upstreamstate.State{
+		CredentialID:      credentialID,
+		OrganizationID:    organizationID,
+		Generation:        1,
+		BalanceCapability: upstreamstate.BalanceCapabilityPermissionDenied,
+		Availability:      upstreamstate.AvailabilityUnknown,
+		LastCheckStatus:   upstreamstate.CheckStatusFailed,
+	}
+	require.NoError(t, db.Create(state).Error)
+
+	repo := &fakeTenantRouteRepo{
+		routeByID: &channelmodel.LLMRoute{
+			ID:              routeID,
+			OrganizationID:  organizationID,
+			ChannelProvider: "deepseek",
+			CredentialID:    &credentialID,
+		},
+	}
+	providerErr := adapter.NewAdapterError("AUTHENTICATION_FAILED", "invalid key", 401, adapter.ErrAuthFailed)
+	validator := &fakeChannelValidator{
+		testResult: &channelprovider.TestResult{
+			Success:       false,
+			Status:        channelprovider.TestStatusFailed,
+			Message:       "Private channel API key is invalid or expired. Update the API key and try again.",
+			Model:         "deepseek-chat",
+			ProviderError: providerErr,
+		},
+	}
+	upstreamService := upstreamstate.NewService(db, nil)
+	svc := &channelService{
+		tenantRouteRepo:   repo,
+		tenantCredService: &fakeTenantCredentialService{cred: &credentialmodel.TenantCredential{ID: credentialID}},
+		validator:         validator,
+		modelRepo:         &fakeModelRepo{},
+		upstreamState:     upstreamService,
+	}
+
+	stream := false
+	result, err := svc.TestChannelModel(context.Background(), routeID, organizationID, "deepseek-chat", "", &stream)
+
+	require.NoError(t, err)
+	require.False(t, result.Success)
+	updated, err := upstreamService.Get(context.Background(), organizationID, credentialID)
+	require.NoError(t, err)
+	require.Equal(t, upstreamstate.AvailabilityInvalidKey, updated.Availability)
+	require.Equal(t, upstreamstate.GuardReasonAuthInvalid, updated.BlockReason)
+	require.Equal(t, 401, updated.ProviderErrorStatus)
+}
+
+func openChannelUpstreamStateTestDB(t *testing.T) *gorm.DB {
+	t.Helper()
+	db, err := gorm.Open(sqlite.Open(":memory:"), &gorm.Config{})
+	require.NoError(t, err)
+	require.NoError(t, db.Exec(`CREATE TABLE llm_credential_upstream_states (
+		credential_id text PRIMARY KEY,
+		organization_id text NOT NULL,
+		generation integer NOT NULL DEFAULT 1,
+		balance_capability text NOT NULL DEFAULT 'unknown',
+		balance_snapshot text,
+		balance_observed_at datetime,
+		warning_thresholds text NOT NULL DEFAULT '[]',
+		availability text NOT NULL DEFAULT 'unknown',
+		observation_source text,
+		availability_observed_at datetime,
+		last_check_at datetime,
+		last_check_status text NOT NULL DEFAULT 'unknown',
+		last_check_error_kind text,
+		next_check_at datetime,
+		check_lease_until datetime,
+		consecutive_failures integer NOT NULL DEFAULT 0,
+		block_reason text,
+		cooldown_until datetime,
+		guard_strikes integer NOT NULL DEFAULT 0,
+		half_open_lease_until datetime,
+		manual_retry_requested_at datetime,
+		provider_error_code text,
+		provider_error_status integer NOT NULL DEFAULT 0,
+		created_at datetime NOT NULL DEFAULT CURRENT_TIMESTAMP,
+		updated_at datetime NOT NULL DEFAULT CURRENT_TIMESTAMP
+	)`).Error)
+	return db
+}
+
+func TestTestChannelModel_SkipsUnpricedModelBeforeValidator(t *testing.T) {
+	routeID := uuid.New()
+	credentialID := uuid.New()
+	orgID := uuid.New()
+	modelID := uuid.New()
+	db := openChannelPricingTestDB(t)
+	require.NoError(t, db.Exec(
+		`INSERT INTO llm_models (id, provider, name, input_price, output_price, input_price_configured, output_price_configured, image_prices) VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+		modelID.String(), "qwen", "qwen-image-2.0", "0", "0", false, false, "[]",
+	).Error)
+	repo := &fakeTenantRouteRepo{
+		routeByID: &channelmodel.LLMRoute{
+			ID:              routeID,
+			OrganizationID:  orgID,
+			ChannelProvider: "qwen",
+			APIBaseURL:      "https://dashscope.aliyuncs.com/compatible-mode/v1",
+			CredentialID:    &credentialID,
+		},
+	}
+	credSvc := &fakeTenantCredentialService{
+		cred: &credentialmodel.TenantCredential{ID: credentialID},
+	}
+	validator := &fakeChannelValidator{}
+	svc := &channelService{
+		tenantRouteRepo:   repo,
+		tenantCredService: credSvc,
+		validator:         validator,
+		modelRepo: &fakeModelRepo{models: []*llmmodelmodel.LLMModel{{
+			ID:              modelID,
+			Provider:        "qwen",
+			Model:           "qwen-image-2.0",
+			ImageGeneration: true,
+		}}},
+		db: db,
+	}
+
+	stream := false
+	result, err := svc.TestChannelModel(context.Background(), routeID, orgID, "qwen-image-2.0", "", &stream)
+
+	require.NoError(t, err)
+	require.False(t, result.Success)
+	require.Equal(t, channelprovider.TestStatusSkipped, result.Status)
+	require.Equal(t, channelModelPricingNotConfiguredMessage, result.Message)
+	require.Equal(t, channelModelPricingNotConfiguredCode, result.Code)
+	require.Equal(t, "qwen", result.Params["provider"])
+	require.Equal(t, "qwen-image-2.0", result.Params["model"])
+	require.Equal(t, modelID.String(), result.Params["model_id"])
+	require.Equal(t, string(gateway.PricingModelSourceGlobal), result.Params["model_source"])
+	require.Equal(t, string(gateway.PricingOperationImage), result.Params["operation"])
+	require.Equal(t, 0, validator.testCalls)
+
+	resultChan := make(chan *channeldto.BatchTestChannelModelsStreamResponse, 2)
+	svc.BatchTestChannelModels(context.Background(), routeID, orgID, []string{"qwen-image-2.0"}, "", &stream, resultChan)
+	results := make([]*channeldto.BatchTestChannelModelsStreamResponse, 0, 2)
+	for item := range resultChan {
+		results = append(results, item)
+	}
+	require.Len(t, results, 2)
+	require.Equal(t, channelprovider.TestStatusSkipped, results[0].Status)
+	require.Equal(t, channelModelPricingNotConfiguredCode, results[0].Code)
+	require.Equal(t, "qwen-image-2.0", results[0].Params["model"])
+	require.True(t, results[1].Completed)
+	require.Equal(t, 1, results[1].SkippedCount)
+	require.Equal(t, 0, validator.testCalls)
+}
+
+func TestTestChannelModel_AllowsModelWithOrganizationPriceOverride(t *testing.T) {
+	routeID := uuid.New()
+	credentialID := uuid.New()
+	orgID := uuid.New()
+	modelID := uuid.New()
+	db := openChannelPricingTestDB(t)
+	require.NoError(t, db.Exec(
+		`INSERT INTO llm_models (id, provider, name, input_price, output_price, input_price_configured, output_price_configured, image_prices) VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+		modelID.String(), "qwen", "qwen-image-2.0", "0", "0", false, false, "[]",
+	).Error)
+	require.NoError(t, db.Exec(
+		`INSERT INTO llm_model_configs (id, organization_id, model_id, output_price_override) VALUES (?, ?, ?, ?)`,
+		uuid.NewString(), orgID.String(), modelID.String(), "0.20",
+	).Error)
+	repo := &fakeTenantRouteRepo{
+		routeByID: &channelmodel.LLMRoute{
+			ID:              routeID,
+			OrganizationID:  orgID,
+			ChannelProvider: "qwen",
+			APIBaseURL:      "https://dashscope.aliyuncs.com/compatible-mode/v1",
+			CredentialID:    &credentialID,
+		},
+	}
+	credSvc := &fakeTenantCredentialService{
+		cred: &credentialmodel.TenantCredential{ID: credentialID},
+	}
+	validator := &fakeChannelValidator{}
+	svc := &channelService{
+		tenantRouteRepo:   repo,
+		tenantCredService: credSvc,
+		validator:         validator,
+		modelRepo: &fakeModelRepo{models: []*llmmodelmodel.LLMModel{{
+			ID:              modelID,
+			Provider:        "qwen",
+			Model:           "qwen-image-2.0",
+			ImageGeneration: true,
+		}}},
+		db: db,
+	}
+
+	stream := false
+	result, err := svc.TestChannelModel(context.Background(), routeID, orgID, "qwen-image-2.0", "", &stream)
+
+	require.NoError(t, err)
+	require.True(t, result.Success)
+	require.Equal(t, channelprovider.TestStatusSuccess, result.Status)
+	require.Equal(t, 1, validator.testCalls)
+	require.Equal(t, "qwen-image-2.0", validator.lastTestModel)
+}
+
+func TestTestChannelModel_DirectProviderDoesNotUseCrossProviderPricingPrecheck(t *testing.T) {
+	routeID := uuid.New()
+	credentialID := uuid.New()
+	orgID := uuid.New()
+	modelID := uuid.New()
+	db := openChannelPricingTestDB(t)
+	require.NoError(t, db.Exec(
+		`INSERT INTO llm_models (id, provider, name, input_price, output_price, input_price_configured, output_price_configured, image_prices) VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+		modelID.String(), "openai", "gpt-4o", "0", "0", false, false, "[]",
+	).Error)
+	repo := &fakeTenantRouteRepo{
+		routeByID: &channelmodel.LLMRoute{
+			ID:              routeID,
+			OrganizationID:  orgID,
+			ChannelProvider: "qwen",
+			APIBaseURL:      "https://dashscope.aliyuncs.com/compatible-mode/v1",
+			CredentialID:    &credentialID,
+		},
+	}
+	credSvc := &fakeTenantCredentialService{
+		cred: &credentialmodel.TenantCredential{ID: credentialID},
+	}
+	validator := &fakeChannelValidator{}
+	svc := &channelService{
+		tenantRouteRepo:   repo,
+		tenantCredService: credSvc,
+		validator:         validator,
+		modelRepo: &fakeModelRepo{models: []*llmmodelmodel.LLMModel{{
+			ID:              modelID,
+			Provider:        "openai",
+			Model:           "gpt-4o",
+			ChatCompletions: true,
+		}}},
+		db: db,
+	}
+
+	stream := false
+	result, err := svc.TestChannelModel(context.Background(), routeID, orgID, "gpt-4o", "", &stream)
+
+	require.NoError(t, err)
+	require.True(t, result.Success)
+	require.Equal(t, 1, validator.testCalls)
+	require.Equal(t, "qwen", validator.lastTestProvider)
+	require.Equal(t, "gpt-4o", validator.lastTestModel)
+}
+
+func TestTestChannelModel_OpenAICompatibleAllowsCrossProviderPricingPrecheck(t *testing.T) {
+	routeID := uuid.New()
+	credentialID := uuid.New()
+	orgID := uuid.New()
+	modelID := uuid.New()
+	db := openChannelPricingTestDB(t)
+	require.NoError(t, db.Exec(
+		`INSERT INTO llm_models (id, provider, name, input_price, output_price, input_price_configured, output_price_configured, image_prices) VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+		modelID.String(), "qwen", "qwen-plus", "0", "0", false, false, "[]",
+	).Error)
+	repo := &fakeTenantRouteRepo{
+		routeByID: &channelmodel.LLMRoute{
+			ID:              routeID,
+			OrganizationID:  orgID,
+			ChannelProvider: "openai-compatible",
+			APIBaseURL:      "https://proxy.example.com/v1",
+			CredentialID:    &credentialID,
+		},
+	}
+	credSvc := &fakeTenantCredentialService{
+		cred: &credentialmodel.TenantCredential{ID: credentialID},
+	}
+	validator := &fakeChannelValidator{}
+	svc := &channelService{
+		tenantRouteRepo:   repo,
+		tenantCredService: credSvc,
+		validator:         validator,
+		modelRepo: &fakeModelRepo{models: []*llmmodelmodel.LLMModel{{
+			ID:              modelID,
+			Provider:        "qwen",
+			Model:           "qwen-plus",
+			ChatCompletions: true,
+		}}},
+		db: db,
+	}
+
+	stream := false
+	result, err := svc.TestChannelModel(context.Background(), routeID, orgID, "qwen-plus", "", &stream)
+
+	require.NoError(t, err)
+	require.False(t, result.Success)
+	require.Equal(t, channelprovider.TestStatusSkipped, result.Status)
+	require.Equal(t, channelModelPricingNotConfiguredCode, result.Code)
+	require.Equal(t, "qwen-plus", result.Params["model"])
+	require.Equal(t, 0, validator.testCalls)
+}
+
+func TestBatchTestChannelModels_CountsSkippedImageModelsSeparately(t *testing.T) {
+	routeID := uuid.New()
+	credentialID := uuid.New()
+	orgID := uuid.New()
+	repo := &fakeTenantRouteRepo{
+		routeByID: &channelmodel.LLMRoute{
+			ID:              routeID,
+			OrganizationID:  orgID,
+			ChannelProvider: "openai-compatible",
+			APIBaseURL:      "https://proxy.example.com/v1",
+			CredentialID:    &credentialID,
+		},
+	}
+	credSvc := &fakeTenantCredentialService{
+		cred: &credentialmodel.TenantCredential{ID: credentialID},
+	}
+	validator := &fakeChannelValidator{
+		testResults: map[string]*channelprovider.TestResult{
+			"qwen-plus": {
+				Success:        true,
+				Status:         channelprovider.TestStatusSuccess,
+				Message:        "ok",
+				ResponseTimeMs: 21,
+				Model:          "qwen-plus",
+				UseCase:        "chat",
+			},
+			"qwen-bad": {
+				Success:        false,
+				Status:         channelprovider.TestStatusFailed,
+				Message:        "model not found",
+				ResponseTimeMs: 22,
+				Model:          "qwen-bad",
+				UseCase:        "chat",
+			},
+			"qwen-image": {
+				Success:        false,
+				Status:         channelprovider.TestStatusSkipped,
+				Message:        "image generation models require a real image generation test in the image workspace",
+				ResponseTimeMs: 0,
+				Model:          "qwen-image",
+				UseCase:        "image-gen",
+			},
+		},
+	}
+	svc := &channelService{
+		tenantRouteRepo:   repo,
+		tenantCredService: credSvc,
+		validator:         validator,
+		modelRepo:         &fakeModelRepo{},
+	}
+	resultChan := make(chan *channeldto.BatchTestChannelModelsStreamResponse, 4)
+
+	svc.BatchTestChannelModels(context.Background(), routeID, orgID, []string{"qwen-plus", "qwen-bad", "qwen-image"}, "", nil, resultChan)
+
+	results := make([]*channeldto.BatchTestChannelModelsStreamResponse, 0, 4)
+	for result := range resultChan {
+		results = append(results, result)
+	}
+	require.Len(t, results, 4)
+	require.Equal(t, channelprovider.TestStatusSuccess, results[0].Status)
+	require.Equal(t, channelprovider.TestStatusFailed, results[1].Status)
+	require.Equal(t, channelprovider.TestStatusSkipped, results[2].Status)
+	require.True(t, results[3].Completed)
+	require.Equal(t, 1, results[3].SuccessCount)
+	require.Equal(t, 1, results[3].FailureCount)
+	require.Equal(t, 1, results[3].SkippedCount)
+	require.Len(t, validator.testStreams, 3)
+	for _, requestedStream := range validator.testStreams {
+		require.Nil(t, requestedStream)
+	}
+}

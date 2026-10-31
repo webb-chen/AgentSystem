@@ -1,0 +1,596 @@
+package gateway
+
+import (
+	"bytes"
+	"context"
+	"encoding/json"
+	"errors"
+	"io"
+	"net/http"
+	"net/http/httptest"
+	"sync/atomic"
+	"testing"
+
+	"github.com/google/uuid"
+	"github.com/webb-chen/AgentSystem/api/config"
+	apikeymodel "github.com/webb-chen/AgentSystem/api/internal/modules/llm/apikey/model"
+	channelmodel "github.com/webb-chen/AgentSystem/api/internal/modules/llm/channel/model"
+	credentialmodel "github.com/webb-chen/AgentSystem/api/internal/modules/llm/credential/model"
+	llmmodel "github.com/webb-chen/AgentSystem/api/internal/modules/llm/llmmodel/model"
+	adapter "github.com/webb-chen/AgentSystem/api/internal/modules/llm/protocol/adapters"
+	_ "github.com/webb-chen/AgentSystem/api/internal/modules/llm/protocol/adapters/provider"
+	"github.com/webb-chen/AgentSystem/api/internal/modules/llm/shared"
+)
+
+const musicGatewayTestModel = "music-3.0"
+
+func TestGenerateLyricsUsesOfficialHTTPTransport(t *testing.T) {
+	organizationID := uuid.New()
+	requestID := uuid.NewString()
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if got, want := r.URL.Path, "/v1/internal/audio/music/lyrics"; got != want {
+			t.Fatalf("path = %q, want %q", got, want)
+		}
+		if got, want := r.Header.Get(headerMINGYINGKEJIBillingOrganizationID), organizationID.String(); got != want {
+			t.Fatalf("billing organization = %q, want %q", got, want)
+		}
+		if got, want := r.Header.Get(headerMINGYINGKEJIRequestID), requestID; got != want {
+			t.Fatalf("request id = %q, want %q", got, want)
+		}
+		_, _ = w.Write([]byte(`{"code":0,"data":{"title":"雨后的木吉他","style_tags":["Folk"],"lyrics":"[Verse]\n雨停在黄昏以后"}}`))
+	}))
+	defer server.Close()
+	setMusicGatewayTestConfig(t, server.URL)
+
+	service := newMusicGatewayTestService(t, organizationID, true)
+	result, err := service.GenerateLyrics(t.Context(), &apikeymodel.TenantAPIKey{
+		ID:             uuid.NewString(),
+		OrganizationID: organizationID.String(),
+	}, &LyricsRequest{
+		RequestID: requestID,
+		Model:     musicGatewayTestModel,
+		Prompt:    "一首温暖的民谣",
+	})
+	if err != nil {
+		t.Fatalf("GenerateLyrics() error = %v", err)
+	}
+	if result.Title != "雨后的木吉他" || result.Lyrics == "" {
+		t.Fatalf("GenerateLyrics() result = %#v", result)
+	}
+}
+
+func TestGenerateLyricsReportsOfficialProviderFailure(t *testing.T) {
+	organizationID := uuid.New()
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		http.Error(w, "unauthorized", http.StatusUnauthorized)
+	}))
+	defer server.Close()
+	setMusicGatewayTestConfig(t, server.URL)
+	recorder := withGatewayObservabilityRecorder(t)
+	service := newMusicGatewayTestService(t, organizationID, true)
+
+	_, err := service.GenerateLyrics(t.Context(), &apikeymodel.TenantAPIKey{
+		ID:             uuid.NewString(),
+		OrganizationID: organizationID.String(),
+	}, &LyricsRequest{
+		RequestID: uuid.NewString(),
+		Model:     musicGatewayTestModel,
+		Prompt:    "warm folk song",
+	})
+	if err == nil {
+		t.Fatal("GenerateLyrics() error = nil, want provider rejection")
+	}
+	if len(recorder.events) != 1 || recorder.events[0].Attributes["use_system_provider"] != true {
+		t.Fatalf("events = %#v, want one system-channel failure", recorder.events)
+	}
+}
+
+var errMusicDestinationWrite = errors.New("music destination write failed")
+
+type failingMusicWriter struct{}
+
+func (failingMusicWriter) Write([]byte) (int, error) {
+	return 0, errMusicDestinationWrite
+}
+
+func TestGenerateMusicUsesStableRequestIDAndCompleteOfficialStream(t *testing.T) {
+	organizationID := uuid.New()
+	requestID := uuid.NewString()
+	var requestCount atomic.Int32
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		requestCount.Add(1)
+		if got, want := r.URL.Path, "/v1/internal/audio/music/generations"; got != want {
+			t.Fatalf("path = %q, want %q", got, want)
+		}
+		if got := r.Header.Get(headerMINGYINGKEJIRequestID); got != requestID {
+			t.Fatalf("request id = %q, want %q", got, requestID)
+		}
+		if got := r.Header.Get(headerMINGYINGKEJIBillingOrganizationID); got != organizationID.String() {
+			t.Fatalf("billing organization = %q", got)
+		}
+		var request adapter.MusicRequest
+		if err := json.NewDecoder(r.Body).Decode(&request); err != nil {
+			t.Fatal(err)
+		}
+		if request.Model != musicGatewayTestModel || request.Mode != adapter.MusicModeInstrumental || request.Prompt != "warm piano" {
+			t.Fatalf("music request = %#v", request)
+		}
+		w.Header().Set("Content-Type", "audio/mpeg")
+		w.Header().Set("Trailer", "X-MINGYINGKEJI-Stream-Status")
+		_, _ = w.Write([]byte("MP3"))
+		w.Header().Set("X-MINGYINGKEJI-Stream-Status", "complete")
+	}))
+	defer server.Close()
+	setMusicGatewayTestConfig(t, server.URL)
+
+	service := newMusicGatewayTestService(t, organizationID, true)
+	var audio bytes.Buffer
+	err := service.GenerateMusic(t.Context(), &apikeymodel.TenantAPIKey{
+		ID:             uuid.NewString(),
+		OrganizationID: organizationID.String(),
+	}, &MusicRequest{
+		RequestID:      requestID,
+		Model:          musicGatewayTestModel,
+		Mode:           adapter.MusicModeInstrumental,
+		Prompt:         "warm piano",
+		ResponseFormat: "mp3",
+	}, &audio)
+	if err != nil {
+		t.Fatalf("GenerateMusic() error = %v", err)
+	}
+	if got, want := audio.String(), "MP3"; got != want {
+		t.Fatalf("audio = %q, want %q", got, want)
+	}
+	if got := requestCount.Load(); got != 1 {
+		t.Fatalf("request count = %d, want 1", got)
+	}
+}
+
+func TestGenerateMusicRejectsModelWithoutCapabilityBeforeDispatch(t *testing.T) {
+	organizationID := uuid.New()
+	var requestCount atomic.Int32
+	server := httptest.NewServer(http.HandlerFunc(func(http.ResponseWriter, *http.Request) {
+		requestCount.Add(1)
+	}))
+	defer server.Close()
+	setMusicGatewayTestConfig(t, server.URL)
+
+	service := newMusicGatewayTestService(t, organizationID, false)
+	err := service.GenerateMusic(t.Context(), &apikeymodel.TenantAPIKey{
+		ID:             uuid.NewString(),
+		OrganizationID: organizationID.String(),
+	}, &MusicRequest{
+		RequestID:      uuid.NewString(),
+		Model:          musicGatewayTestModel,
+		Mode:           adapter.MusicModeInstrumental,
+		Prompt:         "warm piano",
+		ResponseFormat: "mp3",
+	}, &bytes.Buffer{})
+	if !adapter.IsCapabilityUnsupported(err) {
+		t.Fatalf("GenerateMusic() error = %v, want capability unsupported", err)
+	}
+	if got := requestCount.Load(); got != 0 {
+		t.Fatalf("request count = %d, want 0", got)
+	}
+}
+
+func TestGenerateMusicRejectsNonCanonicalFormatBeforeDispatch(t *testing.T) {
+	organizationID := uuid.New()
+	var requestCount atomic.Int32
+	server := httptest.NewServer(http.HandlerFunc(func(http.ResponseWriter, *http.Request) {
+		requestCount.Add(1)
+	}))
+	defer server.Close()
+	setMusicGatewayTestConfig(t, server.URL)
+
+	service := newMusicGatewayTestService(t, organizationID, true)
+	err := service.GenerateMusic(t.Context(), &apikeymodel.TenantAPIKey{
+		ID:             uuid.NewString(),
+		OrganizationID: organizationID.String(),
+	}, &MusicRequest{
+		RequestID:      uuid.NewString(),
+		Model:          musicGatewayTestModel,
+		Mode:           adapter.MusicModeInstrumental,
+		Prompt:         "warm piano",
+		ResponseFormat: " mp3 ",
+	}, &bytes.Buffer{})
+	if !errors.Is(err, adapter.ErrInvalidRequest) {
+		t.Fatalf("GenerateMusic() error = %v, want ErrInvalidRequest", err)
+	}
+	if got := requestCount.Load(); got != 0 {
+		t.Fatalf("request count = %d, want 0", got)
+	}
+}
+
+func TestGenerateMusicRejectsNonCanonicalRequestIDBeforeDispatch(t *testing.T) {
+	organizationID := uuid.New()
+	var requestCount atomic.Int32
+	server := httptest.NewServer(http.HandlerFunc(func(http.ResponseWriter, *http.Request) {
+		requestCount.Add(1)
+	}))
+	defer server.Close()
+	setMusicGatewayTestConfig(t, server.URL)
+	service := newMusicGatewayTestService(t, organizationID, true)
+
+	for _, requestID := range []string{" " + uuid.NewString() + " ", uuid.Nil.String()} {
+		err := service.GenerateMusic(t.Context(), &apikeymodel.TenantAPIKey{
+			ID:             uuid.NewString(),
+			OrganizationID: organizationID.String(),
+		}, &MusicRequest{
+			RequestID:      requestID,
+			Model:          musicGatewayTestModel,
+			Mode:           adapter.MusicModeInstrumental,
+			Prompt:         "warm piano",
+			ResponseFormat: "mp3",
+		}, &bytes.Buffer{})
+		if !errors.Is(err, adapter.ErrInvalidRequest) {
+			t.Fatalf("GenerateMusic(%q) error = %v, want ErrInvalidRequest", requestID, err)
+		}
+	}
+	if got := requestCount.Load(); got != 0 {
+		t.Fatalf("request count = %d, want 0", got)
+	}
+}
+
+func TestGenerateMusicReportsOfficialProviderFailure(t *testing.T) {
+	organizationID := uuid.New()
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		http.Error(w, "unauthorized", http.StatusUnauthorized)
+	}))
+	defer server.Close()
+	setMusicGatewayTestConfig(t, server.URL)
+	recorder := withGatewayObservabilityRecorder(t)
+	service := newMusicGatewayTestService(t, organizationID, true)
+
+	err := service.GenerateMusic(t.Context(), &apikeymodel.TenantAPIKey{
+		ID:             uuid.NewString(),
+		OrganizationID: organizationID.String(),
+	}, &MusicRequest{
+		RequestID:      uuid.NewString(),
+		Model:          musicGatewayTestModel,
+		Mode:           adapter.MusicModeInstrumental,
+		Prompt:         "warm piano",
+		ResponseFormat: "mp3",
+	}, &bytes.Buffer{})
+	if err == nil {
+		t.Fatal("GenerateMusic() error = nil, want provider rejection")
+	}
+	if len(recorder.events) != 1 || recorder.events[0].Attributes["use_system_provider"] != true {
+		t.Fatalf("events = %#v, want one system-channel failure", recorder.events)
+	}
+}
+
+func TestGenerateMusicDoesNotReportDestinationWriteFailure(t *testing.T) {
+	organizationID := uuid.New()
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "audio/mpeg")
+		_, _ = io.WriteString(w, "MP3")
+	}))
+	defer server.Close()
+	setMusicGatewayTestConfig(t, server.URL)
+	recorder := withGatewayObservabilityRecorder(t)
+	service := newMusicGatewayTestService(t, organizationID, true)
+
+	err := service.GenerateMusic(t.Context(), &apikeymodel.TenantAPIKey{
+		ID:             uuid.NewString(),
+		OrganizationID: organizationID.String(),
+	}, &MusicRequest{
+		RequestID:      uuid.NewString(),
+		Model:          musicGatewayTestModel,
+		Mode:           adapter.MusicModeInstrumental,
+		Prompt:         "warm piano",
+		ResponseFormat: "mp3",
+	}, failingMusicWriter{})
+	if !errors.Is(err, errMusicDestinationWrite) {
+		t.Fatalf("GenerateMusic() error = %v, want destination write error", err)
+	}
+	if len(recorder.events) != 0 {
+		t.Fatalf("events = %#v, want no provider failure", recorder.events)
+	}
+}
+
+func TestGenerateMusicUsesPrivateMiniMaxRouteAndSettlesMeteredBilling(t *testing.T) {
+	organizationID := uuid.New()
+	requestID := uuid.NewString()
+	providerAdapter := &privateMusicGatewayAdapter{}
+	factory := adapter.NewDefaultAdapterFactory()
+	factory.Register("minimax", func(*adapter.AdapterConfig) (adapter.LLMProviderAdapter, error) {
+		return providerAdapter, nil
+	})
+	local := &fakeBillingProvider{checkBalanceResult: true}
+	pricing := &fakePricingEngine{meteredQuote: PricingQuote{TotalCredits: 17, OutputCredits: 17}}
+	service := newPrivateMusicGatewayTestService(t, organizationID)
+	service.adapterFactory = factory
+	service.billing = &fakeBillingProvider{checkBalanceResult: true}
+	service.localBilling = local
+	service.pricingEngine = pricing
+
+	var audio bytes.Buffer
+	err := service.GenerateMusic(t.Context(), &apikeymodel.TenantAPIKey{
+		ID:             uuid.NewString(),
+		OrganizationID: organizationID.String(),
+	}, &MusicRequest{
+		RequestID:      requestID,
+		Model:          musicGatewayTestModel,
+		Mode:           adapter.MusicModeInstrumental,
+		Prompt:         "warm piano",
+		ResponseFormat: "mp3",
+	}, &audio)
+	if err != nil {
+		t.Fatalf("GenerateMusic() error = %v", err)
+	}
+	if got, want := audio.String(), "PRIVATE-MP3"; got != want {
+		t.Fatalf("audio = %q, want %q", got, want)
+	}
+	if local.preDeductCalls != 1 || local.settleCalls != 1 || local.lastSettle == nil {
+		t.Fatalf("local billing calls/settlement = %d/%d/%#v", local.preDeductCalls, local.settleCalls, local.lastSettle)
+	}
+	if local.lastSettle.AttemptID != requestID || local.lastSettle.PricingOperation != PricingOperationMusic || local.lastSettle.ActualCredits != 17 {
+		t.Fatalf("settlement = %#v", local.lastSettle)
+	}
+	if pricing.lastMeteredUsage.Operation != PricingOperationMusic || pricing.lastMeteredUsage.Meter != meterOutputTrack ||
+		pricing.lastMeteredUsage.BaseUnit != baseUnitTrack || pricing.lastMeteredUsage.Quantity != 1 {
+		t.Fatalf("metered usage = %#v", pricing.lastMeteredUsage)
+	}
+}
+
+func TestGenerateLyricsUsesPrivateMiniMaxRouteAndSettlesMeteredBilling(t *testing.T) {
+	organizationID := uuid.New()
+	requestID := uuid.NewString()
+	providerAdapter := &privateMusicGatewayAdapter{}
+	factory := adapter.NewDefaultAdapterFactory()
+	factory.Register("minimax", func(*adapter.AdapterConfig) (adapter.LLMProviderAdapter, error) {
+		return providerAdapter, nil
+	})
+	local := &fakeBillingProvider{checkBalanceResult: true}
+	pricing := &fakePricingEngine{meteredQuote: PricingQuote{TotalCredits: 3, OutputCredits: 3}}
+	service := newPrivateMusicGatewayTestService(t, organizationID)
+	service.adapterFactory = factory
+	service.billing = &fakeBillingProvider{checkBalanceResult: true}
+	service.localBilling = local
+	service.pricingEngine = pricing
+
+	result, err := service.GenerateLyrics(t.Context(), &apikeymodel.TenantAPIKey{
+		ID:             uuid.NewString(),
+		OrganizationID: organizationID.String(),
+	}, &LyricsRequest{RequestID: requestID, Model: musicGatewayTestModel, Prompt: "warm folk"})
+	if err != nil {
+		t.Fatalf("GenerateLyrics() error = %v", err)
+	}
+	if result == nil || result.Title != "Private Song" {
+		t.Fatalf("result = %#v", result)
+	}
+	if local.preDeductCalls != 1 || local.settleCalls != 1 || local.lastSettle == nil {
+		t.Fatalf("local billing calls/settlement = %d/%d/%#v", local.preDeductCalls, local.settleCalls, local.lastSettle)
+	}
+	if local.lastSettle.AttemptID != requestID+":lyrics" || local.lastSettle.PricingOperation != PricingOperationLyrics || local.lastSettle.ActualCredits != 3 {
+		t.Fatalf("settlement = %#v", local.lastSettle)
+	}
+	if pricing.lastMeteredUsage.Operation != PricingOperationLyrics || pricing.lastMeteredUsage.Meter != meterRequest ||
+		pricing.lastMeteredUsage.BaseUnit != baseUnitRequest || pricing.lastMeteredUsage.Quantity != 1 {
+		t.Fatalf("metered usage = %#v", pricing.lastMeteredUsage)
+	}
+}
+
+func TestGenerateMusicPrivateProviderFailureRollsBackReservation(t *testing.T) {
+	organizationID := uuid.New()
+	providerErr := errors.New("provider failed")
+	providerAdapter := &privateMusicGatewayAdapter{err: providerErr}
+	factory := adapter.NewDefaultAdapterFactory()
+	factory.Register("minimax", func(*adapter.AdapterConfig) (adapter.LLMProviderAdapter, error) {
+		return providerAdapter, nil
+	})
+	local := &fakeBillingProvider{checkBalanceResult: true}
+	service := newPrivateMusicGatewayTestService(t, organizationID)
+	service.adapterFactory = factory
+	service.billing = &fakeBillingProvider{checkBalanceResult: true}
+	service.localBilling = local
+	service.pricingEngine = &fakePricingEngine{meteredQuote: PricingQuote{TotalCredits: 17}}
+
+	err := service.GenerateMusic(t.Context(), &apikeymodel.TenantAPIKey{
+		ID:             uuid.NewString(),
+		OrganizationID: organizationID.String(),
+	}, &MusicRequest{
+		RequestID:      uuid.NewString(),
+		Model:          musicGatewayTestModel,
+		Mode:           adapter.MusicModeInstrumental,
+		Prompt:         "warm piano",
+		ResponseFormat: "mp3",
+	}, &bytes.Buffer{})
+	if !errors.Is(err, providerErr) {
+		t.Fatalf("GenerateMusic() error = %v, want provider error", err)
+	}
+	if local.preDeductCalls != 1 || local.settleCalls != 1 || local.lastSettle == nil || local.lastSettle.Status != "error" || local.lastSettle.ActualCredits != 0 {
+		t.Fatalf("rollback = %d/%d/%#v", local.preDeductCalls, local.settleCalls, local.lastSettle)
+	}
+}
+
+func TestCompensateMusicDeliveryDoesNotDependOnCurrentModelRoute(t *testing.T) {
+	organizationID := uuid.New()
+	requestID := uuid.NewString()
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if got, want := r.URL.Path, "/v1/internal/audio/music/delivery-compensations"; got != want {
+			t.Fatalf("path = %q, want %q", got, want)
+		}
+		if got := r.Header.Get(headerMINGYINGKEJIBillingOrganizationID); got != organizationID.String() {
+			t.Fatalf("billing organization = %q", got)
+		}
+		if got := r.Header.Get(headerMINGYINGKEJIRequestID); got != requestID {
+			t.Fatalf("request id = %q", got)
+		}
+		_, _ = w.Write([]byte(`{"code":0,"data":{"billing_status":"compensated"}}`))
+	}))
+	defer server.Close()
+	setMusicGatewayTestConfig(t, server.URL)
+
+	local := &privateMusicCompensationBilling{err: adapter.ErrMusicCompensationNotFound}
+	service := &llmGatewayServiceImpl{
+		db:             openGatewayCatalogDB(t),
+		adapterFactory: adapter.GlobalFactory,
+		localBilling:   local,
+	}
+	err := service.CompensateMusicDelivery(t.Context(), &apikeymodel.TenantAPIKey{
+		ID:             uuid.NewString(),
+		OrganizationID: organizationID.String(),
+	}, requestID)
+	if err != nil {
+		t.Fatalf("CompensateMusicDelivery() error = %v", err)
+	}
+	if local.calls != 1 {
+		t.Fatalf("local compensation calls = %d, want 1", local.calls)
+	}
+}
+
+func TestCompensateMusicDeliveryUsesLocalBillingWithoutOfficialRequest(t *testing.T) {
+	organizationID := uuid.New()
+	requestID := uuid.NewString()
+	var officialCalls atomic.Int32
+	server := httptest.NewServer(http.HandlerFunc(func(http.ResponseWriter, *http.Request) {
+		officialCalls.Add(1)
+	}))
+	defer server.Close()
+	setMusicGatewayTestConfig(t, server.URL)
+
+	local := &privateMusicCompensationBilling{}
+	service := &llmGatewayServiceImpl{
+		db:             openGatewayCatalogDB(t),
+		adapterFactory: adapter.GlobalFactory,
+		localBilling:   local,
+	}
+	err := service.CompensateMusicDelivery(t.Context(), &apikeymodel.TenantAPIKey{
+		ID:             uuid.NewString(),
+		OrganizationID: organizationID.String(),
+	}, requestID)
+	if err != nil {
+		t.Fatalf("CompensateMusicDelivery() error = %v", err)
+	}
+	if local.calls != 1 || local.organizationID != organizationID || local.requestID != requestID {
+		t.Fatalf("local compensation = calls=%d org=%s request=%s", local.calls, local.organizationID, local.requestID)
+	}
+	if officialCalls.Load() != 0 {
+		t.Fatalf("official compensation calls = %d, want 0", officialCalls.Load())
+	}
+}
+
+type privateMusicCompensationBilling struct {
+	fakeBillingProvider
+	calls          int
+	organizationID uuid.UUID
+	requestID      string
+	err            error
+}
+
+func (b *privateMusicCompensationBilling) CompensatePrivateMusicDelivery(_ context.Context, organizationID uuid.UUID, requestID string) error {
+	b.calls++
+	b.organizationID = organizationID
+	b.requestID = requestID
+	return b.err
+}
+
+type privateMusicGatewayAdapter struct {
+	chatTraceSuccessAdapter
+	err error
+}
+
+func (a *privateMusicGatewayAdapter) GenerateMusic(_ context.Context, _ *adapter.MusicRequest, dst io.Writer) error {
+	if a.err != nil {
+		return a.err
+	}
+	_, err := dst.Write([]byte("PRIVATE-MP3"))
+	return err
+}
+
+func (a *privateMusicGatewayAdapter) GenerateLyrics(context.Context, *adapter.LyricsRequest) (*adapter.LyricsResult, error) {
+	if a.err != nil {
+		return nil, a.err
+	}
+	return &adapter.LyricsResult{Title: "Private Song", StyleTags: []string{"Folk"}, Lyrics: "[Verse]\nhello"}, nil
+}
+
+func newPrivateMusicGatewayTestService(t *testing.T, organizationID uuid.UUID) *llmGatewayServiceImpl {
+	t.Helper()
+	db := openGatewayCatalogDB(t)
+	insertGatewayCatalogModel(t, db, uuid.New(), "minimax", musicGatewayTestModel)
+	if err := db.Model(&llmmodel.LLMModel{}).
+		Where("name = ?", musicGatewayTestModel).
+		Updates(map[string]any{
+			"music_generation": true,
+			"use_cases":        llmmodel.StringArray{string(llmmodel.UseCaseMusicGen)},
+		}).Error; err != nil {
+		t.Fatal(err)
+	}
+	route := &channelmodel.LLMRoute{
+		ID:              uuid.New(),
+		OrganizationID:  organizationID,
+		Type:            shared.RouteTypePrivate,
+		ChannelProvider: "minimax",
+		IsEnabled:       true,
+		Models:          []string{musicGatewayTestModel},
+		TenantCredential: &credentialmodel.TenantCredential{
+			ChannelProvider:  "minimax",
+			APIKeyCiphertext: "ciphertext",
+			IsActive:         true,
+		},
+	}
+	return &llmGatewayServiceImpl{
+		db:             db,
+		adapterFactory: adapter.GlobalFactory,
+		channelRouter: &ChannelRouter{
+			db:                      db,
+			organizationIDRouteRepo: &fakeCandidateRouteRepo{routes: []*channelmodel.LLMRoute{route}},
+			cryptoService:           stubCryptoService{},
+			strategyFactory:         NewStrategyFactory(),
+			privateModels:           &fakePrivateModelLookup{},
+		},
+	}
+}
+
+func newMusicGatewayTestService(t *testing.T, organizationID uuid.UUID, enabled bool) *llmGatewayServiceImpl {
+	t.Helper()
+	db := openGatewayCatalogDB(t)
+	insertGatewayCatalogModel(t, db, uuid.New(), "minimax", musicGatewayTestModel)
+	if err := db.Model(&llmmodel.LLMModel{}).
+		Where("name = ?", musicGatewayTestModel).
+		Updates(map[string]any{
+			"music_generation": enabled,
+			"use_cases":        llmmodel.StringArray{string(llmmodel.UseCaseMusicGen)},
+		}).Error; err != nil {
+		t.Fatal(err)
+	}
+	route := &channelmodel.LLMRoute{
+		ID:              uuid.New(),
+		OrganizationID:  organizationID,
+		Type:            shared.RouteTypeMINGYINGKEJICloud,
+		ChannelProvider: "mingyingkeji-cloud",
+		IsOfficial:      true,
+		IsEnabled:       true,
+		Models:          []string{musicGatewayTestModel},
+		OfficialProviderModels: []channelmodel.ProviderModel{{
+			Provider: "minimax",
+			Model:    musicGatewayTestModel,
+		}},
+	}
+	return &llmGatewayServiceImpl{
+		db:             db,
+		adapterFactory: adapter.GlobalFactory,
+		channelRouter: &ChannelRouter{
+			db:                      db,
+			organizationIDRouteRepo: &fakeCandidateRouteRepo{routes: []*channelmodel.LLMRoute{route}},
+			cryptoService:           stubCryptoService{},
+			strategyFactory:         NewStrategyFactory(),
+			privateModels:           &fakePrivateModelLookup{},
+		},
+	}
+}
+
+func setMusicGatewayTestConfig(t *testing.T, consoleURL string) {
+	t.Helper()
+	previous := config.GlobalConfig
+	config.GlobalConfig = &config.Config{
+		Console: config.ConsoleConfig{
+			APIURL:         consoleURL,
+			InternalAPIKey: "test-internal-key",
+		},
+	}
+	t.Cleanup(func() { config.GlobalConfig = previous })
+}

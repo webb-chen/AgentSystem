@@ -1,0 +1,143 @@
+package v1
+
+import (
+	"github.com/gin-gonic/gin"
+	"github.com/webb-chen/AgentSystem/api/config"
+	notificationsms "github.com/webb-chen/AgentSystem/api/internal/modules/notification/sms"
+	authService "github.com/webb-chen/AgentSystem/api/internal/modules/user/auth/service"
+
+	interfaces "github.com/webb-chen/AgentSystem/api/internal/modules/shared/interface"
+	system_service "github.com/webb-chen/AgentSystem/api/internal/modules/system/service"
+	authHandler "github.com/webb-chen/AgentSystem/api/internal/modules/user/auth/handler"
+	workspaceHandler "github.com/webb-chen/AgentSystem/api/internal/modules/workspace/handler"
+	workspaceRepo "github.com/webb-chen/AgentSystem/api/internal/modules/workspace/repository"
+	workspaceService "github.com/webb-chen/AgentSystem/api/internal/modules/workspace/service"
+	helper "github.com/webb-chen/AgentSystem/api/internal/util"
+	appcatalog "github.com/webb-chen/AgentSystem/api/pkg/apperror/catalog"
+	apptransport "github.com/webb-chen/AgentSystem/api/pkg/apperror/transport"
+	"gorm.io/gorm"
+)
+
+// UserRouteDeps contains dependencies required by user and auth routes.
+type UserRouteDeps struct {
+	DB                         *gorm.DB
+	AccountService             interfaces.AccountService
+	PhoneAuthAccounts          authService.PhoneAuthAccountGateway
+	NotificationSMSService     notificationsms.Service
+	WorkspaceManagementService interfaces.WorkspaceManagementService
+	OrganizationService        interfaces.OrganizationService
+	DepartmentService          workspaceService.DepartmentService
+	ConsoleWebURL              string
+	ApplicationErrorCatalog    *appcatalog.Catalog
+}
+
+// RegisterUserRoutes registers user-related routes
+func RegisterUserRoutes(v1 *gin.RouterGroup, deps UserRouteDeps) {
+	if deps.DB == nil {
+		panic("user routes require db")
+	}
+	if deps.AccountService == nil {
+		panic("user routes require account service")
+	}
+	if deps.PhoneAuthAccounts == nil {
+		panic("user routes require phone auth accounts")
+	}
+	if deps.NotificationSMSService == nil {
+		panic("user routes require notification sms service")
+	}
+	if deps.WorkspaceManagementService == nil {
+		panic("user routes require workspace management service")
+	}
+	if deps.OrganizationService == nil {
+		panic("user routes require organization service")
+	}
+	if deps.DepartmentService == nil {
+		panic("user routes require department service")
+	}
+	if deps.ApplicationErrorCatalog == nil {
+		panic("user routes require application error catalog")
+	}
+	errorProjector, err := apptransport.NewProjector(deps.ApplicationErrorCatalog)
+	if err != nil {
+		panic(err)
+	}
+
+	workspaceRepository := workspaceRepo.NewWorkspaceRepository(deps.DB)
+	workspaceServiceImpl := workspaceService.NewWorkspaceService(workspaceRepository)
+
+	tokenMgr := helper.NewTokenManager()
+	featureService := system_service.NewFeatureService()
+	cfg := config.Current()
+
+	// --- Handlers ---
+	accountHandler := authHandler.NewAccountHandler(deps.AccountService, deps.WorkspaceManagementService)
+	forgotPasswordHandler := authHandler.NewForgotPasswordHandler(deps.AccountService)
+	authHandlerInstance := authHandler.NewAuthHandler(deps.AccountService, featureService, tokenMgr)
+	phoneAuthService := authService.NewPhoneAuthService(
+		deps.PhoneAuthAccounts,
+		tokenMgr,
+		authService.NewNotificationSMSPhoneCodeSender(deps.NotificationSMSService),
+		authService.PhoneAuthOptions{
+			AllowRegister:          config.Current().Feature.AllowRegister,
+			MasterVerificationCode: config.Current().Auth.MasterVerificationCode,
+		},
+	)
+	phoneAuthService.SetRegistrationInvitationGateway(deps.OrganizationService)
+	phoneAuthHandler := authHandler.NewPhoneAuthHandler(phoneAuthService, errorProjector)
+	emailRegistrationService := authService.NewEmailRegistrationService(
+		deps.AccountService,
+		tokenMgr,
+		authService.NewPackageEmailRegistrationCodeSender(),
+		authService.EmailRegistrationOptions{
+			AllowRegister:               cfg.Feature.PublicDeploymentEnabled && cfg.Feature.AllowRegister,
+			MasterVerificationCode:      cfg.Auth.MasterVerificationCode,
+			AllowMasterVerificationCode: isDevelopmentRuntime(cfg),
+			MaxCodeAttempts:             5,
+		},
+	)
+	emailRegistrationService.SetRegistrationInvitationGateway(deps.OrganizationService)
+	emailRegistrationHandler := authHandler.NewEmailRegistrationHandler(emailRegistrationService, errorProjector)
+	emailCodeLoginService := authService.NewEmailCodeLoginService(
+		deps.AccountService,
+		tokenMgr,
+		authService.EmailCodeLoginOptions{
+			Enabled:                     cfg.Feature.EnableEmailCodeLogin,
+			MasterVerificationCode:      cfg.Auth.MasterVerificationCode,
+			AllowMasterVerificationCode: isDevelopmentRuntime(cfg),
+			MaxCodeAttempts:             5,
+		},
+	)
+	emailCodeLoginHandler := authHandler.NewEmailCodeLoginHandler(emailCodeLoginService)
+	activateHandler := authHandler.NewActivateHandler(deps.AccountService)
+
+	membersHandler := workspaceHandler.NewMembersHandler(
+		deps.WorkspaceManagementService,
+		deps.AccountService,
+		deps.OrganizationService,
+		deps.ConsoleWebURL,
+	)
+
+	enterpriseHandler := workspaceHandler.NewOrganizationHandler(
+		deps.OrganizationService,
+		deps.WorkspaceManagementService,
+		deps.AccountService,
+		workspaceServiceImpl,
+		deps.DepartmentService,
+		deps.ConsoleWebURL,
+	)
+
+	// --- Route Registration ---
+	accountHandler.RegisterRoutes(v1)
+	forgotPasswordHandler.RegisterRoutes(v1)
+	authHandlerInstance.RegisterAuthRoutes(v1)
+	emailRegistrationHandler.RegisterRoutes(v1)
+	emailCodeLoginHandler.RegisterRoutes(v1)
+	phoneAuthHandler.RegisterRoutes(v1)
+	activateHandler.RegisterRoutes(v1)
+	enterpriseHandler.RegisterRoutes(v1)
+	membersHandler.RegisterRoutes(v1)
+}
+
+func isDevelopmentRuntime(cfg *config.Config) bool {
+	return cfg.Server.Mode == "debug" || cfg.Server.Environment == "local" || cfg.Server.Environment == "dev"
+}

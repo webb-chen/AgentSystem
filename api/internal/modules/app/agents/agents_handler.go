@@ -1,0 +1,1621 @@
+package agents
+
+import (
+	"bytes"
+	"context"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"io"
+	"net/http"
+	"strconv"
+	"strings"
+
+	"github.com/gin-gonic/gin"
+	"github.com/google/uuid"
+	"github.com/webb-chen/AgentSystem/api/internal/capabilities/agentbindings"
+	runtimedto "github.com/webb-chen/AgentSystem/api/internal/capabilities/chatruntime/dto"
+	runtimemodel "github.com/webb-chen/AgentSystem/api/internal/capabilities/chatruntime/model"
+	runtimeservice "github.com/webb-chen/AgentSystem/api/internal/capabilities/chatruntime/service"
+	"github.com/webb-chen/AgentSystem/api/internal/dto"
+	"github.com/webb-chen/AgentSystem/api/internal/modules/app/runtimeauth"
+	approvalruntime "github.com/webb-chen/AgentSystem/api/internal/modules/app/workflow/approval"
+	filemodel "github.com/webb-chen/AgentSystem/api/internal/modules/file_process/model"
+	llmclient "github.com/webb-chen/AgentSystem/api/internal/modules/llm/client"
+	interfaces "github.com/webb-chen/AgentSystem/api/internal/modules/shared/interface"
+	workspace_model "github.com/webb-chen/AgentSystem/api/internal/modules/workspace/model"
+	"github.com/webb-chen/AgentSystem/api/internal/util"
+	"github.com/webb-chen/AgentSystem/api/pkg/logger"
+	"github.com/webb-chen/AgentSystem/api/pkg/response"
+	"gorm.io/gorm"
+)
+
+const agentWebAppCapabilityReasonPublicCompatible = "allowed_public_compatible"
+
+type AgentsHandler struct {
+	appService                 AgentsService
+	tenantService              interfaces.WorkspaceManagementService
+	accountService             interfaces.AccountService
+	organizationService        interfaces.OrganizationService
+	fileService                interfaces.FileService
+	db                         *gorm.DB
+	chatRuntimeService         runtimeservice.Service
+	modelPrechecker            llmclient.AppModelPrechecker
+	workflowContinuationRunner workflowContinuationRunner
+	voiceService               *VoiceService
+	speechService              *SpeechService
+}
+
+type workflowContinuationRunner interface {
+	ResumeApprovalWorkflow(ctx context.Context, form *approvalruntime.Form) error
+	ResumeQuestionAnswerWorkflow(ctx context.Context, workflowRunID string, inputs map[string]interface{}) error
+	StopWorkflowContinuation(ctx context.Context, workflowRunID string, accountID string) error
+}
+
+type workflowContinuationStreamRunner interface {
+	ResumeApprovalWorkflowStream(ctx context.Context, form *approvalruntime.Form, onEvent func(string, map[string]interface{}) error) error
+	ResumeQuestionAnswerWorkflowStream(ctx context.Context, workflowRunID string, inputs map[string]interface{}, onEvent func(string, map[string]interface{}) error) error
+}
+
+func NewAgentsHandler(appService AgentsService, tenantService interfaces.WorkspaceManagementService, accountService interfaces.AccountService, organizationService interfaces.OrganizationService, db *gorm.DB, chatRuntimeServices ...runtimeservice.Service) *AgentsHandler {
+	var chatRuntimeService runtimeservice.Service
+	if len(chatRuntimeServices) > 0 {
+		chatRuntimeService = chatRuntimeServices[0]
+	}
+	return &AgentsHandler{
+		appService:          appService,
+		tenantService:       tenantService,
+		accountService:      accountService,
+		organizationService: organizationService,
+		db:                  db,
+		chatRuntimeService:  chatRuntimeService,
+	}
+}
+
+func (h *AgentsHandler) SetFileService(fileService interfaces.FileService) {
+	h.fileService = fileService
+}
+
+func (h *AgentsHandler) SetModelPrechecker(modelPrechecker llmclient.AppModelPrechecker) {
+	h.modelPrechecker = modelPrechecker
+}
+
+func (h *AgentsHandler) SetVoiceService(voiceService *VoiceService) {
+	h.voiceService = voiceService
+}
+
+func (h *AgentsHandler) SetSpeechService(speechService *SpeechService) {
+	h.speechService = speechService
+}
+
+func (h *AgentsHandler) SetWorkflowContinuationRunner(runner interface {
+	ResumeApprovalWorkflow(ctx context.Context, form *approvalruntime.Form) error
+	ResumeQuestionAnswerWorkflow(ctx context.Context, workflowRunID string, inputs map[string]interface{}) error
+	StopWorkflowContinuation(ctx context.Context, workflowRunID string, accountID string) error
+}) {
+	h.workflowContinuationRunner = runner
+}
+
+func (h *AgentsHandler) GetAgentsList(c *gin.Context) {
+	// 1. Authenticate user - Requirement 11.1: Handle authentication errors (401)
+	accountID := c.GetString("account_id")
+	if accountID == "" {
+		// Requirement 11.1: Return 401 for missing account_id
+		logger.Error("GetAgentsList: authentication failed - account_id not found in context", nil)
+		response.Fail(c, response.ErrUnauthorized)
+		return
+	}
+
+	// Validate account_id format
+	if _, err := uuid.Parse(accountID); err != nil {
+		// Requirement 11.1: Return 401 for invalid account_id format
+		// Requirement 11.5: Add structured logging with context
+		logger.Error(fmt.Sprintf("GetAgentsList: authentication failed - invalid account_id format: account_id=%s", accountID), err)
+		response.Fail(c, response.ErrUnauthorized)
+		return
+	}
+
+	// 2. Parse query parameters - Requirement 11.4: Handle invalid parameter errors (400)
+	var req dto.GetAgentsListRequest
+	if err := c.ShouldBindQuery(&req); err != nil {
+		// Log parameter binding errors but continue with defaults
+		logger.Warn("GetAgentsList: failed to bind query parameters, using defaults", map[string]interface{}{
+			"account_id": accountID,
+			"error":      err.Error(),
+		})
+		// Continue with default values
+	}
+
+	// 3. Parse internal parameter correctly (handle "true"/"false" strings)
+	if internalStr := c.Query("internal"); internalStr != "" {
+		switch internalStr {
+		case "true":
+			internalVal := true
+			req.Internal = &internalVal
+		case "false":
+			internalVal := false
+			req.Internal = &internalVal
+		default:
+			// Requirement 11.4: Handle invalid parameter errors (400)
+			logger.Warn("GetAgentsList: invalid internal parameter value", map[string]interface{}{
+				"account_id": accountID,
+				"value":      internalStr,
+			})
+			response.Fail(c, response.ErrInvalidParam)
+			return
+		}
+	}
+	if publishedStr := c.Query("is_published"); publishedStr != "" {
+		switch publishedStr {
+		case "true":
+			published := true
+			req.IsPublished = &published
+		case "false":
+			published := false
+			req.IsPublished = &published
+		default:
+			logger.Warn("GetAgentsList: invalid is_published parameter value", map[string]interface{}{
+				"account_id": accountID,
+				"value":      publishedStr,
+			})
+			response.Fail(c, response.ErrInvalidParam)
+			return
+		}
+	}
+
+	// 4. Validate and normalize pagination parameters
+	if req.Page <= 0 {
+		req.Page = 1
+	}
+	if req.Page > 99999 {
+		req.Page = 99999
+	}
+
+	pageSize := 20
+	if req.PageSize > 0 {
+		pageSize = req.PageSize
+	} else if req.Limit > 0 {
+		pageSize = req.Limit
+	}
+	if pageSize <= 0 {
+		pageSize = 20
+	}
+	if pageSize > 100 {
+		pageSize = 100
+	}
+	req.Limit = pageSize
+
+	// 5. Call new service method with permission-based filtering
+	// Requirement 11.5: Add structured logging with context (account_id, org_id, dept_ids)
+	logger.Info("GetAgentsList: calling GetAgentsListWithPermissions", map[string]interface{}{
+		"account_id":     accountID,
+		"page":           req.Page,
+		"limit":          req.Limit,
+		"name":           req.Name,
+		"keyword":        req.Keyword,
+		"agent_type":     req.AgentType,
+		"asset_kind":     req.AssetKind,
+		"is_published":   req.IsPublished,
+		"web_app_status": req.WebAppStatus,
+		"internal":       req.Internal,
+	})
+
+	// Requirement 11.2, 11.3, 11.4: Handle service errors and map to HTTP responses
+	result, err := h.appService.GetAgentsListWithPermissions(c.Request.Context(), accountID, req)
+	if err != nil {
+		// Requirement 11.5: Add structured logging with context
+		logger.Error(fmt.Sprintf("GetAgentsList: service error for account_id=%s", accountID), err)
+
+		// Requirement 11.2: Handle tenant not found errors (404)
+		if err.Error() == "tenant not found" {
+			response.Fail(c, response.ErrWorkspaceNotFound)
+			return
+		}
+
+		if errors.Is(err, errInvalidAgentListAssetKind) ||
+			errors.Is(err, errInvalidAgentListWebAppStatus) {
+			response.Fail(c, response.ErrInvalidParam)
+			return
+		}
+
+		// Requirement 11.3: Handle database errors (500) with logging
+		if err.Error() == "failed to determine user permissions" ||
+			err.Error() == "failed to get current organization" ||
+			err.Error() == "failed to get organization departments" ||
+			err.Error() == "failed to get user department memberships" ||
+			err.Error() == "failed to retrieve agents" {
+			response.Fail(c, response.ErrSystemError)
+			return
+		}
+
+		// Default error response
+		response.SpecialFail(c, gin.H{
+			"code":    "399001",
+			"message": err.Error(),
+		})
+		return
+	}
+
+	// 6. Return successful response with agent list and pagination info
+	// Requirement 11.5: Add structured logging with context
+	logger.Info("GetAgentsList: successfully retrieved agents", map[string]interface{}{
+		"account_id":  accountID,
+		"agent_count": len(result.Data),
+		"total":       result.Total,
+		"page":        result.Page,
+		"limit":       result.Limit,
+	})
+	response.Success(c, result)
+}
+
+func (h *AgentsHandler) GetRunnableWebApps(c *gin.Context) {
+	accountID := c.GetString("account_id")
+	if accountID == "" {
+		response.Fail(c, response.ErrUnauthorized)
+		return
+	}
+
+	if _, err := uuid.Parse(accountID); err != nil {
+		logger.Error(fmt.Sprintf("GetRunnableWebApps: invalid account_id format: account_id=%s", accountID), err)
+		response.Fail(c, response.ErrUnauthorized)
+		return
+	}
+
+	var req dto.GetRunnableWebAppsRequest
+	if err := c.ShouldBindQuery(&req); err != nil {
+		response.Fail(c, response.ErrInvalidParam)
+		return
+	}
+
+	if req.WorkspaceID != "" {
+		if _, err := uuid.Parse(req.WorkspaceID); err != nil {
+			response.Fail(c, response.ErrInvalidParam)
+			return
+		}
+	}
+	if _, err := parseRunnableWebAppIDs(req.WebAppIDs); err != nil {
+		response.Fail(c, response.ErrInvalidParam)
+		return
+	}
+
+	result, err := h.appService.GetRunnableWebApps(c.Request.Context(), accountID, req)
+	if err != nil {
+		switch {
+		case errors.Is(err, errInvalidRunnableWebAppIDs):
+			response.Fail(c, response.ErrInvalidParam)
+		case errors.Is(err, errCurrentOrganizationNotFound):
+			response.Fail(c, response.ErrOrganizationNotFound)
+		default:
+			logger.Error(fmt.Sprintf("GetRunnableWebApps: service error for account_id=%s", accountID), err)
+			response.Fail(c, response.ErrSystemError)
+		}
+		return
+	}
+
+	response.Success(c, result)
+}
+
+func (h *AgentsHandler) CreateAgent(c *gin.Context) {
+	accountID := c.GetString("account_id")
+	if accountID == "" {
+		response.Fail(c, response.ErrUnauthorized)
+		return
+	}
+
+	callerOrganizationID := util.GetOrganizationID(c)
+	if callerOrganizationID == "" {
+		response.Fail(c, response.ErrOrganizationNotFound)
+		return
+	}
+
+	precheckedWorkspaceID := ""
+	precheckedPermission := workspace_model.WorkspacePermissionCode("")
+	if targetWorkspaceID, agentType, ok := h.peekCreateAgentWorkspaceScope(c); ok && targetWorkspaceID != "" && h.organizationService != nil {
+		createPermissions := agentCreatePermissionCodes(agentType)
+		if len(createPermissions) == 0 {
+			response.Fail(c, response.ErrPermissionDenied)
+			return
+		}
+		precheckedPermission = createPermissions[0]
+		hasPermission, err := h.organizationService.CheckWorkspacePermission(
+			c.Request.Context(),
+			callerOrganizationID,
+			targetWorkspaceID,
+			accountID,
+			precheckedPermission,
+		)
+		if err != nil {
+			logger.Error("Failed to check create agent workspace permission", err)
+			response.Fail(c, response.ErrSystemError)
+			return
+		}
+		if !hasPermission {
+			logger.Warn("CreateAgent: workspace permission denied", map[string]interface{}{
+				"account_id":   accountID,
+				"workspace_id": targetWorkspaceID,
+			})
+			response.Fail(c, response.ErrPermissionDenied)
+			return
+		}
+		precheckedWorkspaceID = targetWorkspaceID
+	}
+
+	var req dto.CreateAgentRequest
+	if err := c.ShouldBindJSON(&req); err != nil {
+		response.Fail(c, response.ErrInvalidParam)
+		return
+	}
+
+	targetWorkspaceID := req.WorkspaceID
+	if targetWorkspaceID == "" {
+		response.Fail(c, response.ErrWorkspaceNotFound)
+		return
+	}
+
+	createPermissions := agentCreatePermissionCodes(req.AgentType)
+	if len(createPermissions) == 0 {
+		response.Fail(c, response.ErrPermissionDenied)
+		return
+	}
+	createPermission := createPermissions[0]
+
+	if h.organizationService != nil && (precheckedWorkspaceID != targetWorkspaceID || precheckedPermission != createPermission) {
+		hasPermission, err := h.organizationService.CheckWorkspacePermission(
+			c.Request.Context(),
+			callerOrganizationID,
+			targetWorkspaceID,
+			accountID,
+			createPermission,
+		)
+		if err != nil {
+			logger.Error("Failed to check create agent workspace permission", err)
+			response.Fail(c, response.ErrSystemError)
+			return
+		}
+		if !hasPermission {
+			logger.Warn("CreateAgent: workspace permission denied", map[string]interface{}{
+				"account_id":   accountID,
+				"workspace_id": targetWorkspaceID,
+			})
+			response.Fail(c, response.ErrPermissionDenied)
+			return
+		}
+	}
+
+	result, err := h.appService.CreateAgent(c.Request.Context(), targetWorkspaceID, req, accountID)
+	if err != nil {
+		// Basic error mapping
+		response.SpecialFail(c, gin.H{
+			"code":    "399001",
+			"message": err.Error(),
+		})
+		return
+	}
+
+	response.Success(c, result)
+}
+
+func (h *AgentsHandler) peekCreateAgentWorkspaceScope(c *gin.Context) (string, string, bool) {
+	if c == nil || c.Request == nil || c.Request.Body == nil {
+		return "", "", false
+	}
+	body, err := io.ReadAll(c.Request.Body)
+	if err != nil {
+		c.Request.Body = io.NopCloser(bytes.NewReader(nil))
+		return "", "", false
+	}
+	c.Request.Body = io.NopCloser(bytes.NewReader(body))
+	var req struct {
+		WorkspaceID string `json:"workspace_id"`
+		AgentType   string `json:"agent_type"`
+	}
+	if err := json.Unmarshal(body, &req); err != nil {
+		return "", "", false
+	}
+	return strings.TrimSpace(req.WorkspaceID), strings.TrimSpace(req.AgentType), true
+}
+
+func (h *AgentsHandler) GetAgent(c *gin.Context) {
+	accountID := c.GetString("account_id")
+	if accountID == "" {
+		response.Fail(c, response.ErrUnauthorized)
+		return
+	}
+
+	agentID := c.Param("agent_id")
+	if agentID == "" {
+		response.Fail(c, response.ErrInvalidParam)
+		return
+	}
+
+	// Pass account_id via context for is_editor calculation
+	ctx := c.Request.Context()
+	ctx = context.WithValue(ctx, "account_id", accountID)
+	if callerOrganizationID := util.GetOrganizationID(c); callerOrganizationID != "" {
+		ctx = context.WithValue(ctx, "tenant_id", callerOrganizationID)
+	}
+
+	result, err := h.appService.GetAgent(ctx, agentID)
+	if err != nil {
+		switch err.Error() {
+		case "permission denied":
+			response.SpecialFail(c, gin.H{"code": "403001", "message": "Permission denied"})
+		default:
+			response.SpecialFail(c, gin.H{
+				"code":    "399001",
+				"message": err.Error(),
+			})
+		}
+		return
+	}
+
+	response.Success(c, result)
+}
+
+func (h *AgentsHandler) GetAgentConfig(c *gin.Context) {
+	accountID := c.GetString("account_id")
+	if accountID == "" {
+		response.Fail(c, response.ErrUnauthorized)
+		return
+	}
+	ctx := agentRuntimeRequestContext(c, accountID)
+	result, err := h.appService.GetAgentConfig(ctx, c.Param("agent_id"), accountID)
+	if err != nil {
+		response.SpecialFail(c, gin.H{"code": "399001", "message": err.Error()})
+		return
+	}
+	response.Success(c, result)
+}
+
+func (h *AgentsHandler) GetAgentRuntimeSurfaces(c *gin.Context) {
+	accountID := c.GetString("account_id")
+	if accountID == "" {
+		response.Fail(c, response.ErrUnauthorized)
+		return
+	}
+	ctx := agentRuntimeRequestContext(c, accountID)
+	result, err := h.appService.GetAgentRuntimeSurfaces(ctx, c.Param("agent_id"), accountID)
+	if err != nil {
+		h.failRuntime(c, err)
+		return
+	}
+	response.Success(c, result)
+}
+
+func (h *AgentsHandler) UpdateAgentRuntimeSurfaces(c *gin.Context) {
+	accountID := c.GetString("account_id")
+	if accountID == "" {
+		response.Fail(c, response.ErrUnauthorized)
+		return
+	}
+	ctx, ok := h.requireAgentManageAccess(c, accountID)
+	if !ok {
+		return
+	}
+	var req dto.UpdateAgentRuntimeSurfacesRequest
+	if err := c.ShouldBindJSON(&req); err != nil {
+		response.Fail(c, response.ErrInvalidParam)
+		return
+	}
+	result, err := h.appService.UpdateAgentRuntimeSurfaces(ctx, c.Param("agent_id"), accountID, req)
+	if err != nil {
+		h.failRuntime(c, err)
+		return
+	}
+	response.Success(c, result)
+}
+
+func (h *AgentsHandler) UpdateAgentConfig(c *gin.Context) {
+	accountID := c.GetString("account_id")
+	if accountID == "" {
+		response.Fail(c, response.ErrUnauthorized)
+		return
+	}
+	ctx, ok := h.requireAgentManageAccess(c, accountID)
+	if !ok {
+		return
+	}
+	var req dto.AgentConfigRequest
+	if err := c.ShouldBindJSON(&req); err != nil {
+		response.Fail(c, response.ErrInvalidParam)
+		return
+	}
+	result, err := h.appService.UpdateAgentConfig(ctx, c.Param("agent_id"), accountID, req)
+	if err != nil {
+		h.failRuntime(c, err)
+		return
+	}
+	response.Success(c, result)
+}
+
+func (h *AgentsHandler) ListAgentWorkflowBindingCandidates(c *gin.Context) {
+	accountID := c.GetString("account_id")
+	if accountID == "" {
+		response.Fail(c, response.ErrUnauthorized)
+		return
+	}
+	ctx, ok := h.requireAgentManageAccess(c, accountID)
+	if !ok {
+		return
+	}
+	var req dto.AgentWorkflowBindingCandidatesRequest
+	if err := c.ShouldBindQuery(&req); err != nil {
+		response.Fail(c, response.ErrInvalidParam)
+		return
+	}
+	if req.Limit == 0 {
+		req.Limit = maxAgentBindingCandidateLimit
+	}
+	if req.Page == 0 {
+		req.Page = 1
+	}
+	req.IncludeSelected = true
+	req.IncludeStartInputs = true
+	result, err := h.appService.ListAgentWorkflowBindingCandidates(ctx, c.Param("agent_id"), accountID, req)
+	if err != nil {
+		h.failRuntime(c, err)
+		return
+	}
+	response.Success(c, result)
+}
+
+func (h *AgentsHandler) ListAgentSkillBindingCandidates(c *gin.Context) {
+	accountID := c.GetString("account_id")
+	if accountID == "" {
+		response.Fail(c, response.ErrUnauthorized)
+		return
+	}
+	ctx, ok := h.requireAgentManageAccess(c, accountID)
+	if !ok {
+		return
+	}
+	var req dto.AgentSkillCandidatesRequest
+	if err := c.ShouldBindQuery(&req); err != nil {
+		response.Fail(c, response.ErrInvalidParam)
+		return
+	}
+	if req.Limit == 0 {
+		req.Limit = maxAgentBindingCandidateLimit
+	}
+	if req.Page == 0 {
+		req.Page = 1
+	}
+	req.IncludeSelected = true
+	result, err := h.appService.ListAgentSkillCandidates(ctx, c.Param("agent_id"), accountID, req)
+	if err != nil {
+		h.failRuntime(c, err)
+		return
+	}
+	response.Success(c, result)
+}
+
+func (h *AgentsHandler) ListAgentIntegrationConnectionBindingCandidates(c *gin.Context) {
+	accountID := c.GetString("account_id")
+	if accountID == "" {
+		response.Fail(c, response.ErrUnauthorized)
+		return
+	}
+	ctx, ok := h.requireAgentManageAccess(c, accountID)
+	if !ok {
+		return
+	}
+	var req dto.AgentIntegrationConnectionCandidatesRequest
+	if err := c.ShouldBindQuery(&req); err != nil {
+		response.Fail(c, response.ErrInvalidParam)
+		return
+	}
+	if req.Limit == 0 {
+		req.Limit = maxAgentBindingCandidateLimit
+	}
+	if req.Page == 0 {
+		req.Page = 1
+	}
+	req.IncludeSelected = true
+	result, err := h.appService.ListAgentIntegrationConnectionCandidates(ctx, c.Param("agent_id"), accountID, req)
+	if err != nil {
+		h.failRuntime(c, err)
+		return
+	}
+	response.Success(c, result)
+}
+
+func (h *AgentsHandler) ListAgentKnowledgeBindingCandidates(c *gin.Context) {
+	accountID := c.GetString("account_id")
+	if accountID == "" {
+		response.Fail(c, response.ErrUnauthorized)
+		return
+	}
+	ctx, ok := h.requireAgentManageAccess(c, accountID)
+	if !ok {
+		return
+	}
+	var req dto.AgentKnowledgeCandidatesRequest
+	if err := c.ShouldBindQuery(&req); err != nil {
+		response.Fail(c, response.ErrInvalidParam)
+		return
+	}
+	if req.Limit == 0 {
+		req.Limit = maxAgentBindingCandidateLimit
+	}
+	if req.Page == 0 {
+		req.Page = 1
+	}
+	req.IncludeSelected = true
+	result, err := h.appService.ListAgentKnowledgeCandidates(ctx, c.Param("agent_id"), accountID, req)
+	if err != nil {
+		h.failRuntime(c, err)
+		return
+	}
+	response.Success(c, result)
+}
+
+func (h *AgentsHandler) ListAgentDatabaseBindingCandidates(c *gin.Context) {
+	accountID := c.GetString("account_id")
+	if accountID == "" {
+		response.Fail(c, response.ErrUnauthorized)
+		return
+	}
+	ctx, ok := h.requireAgentManageAccess(c, accountID)
+	if !ok {
+		return
+	}
+	var req dto.AgentDatabaseCandidatesRequest
+	if err := c.ShouldBindQuery(&req); err != nil {
+		response.Fail(c, response.ErrInvalidParam)
+		return
+	}
+	if req.Limit == 0 {
+		req.Limit = maxAgentBindingCandidateLimit
+	}
+	if req.Page == 0 {
+		req.Page = 1
+	}
+	if _, provided := c.GetQuery("available_only"); !provided {
+		req.AvailableOnly = true
+	}
+	req.IncludeSelected = true
+	result, err := h.appService.ListAgentDatabaseCandidates(ctx, c.Param("agent_id"), accountID, req)
+	if err != nil {
+		h.failRuntime(c, err)
+		return
+	}
+	response.Success(c, result)
+}
+
+func (h *AgentsHandler) ListAgentDatabaseTableBindingCandidates(c *gin.Context) {
+	accountID := c.GetString("account_id")
+	if accountID == "" {
+		response.Fail(c, response.ErrUnauthorized)
+		return
+	}
+	ctx, ok := h.requireAgentManageAccess(c, accountID)
+	if !ok {
+		return
+	}
+	var req dto.AgentDatabaseTablesRequest
+	if err := c.ShouldBindQuery(&req); err != nil {
+		response.Fail(c, response.ErrInvalidParam)
+		return
+	}
+	if req.Limit == 0 {
+		req.Limit = maxAgentBindingCandidateLimit
+	}
+	if req.Page == 0 {
+		req.Page = 1
+	}
+	req.DataSourceID = c.Param("data_source_id")
+	req.IncludeSelected = true
+	result, err := h.appService.ListAgentDatabaseTables(ctx, c.Param("agent_id"), accountID, req)
+	if err != nil {
+		h.failRuntime(c, err)
+		return
+	}
+	response.Success(c, result)
+}
+
+func (h *AgentsHandler) ListAgentMemorySlots(c *gin.Context) {
+	accountID, err := uuid.Parse(strings.TrimSpace(c.GetString("account_id")))
+	if err != nil {
+		response.Fail(c, response.ErrUnauthorized)
+		return
+	}
+	result, err := h.appService.ListAgentMemorySlots(c.Request.Context(), c.Param("agent_id"), accountID.String())
+	if err != nil {
+		h.failRuntime(c, err)
+		return
+	}
+	response.Success(c, gin.H{"slots": result})
+}
+
+func (h *AgentsHandler) ReplaceAgentMemorySlots(c *gin.Context) {
+	accountID, err := uuid.Parse(strings.TrimSpace(c.GetString("account_id")))
+	if err != nil {
+		response.Fail(c, response.ErrUnauthorized)
+		return
+	}
+	if _, ok := h.requireAgentManageAccess(c, accountID.String()); !ok {
+		return
+	}
+	var req struct {
+		Slots []dto.AgentMemorySlotConfig `json:"slots" binding:"required"`
+	}
+	if err := c.ShouldBindJSON(&req); err != nil {
+		response.Fail(c, response.ErrInvalidParam)
+		return
+	}
+	result, err := h.appService.ReplaceAgentMemorySlots(c.Request.Context(), c.Param("agent_id"), accountID.String(), req.Slots)
+	if err != nil {
+		h.failRuntime(c, err)
+		return
+	}
+	response.Success(c, gin.H{"slots": result})
+}
+
+func (h *AgentsHandler) UpdateAgentMemoryConfig(c *gin.Context) {
+	accountID, err := uuid.Parse(strings.TrimSpace(c.GetString("account_id")))
+	if err != nil {
+		response.Fail(c, response.ErrUnauthorized)
+		return
+	}
+	if _, ok := h.requireAgentManageAccess(c, accountID.String()); !ok {
+		return
+	}
+	var req dto.AgentMemoryConfigRequest
+	if err := c.ShouldBindJSON(&req); err != nil {
+		response.Fail(c, response.ErrInvalidParam)
+		return
+	}
+	result, err := h.appService.UpdateAgentMemoryConfig(c.Request.Context(), c.Param("agent_id"), accountID.String(), req)
+	if err != nil {
+		h.failRuntime(c, err)
+		return
+	}
+	response.Success(c, result)
+}
+
+func (h *AgentsHandler) ListAgentMemoryValues(c *gin.Context) {
+	accountID, err := uuid.Parse(strings.TrimSpace(c.GetString("account_id")))
+	if err != nil {
+		response.Fail(c, response.ErrUnauthorized)
+		return
+	}
+	result, err := h.appService.ListAgentMemoryValues(c.Request.Context(), c.Param("agent_id"), accountID.String())
+	if err != nil {
+		h.failRuntime(c, err)
+		return
+	}
+	response.Success(c, result)
+}
+
+func (h *AgentsHandler) UpdateAgentMemoryValue(c *gin.Context) {
+	accountID, err := uuid.Parse(strings.TrimSpace(c.GetString("account_id")))
+	if err != nil {
+		response.Fail(c, response.ErrUnauthorized)
+		return
+	}
+	if _, ok := h.requireAgentManageAccess(c, accountID.String()); !ok {
+		return
+	}
+	var req dto.UpdateAgentMemoryValueRequest
+	if err := c.ShouldBindJSON(&req); err != nil {
+		response.Fail(c, response.ErrInvalidParam)
+		return
+	}
+	result, err := h.appService.UpdateAgentMemoryValue(c.Request.Context(), c.Param("agent_id"), accountID.String(), req)
+	if err != nil {
+		h.failRuntime(c, err)
+		return
+	}
+	response.Success(c, result)
+}
+
+func (h *AgentsHandler) ClearAgentMemoryValue(c *gin.Context) {
+	accountID, err := uuid.Parse(strings.TrimSpace(c.GetString("account_id")))
+	if err != nil {
+		response.Fail(c, response.ErrUnauthorized)
+		return
+	}
+	result, err := h.appService.ClearAgentMemoryValue(c.Request.Context(), c.Param("agent_id"), accountID.String(), c.Param("key"))
+	if err != nil {
+		h.failRuntime(c, err)
+		return
+	}
+	response.Success(c, result)
+}
+
+func (h *AgentsHandler) PublishAgent(c *gin.Context) {
+	accountID := c.GetString("account_id")
+	if accountID == "" {
+		response.Fail(c, response.ErrUnauthorized)
+		return
+	}
+	ctx, ok := h.requireAgentManageAccess(c, accountID)
+	if !ok {
+		return
+	}
+	var req dto.PublishAgentRequest
+	if err := c.ShouldBindJSON(&req); err != nil && !errors.Is(err, io.EOF) {
+		response.Fail(c, response.ErrInvalidParam)
+		return
+	}
+	result, err := h.appService.PublishAgent(ctx, c.Param("agent_id"), accountID, req)
+	if err != nil {
+		h.failRuntime(c, err)
+		return
+	}
+	response.Success(c, result)
+}
+
+func (h *AgentsHandler) GenerateAgentSuggestedQuestions(c *gin.Context) {
+	accountID := c.GetString("account_id")
+	if accountID == "" {
+		response.Fail(c, response.ErrUnauthorized)
+		return
+	}
+	ctx, ok := h.requireAgentManageAccess(c, accountID)
+	if !ok {
+		return
+	}
+	var req dto.GenerateAgentSuggestedQuestionsRequest
+	if err := c.ShouldBindJSON(&req); err != nil {
+		response.Fail(c, response.ErrInvalidParam)
+		return
+	}
+	result, err := h.appService.GenerateAgentSuggestedQuestions(ctx, c.Param("agent_id"), accountID, &req)
+	if err != nil {
+		logger.ErrorContext(c.Request.Context(), "failed to generate agent suggested questions", "agent_id", c.Param("agent_id"), err)
+		if isAgentSuggestedQuestionsConfigurationError(err) {
+			response.FailWithMessage(c, response.ErrConfigError, "Please configure a default LLM model before generating suggested questions.")
+			return
+		}
+		if isAgentSuggestedQuestionsModelOutputError(err) {
+			response.FailWithMessage(c, response.ErrServiceUnavailable, "The model did not return usable suggested questions. Please try again.")
+			return
+		}
+		response.FailWithMessage(c, response.ErrServiceUnavailable, "Failed to generate suggested questions. Please try again.")
+		return
+	}
+	response.Success(c, result)
+}
+
+func (h *AgentsHandler) ChatAgent(c *gin.Context) {
+	if h.chatRuntimeService == nil {
+		response.Fail(c, response.ErrSystemError)
+		return
+	}
+	accountID, err := uuid.Parse(strings.TrimSpace(c.GetString("account_id")))
+	if err != nil {
+		response.Fail(c, response.ErrUnauthorized)
+		return
+	}
+	organizationID, err := uuid.Parse(strings.TrimSpace(util.GetOrganizationID(c)))
+	if err != nil {
+		response.Fail(c, response.ErrUnauthorized)
+		return
+	}
+	agentID, err := uuid.Parse(strings.TrimSpace(c.Param("agent_id")))
+	if err != nil {
+		response.Fail(c, response.ErrInvalidParam)
+		return
+	}
+	ctx, ok := h.requireAgentManageAccess(c, accountID.String())
+	if !ok {
+		return
+	}
+	var req runtimedto.ChatRequest
+	if err := c.ShouldBindJSON(&req); err != nil {
+		response.Fail(c, response.ErrInvalidParam)
+		return
+	}
+	draft, err := h.appService.GetAgentDraftRuntimeConfig(ctx, agentID.String(), accountID.String())
+	if err != nil {
+		response.SpecialFail(c, gin.H{"code": "399001", "message": err.Error()})
+		return
+	}
+	agentWorkspaceID, err := uuid.Parse(strings.TrimSpace(draft.WorkspaceID))
+	if err != nil {
+		response.Fail(c, response.ErrInvalidParam)
+		return
+	}
+	scope := runtimeservice.Scope{OrganizationID: organizationID, AccountID: accountID, WorkspaceID: &agentWorkspaceID}
+	runConfig, err := h.agentRunConfig(ctx, scope, agentID.String(), "agent.draft", draft.Config, "account")
+	if err != nil {
+		h.failRuntime(c, err)
+		return
+	}
+	prepared, err := h.chatRuntimeService.PrepareConfiguredChat(
+		ctx,
+		scope,
+		runtimeservice.Caller{Type: runtimemodel.ConversationCallerAgent, ID: &agentID, Source: runtimemodel.ConversationSourceConsole},
+		runConfig,
+		req,
+	)
+	if err != nil {
+		response.SpecialFail(c, gin.H{"code": "399001", "message": err.Error()})
+		return
+	}
+	setupPreparedAgentSSE(c, prepared)
+	_ = writeAgentSSE(c, "message_start", gin.H{
+		"conversation_id": prepared.Conversation.ID.String(),
+		"message_id":      prepared.Message.ID.String(),
+		"parent_id":       uuidPtrToString(prepared.Message.ParentID),
+		"title":           prepared.Conversation.Title,
+		"model":           prepared.Message.ModelName,
+		"created_at":      prepared.Message.CreatedAt.Unix(),
+	})
+	result, err := h.chatRuntimeService.RunPreparedStream(c.Request.Context(), prepared, func(chunk string) error {
+		return writeAgentSSE(c, "message", gin.H{
+			"conversation_id": prepared.Conversation.ID.String(),
+			"message_id":      prepared.Message.ID.String(),
+			"answer":          chunk,
+		})
+	}, func(event runtimeservice.StreamEvent) error {
+		return writeAgentSSEEvent(c, event.ID, event.EventType, event.Payload)
+	})
+	if err != nil {
+		status := runtimemodel.MessageStatusError
+		if errors.Is(err, runtimeservice.ErrMessageStopped) {
+			status = runtimemodel.MessageStatusStopped
+		}
+		_ = writeAgentSSE(c, "message_end", gin.H{
+			"conversation_id": prepared.Conversation.ID.String(),
+			"message_id":      prepared.Message.ID.String(),
+			"status":          status,
+			"metadata":        gin.H{},
+		})
+		return
+	}
+	writeAgentChatEnd(c, prepared, result)
+}
+
+func (h *AgentsHandler) ListAgentPublishedVersions(c *gin.Context) {
+	accountID := c.GetString("account_id")
+	if accountID == "" {
+		response.Fail(c, response.ErrUnauthorized)
+		return
+	}
+	page := 1
+	limit := 20
+	if parsed, err := strconv.Atoi(c.DefaultQuery("page", "1")); err == nil {
+		page = parsed
+	}
+	if parsed, err := strconv.Atoi(c.DefaultQuery("limit", "20")); err == nil {
+		limit = parsed
+	}
+	ctx := agentRuntimeRequestContext(c, accountID)
+	result, err := h.appService.ListAgentPublishedVersions(ctx, c.Param("agent_id"), accountID, page, limit)
+	if err != nil {
+		response.SpecialFail(c, gin.H{"code": "399001", "message": err.Error()})
+		return
+	}
+	response.Success(c, result)
+}
+
+func (h *AgentsHandler) PreviewAgentPublishedVersionRollback(c *gin.Context) {
+	accountID := c.GetString("account_id")
+	if accountID == "" {
+		response.Fail(c, response.ErrUnauthorized)
+		return
+	}
+	ctx, ok := h.requireAgentManageAccess(c, accountID)
+	if !ok {
+		return
+	}
+	result, err := h.appService.PreviewAgentPublishedVersionRollback(ctx, c.Param("agent_id"), accountID, c.Param("version_id"))
+	if err != nil {
+		h.failRuntime(c, err)
+		return
+	}
+	response.Success(c, result)
+}
+
+func (h *AgentsHandler) RollbackAgentPublishedVersion(c *gin.Context) {
+	accountID := c.GetString("account_id")
+	if accountID == "" {
+		response.Fail(c, response.ErrUnauthorized)
+		return
+	}
+	ctx, ok := h.requireAgentManageAccess(c, accountID)
+	if !ok {
+		return
+	}
+	var req dto.RollbackAgentPublishedVersionRequest
+	if err := c.ShouldBindJSON(&req); err != nil {
+		response.Fail(c, response.ErrInvalidParam)
+		return
+	}
+	result, err := h.appService.RollbackAgentPublishedVersion(ctx, c.Param("agent_id"), accountID, req)
+	if err != nil {
+		h.failRuntime(c, err)
+		return
+	}
+	response.Success(c, result)
+}
+
+func (h *AgentsHandler) GetWebAppRuntimeConfig(c *gin.Context) {
+	result, err := h.appService.GetPublishedAgentWebAppConfig(c.Request.Context(), c.Param("web_app_id"))
+	if err != nil {
+		h.failWebAppRuntime(c, err)
+		return
+	}
+	voiceEnabled := false
+	if h.voiceService != nil {
+		voiceEnabled, err = h.voiceService.Available(c.Request.Context(), result.OrganizationID)
+		if err != nil {
+			logger.WarnContext(c.Request.Context(), "failed to resolve web app voice capability", "web_app_id", result.WebAppID, "error", err)
+			voiceEnabled = false
+		}
+	}
+	speechEnabled := false
+	if h.speechService != nil {
+		speechEnabled, err = h.speechService.Available(c.Request.Context(), result.OrganizationID)
+		if err != nil {
+			logger.WarnContext(c.Request.Context(), "failed to resolve web app speech capability", "web_app_id", result.WebAppID, "error", err)
+			speechEnabled = false
+		}
+	}
+	response.Success(c, gin.H{
+		"variables": []interface{}{},
+		"features": gin.H{
+			"agent_type":          result.AgentType,
+			"runtime":             "chat",
+			"suggested_questions": result.Config.SuggestedQuestions,
+			"speech_to_text": gin.H{
+				"enabled": voiceEnabled,
+			},
+			"text_to_speech": gin.H{
+				"enabled": speechEnabled,
+			},
+		},
+		"config": gin.H{
+			"agent_id":   result.AgentID,
+			"type":       result.AgentType,
+			"icon":       result.Icon,
+			"icon_type":  result.IconType,
+			"icon_url":   result.IconURL,
+			"title":      result.Name,
+			"web_app_id": result.WebAppID,
+		},
+		"agent_config": publicAgentWebAppConfig(result),
+		"version": gin.H{
+			"version":      result.Version,
+			"version_uuid": result.VersionUUID,
+		},
+	})
+}
+
+func (h *AgentsHandler) GetWebAppRuntimeCapability(c *gin.Context) {
+	result, err := h.appService.GetWebAppRuntimeCapability(c.Request.Context(), c.Param("web_app_id"), c.GetString("account_id"), c.GetBool("is_authenticated"))
+	if err != nil {
+		h.failWebAppRuntime(c, err)
+		return
+	}
+	result.AuthMode = webAppRuntimeAuthMode(c)
+	response.Success(c, result)
+}
+
+func (h *AgentsHandler) requireWebAppRuntimeAccess(c *gin.Context) bool {
+	result, err := h.appService.GetWebAppRuntimeCapability(c.Request.Context(), c.Param("web_app_id"), c.GetString("account_id"), c.GetBool("is_authenticated"))
+	if err != nil {
+		h.failWebAppRuntime(c, err)
+		return false
+	}
+	if result.Allowed {
+		return true
+	}
+
+	switch result.Reason {
+	case agentWebAppCapabilityReasonLoginRequired:
+		response.Fail(c, response.ErrUnauthorized)
+	case agentWebAppCapabilityReasonNoAccess,
+		string(runtimeauth.RuntimeAccessDeniedNoMatchingGrant):
+		response.Fail(c, response.ErrPermissionDenied)
+	case string(runtimeauth.RuntimeAccessDeniedDisabledSurface),
+		string(runtimeauth.RuntimeAccessDeniedMissingSurface):
+		response.Fail(c, response.ErrWebAppOffline)
+	default:
+		response.Fail(c, response.ErrPermissionDenied)
+	}
+	return false
+}
+
+func (h *AgentsHandler) GetWebAppUploadConfig(c *gin.Context) {
+	if h.fileService == nil {
+		response.Fail(c, response.ErrSystemError)
+		return
+	}
+	if !h.requireWebAppRuntimeAccess(c) {
+		return
+	}
+	published, err := h.appService.GetPublishedAgentWebAppConfig(c.Request.Context(), c.Param("web_app_id"))
+	if err != nil {
+		h.failWebAppRuntime(c, err)
+		return
+	}
+	if !requireAuthenticatedWebAppAgentFileAccess(c) {
+		return
+	}
+	if !published.Config.FileUpload {
+		response.Fail(c, response.ErrPermissionDenied)
+		return
+	}
+	response.Success(c, h.fileService.GetUploadConfig())
+}
+
+func (h *AgentsHandler) UploadWebAppFile(c *gin.Context) {
+	if h.fileService == nil {
+		response.Fail(c, response.ErrSystemError)
+		return
+	}
+	if !h.requireWebAppRuntimeAccess(c) {
+		return
+	}
+	published, err := h.appService.GetPublishedAgentWebAppConfig(c.Request.Context(), c.Param("web_app_id"))
+	if err != nil {
+		h.failWebAppRuntime(c, err)
+		return
+	}
+	if !requireAuthenticatedWebAppAgentFileAccess(c) {
+		return
+	}
+	if !published.Config.FileUpload {
+		response.Fail(c, response.ErrPermissionDenied)
+		return
+	}
+	accountID := strings.TrimSpace(c.GetString("account_id"))
+	if accountID == "" {
+		response.Fail(c, response.ErrUnauthorized)
+		return
+	}
+	file, header, err := c.Request.FormFile("file")
+	if err != nil {
+		response.Fail(c, response.ErrNoFileUploaded)
+		return
+	}
+	defer file.Close()
+	if err := c.Request.ParseMultipartForm(32 << 20); err == nil && len(c.Request.MultipartForm.File) > 1 {
+		response.Fail(c, response.ErrTooManyFiles)
+		return
+	}
+	if strings.TrimSpace(header.Filename) == "" {
+		response.Fail(c, response.ErrFilenameRequired)
+		return
+	}
+	content, err := io.ReadAll(file)
+	if err != nil {
+		response.Fail(c, response.ErrFileReadFailed)
+		return
+	}
+	mimeType := header.Header.Get("Content-Type")
+	if mimeType == "" {
+		mimeType = "application/octet-stream"
+	}
+	workspaceID := published.WorkspaceID
+	uploadFile, err := h.fileService.UploadFile(
+		c.Request.Context(),
+		header.Filename,
+		content,
+		mimeType,
+		accountID,
+		published.OrganizationID,
+		filemodel.CreatedByRoleEndUser,
+		nil,
+		&workspaceID,
+		true,
+		false,
+	)
+	if err != nil {
+		switch {
+		case errors.Is(err, filemodel.ErrFileTooLarge):
+			response.Fail(c, response.ErrFileTooLarge)
+		case errors.Is(err, filemodel.ErrUnsupportedFileType):
+			response.Fail(c, response.ErrUnsupportedFileType)
+		default:
+			logger.ErrorContext(c.Request.Context(), "failed to upload webapp file", err)
+			response.FailWithMessage(c, response.ErrorCode{Code: 210002, Message: "Failed to upload file", UserVisible: true}, err.Error())
+		}
+		return
+	}
+	response.Success(c, dto.NewFileUploadResponse(uploadFile))
+}
+
+func agentRuntimeRequestContext(c *gin.Context, accountID string) context.Context {
+	ctx := context.WithValue(c.Request.Context(), "account_id", accountID)
+	if callerOrganizationID := util.GetOrganizationID(c); callerOrganizationID != "" {
+		ctx = context.WithValue(ctx, "tenant_id", callerOrganizationID)
+	}
+	return ctx
+}
+
+func (h *AgentsHandler) requireAgentManageAccess(c *gin.Context, accountID string) (context.Context, bool) {
+	ctx := agentRuntimeRequestContext(c, accountID)
+	if err := h.appService.RequireAgentManageAccess(ctx, c.Param("agent_id"), accountID); err != nil {
+		h.failRuntime(c, err)
+		return nil, false
+	}
+	return ctx, true
+}
+
+func publicAgentWebAppConfig(result *dto.AgentWebAppRuntimeConfigResponse) dto.AgentPublicWebAppConfigResponse {
+	if result == nil {
+		return dto.AgentPublicWebAppConfigResponse{}
+	}
+	return dto.AgentPublicWebAppConfigResponse{
+		AgentID:            result.AgentID,
+		WebAppID:           result.WebAppID,
+		AgentType:          result.AgentType,
+		Name:               result.Name,
+		Description:        result.Description,
+		Icon:               result.Icon,
+		IconType:           result.IconType,
+		IconURL:            result.IconURL,
+		HomeTitle:          result.Config.HomeTitle,
+		OpeningStatement:   result.Config.OpeningStatement,
+		InputPlaceholder:   result.Config.InputPlaceholder,
+		SuggestedQuestions: result.Config.SuggestedQuestions,
+		FileUpload:         result.Config.FileUpload,
+		SupportsVision:     result.Config.SupportsVision,
+		AgentMemoryEnabled: result.Config.AgentMemoryEnabled,
+		Version:            result.Version,
+		VersionUUID:        result.VersionUUID,
+	}
+}
+
+func requireAuthenticatedWebAppAgentWhenMemoryEnabled(c *gin.Context, published *dto.AgentWebAppRuntimeConfigResponse) bool {
+	if published != nil && published.Config.AgentMemoryEnabled && !c.GetBool("is_authenticated") {
+		response.Fail(c, response.ErrUnauthorized)
+		return false
+	}
+	return true
+}
+
+func requireAuthenticatedWebAppAgentFileAccess(c *gin.Context) bool {
+	if !c.GetBool("is_authenticated") {
+		response.Fail(c, response.ErrUnauthorized)
+		return false
+	}
+	return true
+}
+
+func webAppRuntimeAuthMode(c *gin.Context) string {
+	switch {
+	case c.GetBool("migration_required"):
+		return "migration"
+	case c.GetBool("is_authenticated"):
+		return "authenticated"
+	case strings.TrimSpace(c.GetString("virtual_account_id")) != "":
+		return "virtual"
+	default:
+		return "unknown"
+	}
+}
+
+func (h *AgentsHandler) ChatWebAppAgent(c *gin.Context) {
+	if h.chatRuntimeService == nil {
+		response.Fail(c, response.ErrSystemError)
+		return
+	}
+	webAppID := strings.TrimSpace(c.Param("web_app_id"))
+	if !h.requireWebAppRuntimeAccess(c) {
+		return
+	}
+	published, err := h.appService.GetPublishedAgentWebAppConfig(c.Request.Context(), webAppID)
+	if err != nil {
+		h.failWebAppRuntime(c, err)
+		return
+	}
+	if !requireAuthenticatedWebAppAgentWhenMemoryEnabled(c, published) {
+		return
+	}
+	accountID, err := uuid.Parse(strings.TrimSpace(c.GetString("account_id")))
+	if err != nil {
+		response.Fail(c, response.ErrUnauthorized)
+		return
+	}
+	agentID, err := uuid.Parse(published.AgentID)
+	if err != nil {
+		response.Fail(c, response.ErrInvalidParam)
+		return
+	}
+	workspaceID, err := uuid.Parse(published.WorkspaceID)
+	if err != nil {
+		response.Fail(c, response.ErrInvalidParam)
+		return
+	}
+	organizationID, err := uuid.Parse(published.OrganizationID)
+	if err != nil {
+		response.Fail(c, response.ErrInvalidParam)
+		return
+	}
+	sourceWebAppID, err := uuid.Parse(published.WebAppID)
+	if err != nil {
+		response.Fail(c, response.ErrInvalidParam)
+		return
+	}
+	var req runtimedto.ChatRequest
+	if err := c.ShouldBindJSON(&req); err != nil {
+		response.Fail(c, response.ErrInvalidParam)
+		return
+	}
+	scope := runtimeservice.Scope{OrganizationID: organizationID, AccountID: accountID, WorkspaceID: &workspaceID, SkipAccessCheck: true}
+	runConfig, err := h.agentRunConfig(c.Request.Context(), scope, published.AgentID, "agent.published."+published.Version, published.Config, webAppAgentMemoryUserScope(c))
+	if err != nil {
+		h.failRuntime(c, err)
+		return
+	}
+	prepared, err := h.chatRuntimeService.PrepareConfiguredChat(
+		c.Request.Context(),
+		scope,
+		runtimeservice.Caller{
+			Type:           runtimemodel.ConversationCallerAgent,
+			ID:             &agentID,
+			Source:         runtimemodel.ConversationSourceWebApp,
+			SourceWebAppID: &sourceWebAppID,
+		},
+		runConfig,
+		req,
+	)
+	if err != nil {
+		response.SpecialFail(c, gin.H{"code": "399001", "message": err.Error()})
+		return
+	}
+	setupPreparedAgentSSE(c, prepared)
+	_ = writeAgentSSE(c, "message_start", gin.H{
+		"conversation_id": prepared.Conversation.ID.String(),
+		"message_id":      prepared.Message.ID.String(),
+		"parent_id":       uuidPtrToString(prepared.Message.ParentID),
+		"title":           prepared.Conversation.Title,
+		"model":           prepared.Message.ModelName,
+		"created_at":      prepared.Message.CreatedAt.Unix(),
+	})
+	result, err := h.chatRuntimeService.RunPreparedStream(c.Request.Context(), prepared, func(chunk string) error {
+		return writeAgentSSE(c, "message", gin.H{
+			"conversation_id": prepared.Conversation.ID.String(),
+			"message_id":      prepared.Message.ID.String(),
+			"answer":          chunk,
+		})
+	}, func(event runtimeservice.StreamEvent) error {
+		return writeAgentSSEEvent(c, event.ID, event.EventType, event.Payload)
+	})
+	if err != nil {
+		status := runtimemodel.MessageStatusError
+		if errors.Is(err, runtimeservice.ErrMessageStopped) {
+			status = runtimemodel.MessageStatusStopped
+		}
+		_ = writeAgentSSE(c, "message_end", gin.H{
+			"conversation_id": prepared.Conversation.ID.String(),
+			"message_id":      prepared.Message.ID.String(),
+			"status":          status,
+			"metadata":        gin.H{},
+		})
+		return
+	}
+	writeAgentChatEnd(c, prepared, result)
+}
+
+func setupAgentSSE(c *gin.Context) {
+	c.Writer.Header().Set("Content-Type", "text/event-stream")
+	c.Writer.Header().Set("Cache-Control", "no-cache")
+	c.Writer.Header().Set("Connection", "keep-alive")
+	c.Writer.Header().Set("Transfer-Encoding", "chunked")
+	c.Status(http.StatusOK)
+	c.Writer.Flush()
+	writer := newAgentSSEWriter(c)
+	c.Set(agentSSEWriterContextKey, writer)
+	writer.StartHeartbeat(c.Request.Context())
+}
+
+const (
+	agentSSEConversationIDHeader = "X-MINGYINGKEJI-Conversation-ID"
+	agentSSEMessageIDHeader      = "X-MINGYINGKEJI-Message-ID"
+)
+
+func setupPreparedAgentSSE(c *gin.Context, prepared *runtimeservice.PreparedChat) {
+	if prepared != nil && prepared.Conversation != nil {
+		c.Header(agentSSEConversationIDHeader, prepared.Conversation.ID.String())
+	}
+	if prepared != nil && prepared.Message != nil {
+		c.Header(agentSSEMessageIDHeader, prepared.Message.ID.String())
+	}
+	setupAgentSSE(c)
+}
+
+func writeAgentSSE(c *gin.Context, event string, data interface{}) error {
+	return writeAgentSSEEvent(c, "", event, data)
+}
+
+func writeAgentChatEnd(c *gin.Context, prepared *runtimeservice.PreparedChat, result *runtimeservice.ChatResult) {
+	status := runtimemodel.MessageStatusCompleted
+	metadata := map[string]interface{}{}
+	eventID := ""
+	if result != nil {
+		if strings.TrimSpace(result.Status) != "" {
+			status = strings.TrimSpace(result.Status)
+		}
+		if result.Metadata != nil {
+			metadata = runtimeservice.ClientVisibleMessageMetadata(result.Metadata)
+		}
+		eventID = strings.TrimSpace(result.MessageEndEventID)
+	}
+	_ = writeAgentSSEEvent(c, eventID, "message_end", gin.H{
+		"conversation_id": prepared.Conversation.ID.String(),
+		"message_id":      prepared.Message.ID.String(),
+		"status":          status,
+		"metadata":        metadata,
+	})
+}
+
+func writeAgentSSEEvent(c *gin.Context, id string, event string, data interface{}) error {
+	if value, ok := c.Get(agentSSEWriterContextKey); ok {
+		if writer, writerOK := value.(*agentSSEWriter); writerOK && writer != nil {
+			return writer.WriteEvent(id, event, data)
+		}
+	}
+	return writeAgentSSERaw(c, id, event, data)
+}
+
+func writeAgentSSERaw(c *gin.Context, id string, event string, data interface{}) error {
+	payload := gin.H{"event": event, "data": data}
+	encoded, err := json.Marshal(payload)
+	if err != nil {
+		return err
+	}
+	if id != "" {
+		_, _ = fmt.Fprintf(c.Writer, "id: %s\n", id)
+	}
+	_, _ = fmt.Fprintf(c.Writer, "event: %s\n", event)
+	_, _ = fmt.Fprintf(c.Writer, "data: %s\n\n", string(encoded))
+	c.Writer.Flush()
+	return nil
+}
+
+func (h *AgentsHandler) UpdateAgent(c *gin.Context) {
+	// Authenticate
+	accountID := c.GetString("account_id")
+	if accountID == "" {
+		response.Fail(c, response.ErrUnauthorized)
+		return
+	}
+
+	agentID := c.Param("agent_id")
+	if agentID == "" {
+		response.Fail(c, response.ErrInvalidParam)
+		return
+	}
+
+	callerOrganizationID := util.GetOrganizationID(c)
+	if callerOrganizationID == "" {
+		response.Fail(c, response.ErrOrganizationNotFound)
+		return
+	}
+
+	ctx, ok := h.requireAgentManageAccess(c, accountID)
+	if !ok {
+		return
+	}
+
+	// Bind update request (partial update)
+	var req map[string]interface{}
+	if err := c.ShouldBindJSON(&req); err != nil {
+		response.Fail(c, response.ErrInvalidParam)
+		return
+	}
+
+	result, err := h.appService.UpdateAgent(ctx, agentID, req)
+	if err != nil {
+		// Map specific errors to appropriate responses
+		switch err.Error() {
+		case "agent not found":
+			response.SpecialFail(c, gin.H{"code": "404001", "message": "Agent not found"})
+		case "permission denied":
+			response.SpecialFail(c, gin.H{"code": "403001", "message": "Permission denied"})
+		default:
+			response.SpecialFail(c, gin.H{"code": "399001", "message": err.Error()})
+		}
+		return
+	}
+
+	response.Success(c, result)
+}
+
+func (h *AgentsHandler) DeleteAgent(c *gin.Context) {
+	// Get account ID from context for authentication
+	accountID := c.GetString("account_id")
+	if accountID == "" {
+		response.Fail(c, response.ErrUnauthorized)
+		return
+	}
+
+	// Get agent ID from URL parameter
+	agentID := c.Param("agent_id")
+	if agentID == "" {
+		response.Fail(c, response.ErrInvalidParam)
+		return
+	}
+
+	callerOrganizationID := util.GetOrganizationID(c)
+	if callerOrganizationID == "" {
+		response.Fail(c, response.ErrOrganizationNotFound)
+		return
+	}
+
+	// Pass account_id and caller organization context for permission validation
+	ctx := c.Request.Context()
+	ctx = context.WithValue(ctx, "account_id", accountID)
+	ctx = context.WithValue(ctx, "tenant_id", callerOrganizationID)
+	ctx = withAgentResourceMutationOptions(ctx, c.Query("agent_binding_action"), c.Query("impact_token"))
+
+	// Call service to delete agent with permission validation
+	err := h.appService.DeleteAgent(ctx, agentID)
+	if err != nil {
+		if util.WriteAgentBindingConflict(c, err) {
+			return
+		}
+		if errors.Is(err, errAgentPermissionDenied) {
+			response.SpecialFail(c, gin.H{
+				"code":    "403001",
+				"message": "Permission denied",
+			})
+			return
+		}
+		// Map specific errors to appropriate responses
+		switch err.Error() {
+		case "agent not found":
+			response.SpecialFail(c, gin.H{
+				"code":    "404001",
+				"message": "Agent not found",
+			})
+		case "permission denied":
+			response.SpecialFail(c, gin.H{
+				"code":    "403001",
+				"message": "Permission denied",
+			})
+		default:
+			response.SpecialFail(c, gin.H{
+				"code":    "399001",
+				"message": err.Error(),
+			})
+		}
+		return
+	}
+
+	response.Success(c, gin.H{"message": "Agent deleted successfully"})
+}
+
+type agentDeleteImpactPreviewer interface {
+	PreviewAgentDeleteImpact(ctx context.Context, agentID string) (*agentbindings.Impact, error)
+}
+
+func (h *AgentsHandler) PreviewAgentDeleteImpact(c *gin.Context) {
+	accountID := c.GetString("account_id")
+	agentID := c.Param("agent_id")
+	callerOrganizationID := util.GetOrganizationID(c)
+	if accountID == "" {
+		response.Fail(c, response.ErrUnauthorized)
+		return
+	}
+	if agentID == "" || callerOrganizationID == "" {
+		response.Fail(c, response.ErrInvalidParam)
+		return
+	}
+	previewer, ok := h.appService.(agentDeleteImpactPreviewer)
+	if !ok {
+		response.Fail(c, response.ErrSystemError)
+		return
+	}
+	ctx := context.WithValue(c.Request.Context(), "account_id", accountID)
+	ctx = context.WithValue(ctx, "tenant_id", callerOrganizationID)
+	impact, err := previewer.PreviewAgentDeleteImpact(ctx, agentID)
+	if err != nil {
+		switch err.Error() {
+		case "agent not found":
+			response.SpecialFail(c, gin.H{"code": "404001", "message": "Agent not found"})
+		case "permission denied":
+			response.SpecialFail(c, gin.H{"code": "403001", "message": "Permission denied"})
+		default:
+			response.SpecialFail(c, gin.H{"code": "399001", "message": err.Error()})
+		}
+		return
+	}
+	response.Success(c, impact)
+}

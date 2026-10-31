@@ -1,0 +1,522 @@
+'use client';
+
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
+import { useForm } from 'react-hook-form';
+import { zodResolver } from '@hookform/resolvers/zod';
+import * as z from 'zod';
+import {
+  Dialog,
+  DialogContent,
+  DialogHeader,
+  DialogTitle,
+  DialogBody,
+} from '@/components/ui/dialog';
+import {
+  Form,
+  FormControl,
+  FormField,
+  FormItem,
+  FormLabel,
+  FormMessage,
+} from '@/components/ui/form';
+import { Input } from '@/components/ui/input';
+import { Textarea } from '@/components/ui/textarea';
+import { Button } from '@/components/ui/button';
+import { RadioCardGroup, RadioCard } from '@/components/ui/radio-card';
+
+import { useT } from '@/i18n';
+import { useRouter } from 'next/navigation';
+import { IconInput } from '@/components/common/icon-input';
+import { uploadAppAvatarPreset } from '@/components/common/icon-input/avatar-preset-upload';
+import {
+  APP_AVATAR_PRESETS,
+  getRandomAppAvatar,
+  type AppAvatarPreset,
+} from '@/components/common/icon-input/avatar-presets';
+import {
+  createImageIconValue,
+  createTextIconValue,
+  type IconValue,
+} from '@/components/common/icon-input/types';
+import { getNameValidationErrors } from '@/utils/validation';
+import { cn } from '@/lib/utils';
+import {
+  AgentType,
+  type CreateAgentRequest,
+  type AgentCreateResponse,
+} from '@/services/types/agent';
+import type { ApiResponseData } from '@/services/types/common';
+import { useCreateAgent } from '@/hooks/agent/use-agents';
+import { Bot, ChevronLeft, MessageSquareQuote, Workflow } from 'lucide-react';
+import { useCurrentWorkspace } from '@/store/workspace-store';
+import { ICON_BG, ICON_TEXT } from '@/lib/config';
+import { useAccountPermissions } from '@/hooks/organization/use-account-permissions';
+import { AGENT_PERMISSION_ACTIONS, WORKFLOW_PERMISSION_ACTIONS } from '@/constants/permissions';
+import { getAgentDetailBaseHref } from '@/utils/agent-detail-routes';
+import { toast } from 'sonner';
+
+interface CreateAgentDialogProps {
+  open: boolean;
+  onOpenChange: (open: boolean) => void;
+  allowedAgentTypes?: AgentType[];
+  defaultAgentType?: AgentType;
+  hideTypeSelector?: boolean;
+}
+
+export function CreateAgentDialog({
+  open,
+  onOpenChange,
+  allowedAgentTypes,
+  defaultAgentType,
+  hideTypeSelector = false,
+}: CreateAgentDialogProps) {
+  const t = useT('agents');
+  const tRoot = useT();
+  const router = useRouter();
+  const portalHostRef = useRef<HTMLDivElement | null>(null);
+
+  const createMutation = useCreateAgent();
+  const currentWorkspaceFromStore = useCurrentWorkspace();
+  const { hasAnyPermission } = useAccountPermissions();
+  const canCreateAgent = hasAnyPermission(AGENT_PERMISSION_ACTIONS.create);
+  const canCreateWorkflow = hasAnyPermission(WORKFLOW_PERMISSION_ACTIONS.create);
+  const selectableAgentTypes = useMemo(
+    () =>
+      allowedAgentTypes?.length
+        ? allowedAgentTypes
+        : [AgentType.AGENT, AgentType.CONVERSATIONAL_AGENT, AgentType.WORKFLOW],
+    [allowedAgentTypes]
+  );
+  const selectableAgentTypeSet = useMemo(
+    () => new Set<AgentType>(selectableAgentTypes),
+    [selectableAgentTypes]
+  );
+  const isWorkflowCreationContext = useMemo(
+    () => selectableAgentTypes.length > 0 && selectableAgentTypes.every(type => type !== AgentType.AGENT),
+    [selectableAgentTypes]
+  );
+  const isAgentTypeAllowed = useCallback(
+    (agentType: AgentType) => {
+      if (!selectableAgentTypeSet.has(agentType)) {
+        return false;
+      }
+      if (agentType === AgentType.AGENT) {
+        return canCreateAgent;
+      }
+      return canCreateWorkflow;
+    },
+    [canCreateAgent, canCreateWorkflow, selectableAgentTypeSet]
+  );
+  const resolvedDefaultAgentType = useMemo(
+    () =>
+      defaultAgentType && isAgentTypeAllowed(defaultAgentType)
+        ? defaultAgentType
+        : selectableAgentTypes.find(type => isAgentTypeAllowed(type)) ?? AgentType.AGENT,
+    [defaultAgentType, isAgentTypeAllowed, selectableAgentTypes]
+  );
+  const canCreateAnyType = selectableAgentTypes.some(type => isAgentTypeAllowed(type));
+
+  const defaultAvatarPresetRef = useRef<AppAvatarPreset>(APP_AVATAR_PRESETS[0]);
+  const wasOpenRef = useRef(false);
+  const [iconValue, setIconValue] = useState<IconValue>(
+    createImageIconValue(defaultAvatarPresetRef.current.src)
+  );
+  const [isPreparingAvatar, setIsPreparingAvatar] = useState(false);
+  const [showAdvanced, setShowAdvanced] = useState(false);
+  const dialogTitle = isWorkflowCreationContext ? t('createWorkflow') : t('create');
+  const useHorizontalCreateLayout = isWorkflowCreationContext && !hideTypeSelector;
+  const nameLabel = isWorkflowCreationContext ? t('form.workflowName') : t('form.name');
+  const namePlaceholder = isWorkflowCreationContext
+    ? t('form.workflowNamePlaceholder')
+    : t('form.namePlaceholder');
+  const descriptionLabel = isWorkflowCreationContext
+    ? t('form.workflowDescription')
+    : t('form.description');
+  const descriptionPlaceholder = isWorkflowCreationContext
+    ? t('form.workflowDescriptionPlaceholder')
+    : t('form.descriptionPlaceholder');
+
+  const baseSchema = useMemo(
+    () =>
+      z.object({
+        name: z.string().superRefine((val, ctx) => {
+          const errs = getNameValidationErrors(val, { allowSpace: true });
+          if (errs.length) {
+            const code = errs[0];
+            const msg =
+              code === 'required'
+                ? isWorkflowCreationContext
+                  ? t('validation.workflowName.required')
+                  : t('validation.name.required')
+                : code === 'tooShort'
+                  ? t('validation.name.tooShort')
+                  : code === 'tooLong'
+                    ? t('validation.name.tooLong')
+                    : code === 'invalidChars'
+                      ? t('validation.name.invalidChars')
+                      : t('validation.name.onlySpaces');
+            ctx.addIssue({ code: z.ZodIssueCode.custom, message: msg });
+          }
+        }),
+        description: z.string().optional(),
+        icon: z.string().optional(),
+        icon_type: z.enum(['text', 'image']),
+        icon_background: z.string().optional(),
+        workspace_id: z.string().optional(),
+      }),
+    [isWorkflowCreationContext, t]
+  );
+
+  const createSchema = useMemo(
+    () => baseSchema.extend({ agent_type: z.nativeEnum(AgentType) }),
+    [baseSchema]
+  );
+
+  type CreateFormDataLocal = z.infer<typeof createSchema>;
+
+  const form = useForm<CreateFormDataLocal>({
+    resolver: zodResolver(createSchema),
+    mode: 'onChange',
+    reValidateMode: 'onChange',
+    shouldFocusError: true,
+    defaultValues: {
+      name: '',
+      description: '',
+      icon: defaultAvatarPresetRef.current.src,
+      icon_type: 'image',
+      agent_type: resolvedDefaultAgentType,
+    },
+  });
+
+  const watchedName = form.watch('name');
+  useEffect(() => {
+    if (watchedName && iconValue.type === 'text') {
+      setIconValue(
+        createTextIconValue(watchedName.slice(0, 2).toUpperCase() || ICON_TEXT, ICON_BG)
+      );
+    }
+  }, [watchedName, iconValue.type]);
+
+  const resetFormState = () => {
+    form.reset({
+      name: '',
+      description: '',
+      icon: defaultAvatarPresetRef.current.src,
+      icon_type: 'image',
+      agent_type: resolvedDefaultAgentType,
+    });
+    setIconValue(createImageIconValue(defaultAvatarPresetRef.current.src));
+    setIsPreparingAvatar(false);
+    setShowAdvanced(false);
+  };
+
+  const onSubmit = async (data: CreateFormDataLocal) => {
+    if (!isAgentTypeAllowed(data.agent_type)) {
+      form.setError('agent_type', {
+        type: 'manual',
+        message: tRoot('common.unauthorizedDescription'),
+      });
+      return;
+    }
+
+    const workspaceId = currentWorkspaceFromStore?.id;
+
+    if (!workspaceId) {
+      form.setError('workspace_id', {
+        type: 'manual',
+        message: t('validation.workspace.required'),
+      });
+      return;
+    }
+
+    let resolvedIconValue = iconValue;
+    if (resolvedIconValue.type === 'image' && !resolvedIconValue.imageId) {
+      const pendingIconUrl = resolvedIconValue.iconUrl;
+      const defaultPreset = APP_AVATAR_PRESETS.find(preset => preset.src === pendingIconUrl);
+      if (defaultPreset) {
+        try {
+          setIsPreparingAvatar(true);
+          resolvedIconValue = await uploadAppAvatarPreset(defaultPreset);
+          setIconValue(resolvedIconValue);
+        } catch (error) {
+          console.error('Default avatar upload failed:', error);
+          toast.error(tRoot('common.iconInput.avatarLibraryDialog.uploadFailed'));
+          setIsPreparingAvatar(false);
+          return;
+        }
+      }
+    }
+
+    const payload: CreateAgentRequest = {
+      name: data.name,
+      description: data.description || '',
+      icon:
+        resolvedIconValue.type === 'text'
+          ? JSON.stringify({
+              icon: resolvedIconValue.icon || data.name.slice(0, 2).toUpperCase() || ICON_TEXT,
+              icon_background: resolvedIconValue.iconBackground,
+            })
+          : resolvedIconValue.imageId || resolvedIconValue.iconUrl || '',
+      icon_type: resolvedIconValue.type,
+      agent_type: data.agent_type,
+      workspace_id: workspaceId,
+    };
+
+    setIsPreparingAvatar(false);
+    createMutation.mutate(payload, {
+      onSuccess: (res: ApiResponseData<AgentCreateResponse>) => {
+        const newId = res.data?.id;
+        if (newId) {
+          router.push(getAgentDetailBaseHref(newId, data.agent_type));
+        }
+        resetFormState();
+        onOpenChange(false);
+      },
+    });
+  };
+
+  const handleDialogOpenChange = (nextOpen: boolean) => {
+    if (!nextOpen) {
+      resetFormState();
+    }
+    onOpenChange(nextOpen);
+  };
+
+  useEffect(() => {
+    if (open && !wasOpenRef.current) {
+      const defaultAvatar = getRandomAppAvatar();
+      defaultAvatarPresetRef.current = defaultAvatar;
+      setIconValue(createImageIconValue(defaultAvatar.src));
+      form.setValue('icon', defaultAvatar.src);
+      form.setValue('icon_type', 'image');
+    }
+    wasOpenRef.current = open;
+  }, [form, open]);
+
+  useEffect(() => {
+    if (!open) return;
+    const currentAgentType = form.getValues('agent_type');
+    if (!isAgentTypeAllowed(currentAgentType)) {
+      form.setValue('agent_type', resolvedDefaultAgentType, { shouldValidate: true });
+    }
+  }, [form, isAgentTypeAllowed, open, resolvedDefaultAgentType]);
+
+  return (
+    <Dialog open={open} onOpenChange={handleDialogOpenChange}>
+      <DialogContent
+        className={cn(useHorizontalCreateLayout ? 'max-w-3xl' : 'max-w-lg')}
+        aria-describedby={undefined}
+        onInteractOutside={e => {
+          const target = e.target as Element | null;
+          if (
+            target &&
+            (target.closest('[data-select-content]') ||
+              target.closest('[data-workspace-selector-content]'))
+          ) {
+            e.preventDefault();
+          }
+        }}
+      >
+        <div ref={portalHostRef} data-portal-host className="contents" />
+        <DialogHeader>
+          <DialogTitle className="flex items-center gap-2 text-xl font-semibold">
+            <Bot className="h-5 w-5" />
+            {dialogTitle}
+          </DialogTitle>
+        </DialogHeader>
+        <Form {...form}>
+          <form onSubmit={form.handleSubmit(onSubmit)}>
+            <DialogBody className="space-y-6">
+              <div
+                className={cn(
+                  'space-y-6',
+                  useHorizontalCreateLayout &&
+                    'grid gap-5 space-y-0 md:grid-cols-[260px_minmax(0,1fr)] md:items-start'
+                )}
+              >
+                {!hideTypeSelector && (
+                  <div
+                    className={cn(
+                      useHorizontalCreateLayout && 'rounded-xl border bg-muted/20 p-4'
+                    )}
+                  >
+                    <FormField
+                      control={form.control}
+                      name="agent_type"
+                      render={({ field }) => (
+                        <FormItem className="space-y-2.5">
+                          <FormLabel className="text-sm font-semibold">
+                            {t('form.mode')} <span className="text-destructive">*</span>
+                          </FormLabel>
+                          <FormControl>
+                            <RadioCardGroup
+                              value={field.value}
+                              onValueChange={field.onChange}
+                              className="gap-2"
+                            >
+                              {isAgentTypeAllowed(AgentType.AGENT) && (
+                                <RadioCard
+                                  value={AgentType.AGENT}
+                                  title={t('modes.agent')}
+                                  description={t('modes.agentDesc')}
+                                  checked={field.value === AgentType.AGENT}
+                                  hiddenRadio
+                                  icon={<Bot className="h-5 w-5" />}
+                                  className="p-3"
+                                />
+                              )}
+                              {isAgentTypeAllowed(AgentType.CONVERSATIONAL_AGENT) && (
+                                <RadioCard
+                                  value={AgentType.CONVERSATIONAL_AGENT}
+                                  title={t('modes.chatWorkflow')}
+                                  description={t('modes.chatWorkflowDesc')}
+                                  checked={field.value === AgentType.CONVERSATIONAL_AGENT}
+                                  hiddenRadio
+                                  icon={<MessageSquareQuote className="h-5 w-5" />}
+                                  className="p-3"
+                                />
+                              )}
+                              {isAgentTypeAllowed(AgentType.WORKFLOW) && (
+                                <RadioCard
+                                  value={AgentType.WORKFLOW}
+                                  title={t('modes.taskWorkflow')}
+                                  description={t('modes.taskWorkflowDesc')}
+                                  checked={field.value === AgentType.WORKFLOW}
+                                  hiddenRadio
+                                  icon={<Workflow className="h-5 w-5" />}
+                                  className="p-3"
+                                />
+                              )}
+                            </RadioCardGroup>
+                          </FormControl>
+                          <FormMessage />
+                        </FormItem>
+                      )}
+                    />
+                  </div>
+                )}
+
+                <div className="min-w-0 space-y-6">
+                  <FormField
+                    control={form.control}
+                    name="name"
+                    render={({ field }) => (
+                      <FormItem className="space-y-2.5">
+                        <FormLabel className="text-sm font-semibold">
+                          {nameLabel} <span className="text-destructive">*</span>
+                        </FormLabel>
+                        <FormControl>
+                          <Input
+                            placeholder={namePlaceholder}
+                            required
+                            aria-invalid={!!form.formState.errors.name}
+                            className={cn(
+                              'h-11',
+                              form.formState.errors.name ? 'focus-visible:ring-destructive' : ''
+                            )}
+                            {...field}
+                          />
+                        </FormControl>
+                        <FormMessage />
+                      </FormItem>
+                    )}
+                  />
+
+                  <FormField
+                    control={form.control}
+                    name="description"
+                    render={({ field }) => (
+                      <FormItem className="space-y-2">
+                        <FormLabel className="flex items-center gap-1">
+                          {descriptionLabel}
+                        </FormLabel>
+                        <FormControl>
+                          <Textarea
+                            placeholder={descriptionPlaceholder}
+                            className="resize-none"
+                            rows={4}
+                            {...field}
+                          />
+                        </FormControl>
+                        <FormMessage />
+                      </FormItem>
+                    )}
+                  />
+                </div>
+
+                <div className={cn('space-y-3', useHorizontalCreateLayout && 'md:col-span-2')}>
+                  <div className="flex items-center justify-between">
+                    <button
+                      type="button"
+                      className="flex items-center gap-1 text-base font-medium"
+                      onClick={() => setShowAdvanced(prev => !prev)}
+                    >
+                      {tRoot('dbs.createModal.advancedSettingsLabel')}
+                      <ChevronLeft
+                        className={cn(
+                          'h-4 w-4 transition-transform duration-300',
+                          showAdvanced ? '-rotate-90' : ''
+                        )}
+                      />
+                    </button>
+                  </div>
+
+                  <div
+                    className={cn(
+                      'space-y-4 w-full overflow-hidden transition-all duration-300',
+                      showAdvanced ? 'h-auto opacity-100 py-4' : 'h-0 opacity-0'
+                    )}
+                  >
+                    <FormField
+                      control={form.control}
+                      name="icon"
+                      render={({ field }) => (
+                        <FormItem className="space-y-2">
+                          <FormLabel>{t('form.icon')}</FormLabel>
+                          <FormControl>
+                            <IconInput
+                              showAvatarPresets
+                              value={iconValue}
+                              onChange={newIconValue => {
+                                setIconValue(newIconValue);
+                                if (newIconValue.type === 'text') {
+                                  field.onChange(newIconValue.icon);
+                                  form.setValue('icon_type', 'text');
+                                  form.setValue('icon_background', newIconValue.iconBackground);
+                                } else {
+                                  field.onChange(
+                                    newIconValue.imageId || newIconValue.iconUrl || ''
+                                  );
+                                  form.setValue('icon_type', 'image');
+                                }
+                              }}
+                            />
+                          </FormControl>
+                          <FormMessage />
+                        </FormItem>
+                      )}
+                    />
+                  </div>
+                </div>
+              </div>
+
+              <div className="flex justify-center pb-2">
+                <Button
+                  type="submit"
+                  className="px-8"
+                  disabled={isPreparingAvatar || createMutation.isPending || !canCreateAnyType}
+                >
+                  {isPreparingAvatar || createMutation.isPending
+                    ? t('form.creating')
+                    : t('form.create')}
+                </Button>
+              </div>
+            </DialogBody>
+          </form>
+        </Form>
+      </DialogContent>
+    </Dialog>
+  );
+}
+
+export default CreateAgentDialog;

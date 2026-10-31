@@ -1,0 +1,127 @@
+'use client';
+
+import { useMemo } from 'react';
+import { PieChart, Pie, Cell, ResponsiveContainer, Tooltip } from 'recharts';
+import { Inbox } from 'lucide-react';
+import { useLocale } from 'next-intl';
+
+import { useT } from '@/i18n';
+import { Card, CardContent } from '@/components/ui/card';
+import type { ModelUsageByAppTypeItem } from '@/services/types/statistics';
+import {
+  formatBillingDisplayAmountFromNormalizedCredits,
+  type BillingDisplaySettings,
+} from '@/utils/billing-display';
+import { formatNumber } from '@/utils/format';
+import { normalizeModelUsageAppType } from '@/utils/model-usage-app-type';
+
+const COLORS = ['#0F766E', '#2563EB', '#CA8A04', '#9333EA'];
+
+interface AppTypeDistributionSectionProps {
+  items: ModelUsageByAppTypeItem[];
+  billingDisplay: BillingDisplaySettings;
+}
+
+function formatShare(share: number): string {
+  return `${formatNumber(share * 100, 2)}%`;
+}
+
+export function AppTypeDistributionSection({
+  items,
+  billingDisplay,
+}: AppTypeDistributionSectionProps) {
+  const t = useT('dashboard');
+  const locale = useLocale();
+  const formatCost = (value: number) =>
+    formatBillingDisplayAmountFromNormalizedCredits(value, billingDisplay, { locale });
+
+  const chartData = useMemo(() => {
+    return items.map((item, index) => {
+      const appType = normalizeModelUsageAppType(item.app_type);
+
+      return {
+        appType,
+        attempts: item.attempt_count,
+        color: COLORS[index % COLORS.length],
+        label: t(`usage.appTypes.${appType}`),
+        percentage: formatShare(item.points_share),
+        value: item.total_points,
+      };
+    });
+  }, [items, t]);
+
+  return (
+    <Card>
+      <CardContent className="p-6">
+        <div className="mb-6 flex flex-col gap-1">
+          <h2 className="text-lg font-semibold">{t('usage.appTypeDistribution.title')}</h2>
+          <p className="text-sm text-muted-foreground">{t('usage.appTypeDistribution.subtitle')}</p>
+        </div>
+
+        {chartData.length === 0 ? (
+          <div className="flex h-[260px] flex-col items-center justify-center rounded-lg border border-dashed text-muted-foreground">
+            <Inbox className="mb-2 size-10" />
+            <div className="text-sm">{t('usage.appTypeDistribution.empty')}</div>
+          </div>
+        ) : (
+          <div className="grid gap-6 lg:grid-cols-[320px_minmax(0,1fr)]">
+            <div className="relative h-[260px]">
+              <ResponsiveContainer width="100%" height="100%">
+                <PieChart>
+                  <Pie data={chartData} cx="50%" cy="50%" innerRadius={70} outerRadius={105} dataKey="value">
+                    {chartData.map((entry, index) => (
+                      <Cell key={`${entry.label}-${index}`} fill={entry.color} />
+                    ))}
+                  </Pie>
+                  <Tooltip
+                    wrapperStyle={{ zIndex: 30 }}
+                    content={({ active, payload }) => {
+                      if (!active || !payload?.length) return null;
+                      const datum = payload[0].payload as (typeof chartData)[number];
+
+                      return (
+                        <div className="rounded-lg border bg-popover p-3 text-sm shadow-md">
+                          <div className="font-medium">{datum.label}</div>
+                          <div className="text-muted-foreground">
+                            {t('usage.chart.totalPointsSeries')}: {formatCost(datum.value)} (
+                            {datum.percentage})
+                          </div>
+                        </div>
+                      );
+                    }}
+                  />
+                </PieChart>
+              </ResponsiveContainer>
+              <div className="pointer-events-none absolute inset-0 flex flex-col items-center justify-center">
+                <div className="text-2xl font-bold text-primary">
+                  {formatCost(items.reduce((sum, item) => sum + item.total_points, 0))}
+                </div>
+                <div className="text-sm text-muted-foreground">{t('usage.chart.totalPoints')}</div>
+              </div>
+            </div>
+
+            <div className="space-y-3">
+              {chartData.map(item => (
+                <div key={item.appType} className="rounded-lg border bg-card p-4">
+                  <div className="mb-2 flex items-center gap-2 text-sm font-medium">
+                    <span className="h-3 w-3 rounded-full" style={{ backgroundColor: item.color }} />
+                    <span>{item.label}</span>
+                    <span className="ml-auto text-muted-foreground">{item.percentage}</span>
+                  </div>
+                  <div className="flex flex-wrap gap-4 text-sm text-muted-foreground">
+                    <span>
+                      {t('usage.appTypeDistribution.totalPoints')}: {formatCost(item.value)}
+                    </span>
+                    <span>
+                      {t('usage.appTypeDistribution.attempts')}: {formatNumber(item.attempts)}
+                    </span>
+                  </div>
+                </div>
+              ))}
+            </div>
+          </div>
+        )}
+      </CardContent>
+    </Card>
+  );
+}

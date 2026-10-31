@@ -1,0 +1,138 @@
+package handler
+
+import (
+	"errors"
+
+	"github.com/gin-gonic/gin"
+	"github.com/webb-chen/AgentSystem/api/internal/dto"
+	interfaces "github.com/webb-chen/AgentSystem/api/internal/modules/shared/interface"
+	workspace_service "github.com/webb-chen/AgentSystem/api/internal/modules/workspace/service"
+	helper "github.com/webb-chen/AgentSystem/api/internal/util"
+	"github.com/webb-chen/AgentSystem/api/middleware"
+	"github.com/webb-chen/AgentSystem/api/pkg/response"
+)
+
+type WorkspaceAssetMoveHandler struct {
+	accountService interfaces.AccountService
+	service        *workspace_service.WorkspaceAssetMoveService
+}
+
+func NewWorkspaceAssetMoveHandler(accountService interfaces.AccountService, service *workspace_service.WorkspaceAssetMoveService) *WorkspaceAssetMoveHandler {
+	return &WorkspaceAssetMoveHandler{accountService: accountService, service: service}
+}
+
+func (h *WorkspaceAssetMoveHandler) RegisterRoutes(router *gin.RouterGroup) {
+	organization := router.Group("/organizations", middleware.JWTWithOrganizationAndService(h.accountService))
+	{
+		organization.POST("/current/assets/move/eligible-targets", h.EligibleTargets)
+		organization.POST("/current/assets/move/dependencies", h.PreviewDependencies)
+		organization.POST("/current/assets/move/preview", h.Preview)
+		organization.POST("/current/assets/move", h.Move)
+	}
+}
+
+func (h *WorkspaceAssetMoveHandler) PreviewDependencies(c *gin.Context) {
+	var req dto.WorkspaceAssetMoveDependencyPreviewRequest
+	if err := c.ShouldBindJSON(&req); err != nil {
+		response.FailWithMessage(c, response.ErrInvalidParam, err.Error())
+		return
+	}
+	organizationID, accountID, ok := h.contextIDs(c)
+	if !ok {
+		return
+	}
+	result, err := h.service.PreviewDependencies(c.Request.Context(), organizationID, accountID, req)
+	if err != nil {
+		handleAssetMoveError(c, err, nil)
+		return
+	}
+	response.Success(c, result)
+}
+
+func (h *WorkspaceAssetMoveHandler) EligibleTargets(c *gin.Context) {
+	var req dto.WorkspaceAssetMoveEligibleTargetsRequest
+	if err := c.ShouldBindJSON(&req); err != nil {
+		response.FailWithMessage(c, response.ErrInvalidParam, err.Error())
+		return
+	}
+	organizationID, accountID, ok := h.contextIDs(c)
+	if !ok {
+		return
+	}
+	result, err := h.service.EligibleTargets(c.Request.Context(), organizationID, accountID, req)
+	if err != nil {
+		handleAssetMoveError(c, err, nil)
+		return
+	}
+	response.Success(c, result)
+}
+
+func (h *WorkspaceAssetMoveHandler) Preview(c *gin.Context) {
+	var req dto.WorkspaceAssetMoveRequest
+	if err := c.ShouldBindJSON(&req); err != nil {
+		response.FailWithMessage(c, response.ErrInvalidParam, err.Error())
+		return
+	}
+	organizationID, accountID, ok := h.contextIDs(c)
+	if !ok {
+		return
+	}
+	preview, err := h.service.Preview(c.Request.Context(), organizationID, accountID, req)
+	if err != nil {
+		handleAssetMoveError(c, err, nil)
+		return
+	}
+	response.Success(c, preview)
+}
+
+func (h *WorkspaceAssetMoveHandler) Move(c *gin.Context) {
+	var req dto.WorkspaceAssetMoveRequest
+	if err := c.ShouldBindJSON(&req); err != nil {
+		response.FailWithMessage(c, response.ErrInvalidParam, err.Error())
+		return
+	}
+	organizationID, accountID, ok := h.contextIDs(c)
+	if !ok {
+		return
+	}
+	result, err := h.service.Move(c.Request.Context(), organizationID, accountID, req)
+	if err != nil {
+		handleAssetMoveError(c, err, result)
+		return
+	}
+	response.Success(c, result)
+}
+
+func (h *WorkspaceAssetMoveHandler) contextIDs(c *gin.Context) (string, string, bool) {
+	organizationID := helper.GetOrganizationID(c)
+	accountID := helper.GetAccountID(c)
+	if organizationID == "" {
+		response.Fail(c, response.ErrInvalidParam)
+		return "", "", false
+	}
+	if accountID == "" {
+		response.Fail(c, response.ErrUnauthorized)
+		return "", "", false
+	}
+	return organizationID, accountID, true
+}
+
+func handleAssetMoveError(c *gin.Context, err error, result interface{}) {
+	if helper.WriteAgentBindingConflict(c, err) {
+		return
+	}
+	switch {
+	case errors.Is(err, workspace_service.ErrAssetMovePermissionDenied):
+		response.Fail(c, response.ErrPermissionDenied)
+	case errors.Is(err, workspace_service.ErrAssetMoveInvalidRequest):
+		response.FailWithMessage(c, response.ErrInvalidParam, err.Error())
+	case errors.Is(err, workspace_service.ErrAssetMoveBlocked):
+		c.JSON(400, response.Response{
+			Code:    "199001",
+			Message: err.Error(),
+			Data:    result,
+		})
+	default:
+		response.FailWithMessage(c, response.ErrSystemError, err.Error())
+	}
+}

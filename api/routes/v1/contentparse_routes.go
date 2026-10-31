@@ -1,0 +1,54 @@
+package v1
+
+import (
+	"github.com/gin-gonic/gin"
+	contentparsemodule "github.com/webb-chen/AgentSystem/api/internal/modules/contentparse"
+	llmclient "github.com/webb-chen/AgentSystem/api/internal/modules/llm/client"
+	llmdefaultservice "github.com/webb-chen/AgentSystem/api/internal/modules/llm/defaultmodel/service"
+	interfaces "github.com/webb-chen/AgentSystem/api/internal/modules/shared/interface"
+	"github.com/webb-chen/AgentSystem/api/middleware"
+	"gorm.io/gorm"
+)
+
+// ContentParseRouteDeps contains dependencies required by content parse routes.
+type ContentParseRouteDeps struct {
+	DB                  *gorm.DB
+	AccountService      interfaces.AccountService
+	OrganizationService interfaces.OrganizationService
+	LLMClient           llmclient.LLMClient
+	DefaultModelService llmdefaultservice.DefaultModelService
+	Module              *contentparsemodule.Module
+}
+
+func RegisterContentParseRoutes(v1 *gin.RouterGroup, deps ContentParseRouteDeps) {
+	if deps.DB == nil {
+		panic("content parse routes require db")
+	}
+	if deps.AccountService == nil {
+		panic("content parse routes require account service")
+	}
+	if deps.OrganizationService == nil {
+		panic("content parse routes require organization service")
+	}
+	if deps.LLMClient == nil {
+		panic("content parse routes require llm client")
+	}
+	if deps.DefaultModelService == nil {
+		panic("content parse routes require default model service")
+	}
+
+	group := v1.Group("")
+	group.Use(middleware.SetupRequired())
+	group.Use(middleware.JWTWithOrganizationAndService(deps.AccountService))
+
+	module := deps.Module
+	if module == nil {
+		module = contentparsemodule.NewModule(
+			deps.DB,
+			contentparsemodule.WithAccountService(deps.AccountService),
+			contentparsemodule.WithOrganizationService(deps.OrganizationService),
+			contentparsemodule.WithSystemVisionModel(deps.LLMClient, deps.DefaultModelService),
+		)
+	}
+	module.RegisterPlaygroundRoutes(group)
+}

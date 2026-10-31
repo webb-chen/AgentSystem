@@ -1,0 +1,64 @@
+package runner
+
+import (
+	"reflect"
+	"testing"
+
+	"github.com/webb-chen/AgentSystem-sandbox/internal/config"
+)
+
+func TestSecureRuntimeLimitsBuildPrlimitArgs(t *testing.T) {
+	limits := secureRuntimeLimits{
+		CPUSeconds:    3,
+		MemoryBytes:   134217728,
+		ProcessLimit:  16,
+		OpenFileLimit: 32,
+	}
+
+	got := limits.prlimitArgs()
+	want := []string{
+		"--cpu=3",
+		"--as=134217728",
+		"--nproc=16",
+		"--nofile=32",
+	}
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("unexpected rlimit args:\n got: %#v\nwant: %#v", got, want)
+	}
+}
+
+func TestSecureRuntimeLimitsSkipDisabledValues(t *testing.T) {
+	limits := secureRuntimeLimits{
+		MemoryBytes:   64,
+		OpenFileLimit: 8,
+	}
+
+	got := limits.prlimitArgs()
+	want := []string{
+		"--as=64",
+		"--nofile=8",
+	}
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("unexpected rlimit args:\n got: %#v\nwant: %#v", got, want)
+	}
+}
+
+func TestSecureRuntimeLimitsFromConfig(t *testing.T) {
+	cfg := config.Config{
+		SecureRuntimeCPUSeconds:    4,
+		SecureRuntimeMemoryBytes:   256,
+		SecureRuntimeProcessLimit:  12,
+		SecureRuntimeOpenFileLimit: 24,
+	}
+
+	got := secureRuntimeLimitsFromConfig(cfg)
+	want := secureRuntimeLimits{
+		CPUSeconds:    4,
+		MemoryBytes:   256,
+		ProcessLimit:  12,
+		OpenFileLimit: 24,
+	}
+	if got != want {
+		t.Fatalf("unexpected secure runtime limits: got %+v want %+v", got, want)
+	}
+}

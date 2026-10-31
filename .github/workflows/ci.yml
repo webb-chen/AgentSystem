@@ -1,0 +1,263 @@
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches:
+      - main
+      - dev
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  hygiene:
+    name: Open source hygiene
+    runs-on: ${{ fromJSON(vars.CI_RUNNER_LABELS || '["ubuntu-latest"]') }}
+    steps:
+      - name: Repair workspace ownership
+        working-directory: ${{ runner.temp }}
+        run: |
+          docker run --rm \
+            -v "$GITHUB_WORKSPACE:/workspace" \
+            alpine:3.22 \
+            chown -R "$(id -u):$(id -g)" /workspace
+
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install ripgrep
+        run: |
+          curl -fsSL https://github.com/BurntSushi/ripgrep/releases/download/14.1.1/ripgrep-14.1.1-x86_64-unknown-linux-musl.tar.gz \
+            | tar -xz -C "$RUNNER_TEMP"
+          echo "$RUNNER_TEMP/ripgrep-14.1.1-x86_64-unknown-linux-musl" >> "$GITHUB_PATH"
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: api/go.mod
+          cache: false
+
+      - name: Check repository hygiene
+        run: ./scripts/check-open-source.sh --worktree
+
+      - name: Check migration source safety
+        working-directory: api
+        env:
+          CONNECTOR_CREDENTIAL_ACTIVE_KEY_ID: ci
+          CONNECTOR_CREDENTIAL_KEYS_JSON: '{"ci":"12345678901234567890123456789012"}'
+        run: go test ./internal/migrations -run '^TestCheck' -count=1
+
+  web:
+    name: Web type check
+    runs-on: ${{ fromJSON(vars.CI_RUNNER_LABELS || '["ubuntu-latest"]') }}
+    defaults:
+      run:
+        working-directory: web
+    steps:
+      - name: Repair workspace ownership
+        working-directory: ${{ runner.temp }}
+        run: |
+          docker run --rm \
+            -v "$GITHUB_WORKSPACE:/workspace" \
+            alpine:3.22 \
+            chown -R "$(id -u):$(id -g)" /workspace
+
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+
+      - name: Set up pnpm
+        run: |
+          corepack enable
+          corepack prepare pnpm@10.12.1 --activate
+
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
+
+      - name: Run registration frontend and type checks
+        run: ../scripts/check-registration-auth.sh --frontend-only
+
+      - name: Check developer access error states
+        run: pnpm test:developer-access-load-error
+
+      - name: Check developer access quota units
+        run: pnpm test:developer-access-credits
+
+      - name: Check developer access refresh, audit and mobile navigation
+        run: pnpm test:developer-access-live-audit
+
+      - name: Test billing display reconciliation
+        run: pnpm test:billing-display
+
+      - name: Check permission-gated file creation entry
+        run: pnpm test:file-sidebar-actions
+
+      - name: Check exact Agent context action permissions
+        run: pnpm test:agent-context-permissions
+
+      - name: File context permissions
+        working-directory: web
+        run: pnpm test:file-context-permissions
+
+      - name: Workspace home access regression
+        run: pnpm test:workspace-home-access
+
+      - name: Template entry route regression
+        run: pnpm test:template-entry-route
+
+      - name: Agent API access guard regression
+        run: pnpm test:agent-api-access-guard
+
+      - name: Workflow batch action permission regression
+        run: pnpm test:batch-action-permissions
+
+      - name: Clean generated web files
+        if: always()
+        run: |
+          for path in node_modules .next; do
+            if [ -e "$path" ]; then
+              find "$path" -depth -delete
+            fi
+          done
+
+  registration-auth:
+    name: Registration and invitation gate
+    runs-on: ${{ fromJSON(vars.CI_RUNNER_LABELS || '["ubuntu-latest"]') }}
+    needs: web
+    steps:
+      - name: Repair workspace ownership
+        working-directory: ${{ runner.temp }}
+        run: |
+          docker run --rm \
+            -v "$GITHUB_WORKSPACE:/workspace" \
+            alpine:3.22 \
+            chown -R "$(id -u):$(id -g)" /workspace
+
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Reclaim unused Docker data
+        run: docker system prune --force
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: api/go.mod
+          cache: false
+
+      - name: Run registration and developer access gates
+        run: |
+          go_root="$(go env GOROOT)"
+          docker run --rm \
+            --user "$(id -u):$(id -g)" \
+            --tmpfs /tmp:rw,exec,nosuid,size=4g \
+            -e HOME=/tmp \
+            -e CGO_ENABLED=1 \
+            -e GOCACHE=/tmp/go-build \
+            -e GOPATH=/tmp/go \
+            -e PATH=/opt/go/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin \
+            -v "$go_root:/opt/go:ro" \
+            -v "$GITHUB_WORKSPACE:/workspace" \
+            -w /workspace \
+            node:22-bookworm \
+            bash -c './scripts/check-registration-auth.sh --backend-only && bash ./scripts/check-developer-access.sh && bash ./scripts/check-contextual-permissions.sh'
+
+  sandbox:
+    name: Sandbox runtime tests
+    runs-on: ${{ fromJSON(vars.CI_RUNNER_LABELS || '["ubuntu-latest"]') }}
+    services:
+      postgres:
+        image: postgres:16-alpine
+        env:
+          POSTGRES_DB: mingyingkeji_sandbox_ci
+          POSTGRES_USER: mingyingkeji_sandbox
+          POSTGRES_PASSWORD: mingyingkeji_sandbox_ci
+        ports:
+          - 5432
+        options: >-
+          --health-cmd "pg_isready -U mingyingkeji_sandbox -d mingyingkeji_sandbox_ci"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 12
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - name: Repair workspace ownership
+        working-directory: ${{ runner.temp }}
+        run: |
+          docker run --rm \
+            -v "$GITHUB_WORKSPACE:/workspace" \
+            alpine:3.22 \
+            chown -R "$(id -u):$(id -g)" /workspace
+
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: sandbox/go.mod
+          cache-dependency-path: sandbox/go.sum
+
+      - name: Install Kest
+        env:
+          KEST_VERSION: v0.7.7
+          KEST_SHA256_LINUX_AMD64: 3814d8662a1cc01410302fcea43910f8437d01f969140c406f64b10249134a5a
+          KEST_SHA256_LINUX_ARM64: 43d45c493bed73146928a2454ba6e712a5f68f02ebbfcefab978e0b4aa731b6d
+        run: |
+          case "$(uname -m)" in
+            x86_64|amd64)
+              archive="kest_linux_amd64.tar.gz"
+              expected_sha="${KEST_SHA256_LINUX_AMD64}"
+              ;;
+            aarch64|arm64)
+              archive="kest_linux_arm64.tar.gz"
+              expected_sha="${KEST_SHA256_LINUX_ARM64}"
+              ;;
+            *)
+              echo "unsupported runner architecture for sandbox Kest flow: $(uname -m)" >&2
+              exit 1
+              ;;
+          esac
+
+          curl -fsSL "https://github.com/kest-labs/kest/releases/download/${KEST_VERSION}/${archive}" -o "${RUNNER_TEMP}/${archive}"
+          echo "${expected_sha}  ${RUNNER_TEMP}/${archive}" | sha256sum -c -
+          tar -xzf "${RUNNER_TEMP}/${archive}" -C "${RUNNER_TEMP}" kest
+          mkdir -p "${RUNNER_TEMP}/bin"
+          mv "${RUNNER_TEMP}/kest" "${RUNNER_TEMP}/bin/kest"
+          chmod +x "${RUNNER_TEMP}/bin/kest"
+          echo "${RUNNER_TEMP}/bin" >> "${GITHUB_PATH}"
+
+      - name: Install ripgrep
+        run: |
+          curl -fsSL https://github.com/BurntSushi/ripgrep/releases/download/14.1.1/ripgrep-14.1.1-x86_64-unknown-linux-musl.tar.gz \
+            | tar -xz -C "$RUNNER_TEMP"
+          echo "$RUNNER_TEMP/ripgrep-14.1.1-x86_64-unknown-linux-musl" >> "$GITHUB_PATH"
+
+      - name: Run sandbox Go tests
+        working-directory: sandbox
+        run: go test ./...
+
+      - name: Check sandbox config docs
+        run: make -C sandbox check-config-docs
+
+      - name: Run sandbox Kest flows
+        env:
+          MINGYINGKEJI_SANDBOX_DATABASE_URL: postgres://mingyingkeji_sandbox:mingyingkeji_sandbox_ci@127.0.0.1:${{ job.services.postgres.ports[5432] }}/mingyingkeji_sandbox_ci?sslmode=disable
+        run: make test-sandbox-kest
+
+      - name: Verify personal key legacy quota guard on PostgreSQL
+        working-directory: api
+        env:
+          MINGYINGKEJI_MIGRATION_TEST_DSN: postgres://mingyingkeji_sandbox:mingyingkeji_sandbox_ci@127.0.0.1:${{ job.services.postgres.ports[5432] }}/mingyingkeji_sandbox_ci?sslmode=disable
+        run: go test ./internal/migrations -run '^TestPersonalKeyLegacyQuotaMigration' -count=1 -v

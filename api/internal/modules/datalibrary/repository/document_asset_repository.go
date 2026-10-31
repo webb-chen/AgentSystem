@@ -1,0 +1,347 @@
+package repository
+
+import (
+	"context"
+	"encoding/json"
+	"time"
+
+	"github.com/google/uuid"
+	"github.com/webb-chen/AgentSystem/api/internal/modules/datalibrary/model"
+	"gorm.io/datatypes"
+	"gorm.io/gorm"
+)
+
+type DocumentAssetListFilter struct {
+	OrganizationID       string
+	WorkspaceID          *string
+	Status               string
+	ProductStatus        string
+	ActiveSourceFileOnly bool
+	Limit                int
+	Offset               int
+}
+
+type DocumentAssetCurrentResultPatch struct {
+	OrganizationID              string
+	Title                       *string
+	ContentHash                 *string
+	ProductStatus               *string
+	ProcessingStage             *string
+	ProcessingProgress          *int
+	ActiveProcessingRequestID   *uuid.UUID
+	ProcessingRunID             *uuid.UUID
+	GenerationNo                *int64
+	ParseArtifactID             *uuid.UUID
+	ChunkArtifactSetID          *uuid.UUID
+	ChunkCount                  *int
+	EmbeddingProvider           *string
+	EmbeddingModel              *string
+	EmbeddingDimension          *int
+	VectorStatus                *string
+	LastErrorCode               *string
+	LastErrorMessage            *string
+	MetadataJSON                map[string]any
+	RequireProcessingRunID      *uuid.UUID
+	RequireGenerationNo         *int64
+	ClearActiveProcessingRunIDs bool
+	ClearParseArtifactID        bool
+	ClearChunkArtifactSetID     bool
+	ClearEmbeddingMetadata      bool
+	ClearError                  bool
+}
+
+type DocumentAssetRepository interface {
+	CreateAsset(ctx context.Context, item *model.DocumentAsset) error
+	CreateAssetWithVersion(ctx context.Context, asset *model.DocumentAsset, version *model.DocumentVersion) error
+	GetAssetByID(ctx context.Context, id uuid.UUID) (*model.DocumentAsset, error)
+	FindAssetBySourceFileID(ctx context.Context, organizationID string, sourceFileID string) (*model.DocumentAsset, error)
+	FindAssetsBySourceFileIDs(ctx context.Context, organizationID string, sourceFileIDs []string) (map[string]*model.DocumentAsset, error)
+	ListAssets(ctx context.Context, filter DocumentAssetListFilter) ([]*model.DocumentAsset, int64, error)
+	UpdateCurrentResult(ctx context.Context, id uuid.UUID, patch DocumentAssetCurrentResultPatch) (*model.DocumentAsset, error)
+
+	CreateVersion(ctx context.Context, item *model.DocumentVersion) error
+	GetVersionByID(ctx context.Context, id uuid.UUID) (*model.DocumentVersion, error)
+	ListVersionsByAssetID(ctx context.Context, assetID uuid.UUID) ([]*model.DocumentVersion, error)
+}
+
+type documentAssetRepository struct {
+	db *gorm.DB
+}
+
+func NewDocumentAssetRepository(db *gorm.DB) DocumentAssetRepository {
+	return &documentAssetRepository{db: db}
+}
+
+func (r *documentAssetRepository) CreateAsset(ctx context.Context, item *model.DocumentAsset) error {
+	return r.db.WithContext(ctx).Create(item).Error
+}
+
+func (r *documentAssetRepository) CreateAssetWithVersion(ctx context.Context, asset *model.DocumentAsset, version *model.DocumentVersion) error {
+	return r.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
+		if err := tx.Create(asset).Error; err != nil {
+			return err
+		}
+		return tx.Create(version).Error
+	})
+}
+
+func (r *documentAssetRepository) GetAssetByID(ctx context.Context, id uuid.UUID) (*model.DocumentAsset, error) {
+	var item model.DocumentAsset
+	err := r.db.WithContext(ctx).Where("id = ?", id).First(&item).Error
+	if err != nil {
+		if err == gorm.ErrRecordNotFound {
+			return nil, nil
+		}
+		return nil, err
+	}
+	return &item, nil
+}
+
+func (r *documentAssetRepository) FindAssetBySourceFileID(ctx context.Context, organizationID string, sourceFileID string) (*model.DocumentAsset, error) {
+	var item model.DocumentAsset
+	err := r.db.WithContext(ctx).
+		Where("organization_id = ? AND source_file_id = ?", organizationID, sourceFileID).
+		Order("updated_at DESC").
+		First(&item).Error
+	if err != nil {
+		if err == gorm.ErrRecordNotFound {
+			return nil, nil
+		}
+		return nil, err
+	}
+	return &item, nil
+}
+
+func (r *documentAssetRepository) FindAssetsBySourceFileIDs(ctx context.Context, organizationID string, sourceFileIDs []string) (map[string]*model.DocumentAsset, error) {
+	result := make(map[string]*model.DocumentAsset, len(sourceFileIDs))
+	if organizationID == "" || len(sourceFileIDs) == 0 {
+		return result, nil
+	}
+
+	var items []*model.DocumentAsset
+	if err := r.db.WithContext(ctx).
+		Where("organization_id = ? AND source_file_id IN ?", organizationID, sourceFileIDs).
+		Order("updated_at DESC").
+		Find(&items).Error; err != nil {
+		return nil, err
+	}
+	for _, item := range items {
+		if _, exists := result[item.SourceFileID]; exists {
+			continue
+		}
+		result[item.SourceFileID] = item
+	}
+	return result, nil
+}
+
+func (r *documentAssetRepository) ListAssets(ctx context.Context, filter DocumentAssetListFilter) ([]*model.DocumentAsset, int64, error) {
+	query := r.db.WithContext(ctx).Model(&model.DocumentAsset{}).
+		Where("data_library_document_assets.organization_id = ?", filter.OrganizationID)
+	if filter.ActiveSourceFileOnly {
+		query = query.Joins(
+			"JOIN upload_files ON CAST(upload_files.id AS TEXT) = data_library_document_assets.source_file_id AND CAST(upload_files.organization_id AS TEXT) = data_library_document_assets.organization_id AND upload_files.is_archived = ?",
+			false,
+		).Where(`
+			(
+				NOT EXISTS (
+					SELECT 1
+					FROM file_folder_joins
+					WHERE CAST(file_folder_joins.file_id AS TEXT) = CAST(upload_files.id AS TEXT)
+				)
+				OR EXISTS (
+					SELECT 1
+					FROM file_folder_joins
+					JOIN file_folders ON CAST(file_folders.id AS TEXT) = CAST(file_folder_joins.folder_id AS TEXT)
+					WHERE CAST(file_folder_joins.file_id AS TEXT) = CAST(upload_files.id AS TEXT)
+				)
+			)
+		`)
+	}
+	if filter.WorkspaceID != nil {
+		query = query.Where("data_library_document_assets.workspace_id = ?", *filter.WorkspaceID)
+	}
+	if filter.Status != "" {
+		query = query.Where("data_library_document_assets.status = ?", filter.Status)
+	}
+	if filter.ProductStatus != "" {
+		query = query.Where("data_library_document_assets.product_status = ?", filter.ProductStatus)
+	}
+
+	var total int64
+	if err := query.Count(&total).Error; err != nil {
+		return nil, 0, err
+	}
+
+	limit := filter.Limit
+	if limit <= 0 || limit > 100 {
+		limit = 20
+	}
+	offset := filter.Offset
+	if offset < 0 {
+		offset = 0
+	}
+
+	var items []*model.DocumentAsset
+	if err := query.Order("updated_at DESC, created_at DESC").Limit(limit).Offset(offset).Find(&items).Error; err != nil {
+		return nil, 0, err
+	}
+	return items, total, nil
+}
+
+func (r *documentAssetRepository) UpdateCurrentResult(ctx context.Context, id uuid.UUID, patch DocumentAssetCurrentResultPatch) (*model.DocumentAsset, error) {
+	if id == uuid.Nil {
+		return nil, nil
+	}
+	updates := map[string]any{
+		"updated_at": time.Now(),
+	}
+	if patch.ProductStatus != nil {
+		updates["product_status"] = *patch.ProductStatus
+	}
+	if patch.Title != nil {
+		updates["title"] = *patch.Title
+	}
+	if patch.ContentHash != nil {
+		updates["content_hash"] = *patch.ContentHash
+	}
+	if patch.ProcessingStage != nil {
+		updates["processing_stage"] = *patch.ProcessingStage
+	}
+	if patch.ProcessingProgress != nil {
+		updates["processing_progress"] = *patch.ProcessingProgress
+	}
+	if patch.ActiveProcessingRequestID != nil {
+		updates["active_processing_request_id"] = *patch.ActiveProcessingRequestID
+	}
+	if patch.ProcessingRunID != nil {
+		updates["processing_run_id"] = *patch.ProcessingRunID
+	}
+	if patch.GenerationNo != nil {
+		updates["generation_no"] = *patch.GenerationNo
+	}
+	if patch.ParseArtifactID != nil {
+		updates["parse_artifact_id"] = *patch.ParseArtifactID
+	}
+	if patch.ChunkArtifactSetID != nil {
+		updates["chunk_artifact_set_id"] = *patch.ChunkArtifactSetID
+	}
+	if patch.ChunkCount != nil {
+		updates["chunk_count"] = *patch.ChunkCount
+	}
+	if patch.EmbeddingProvider != nil {
+		updates["embedding_provider"] = *patch.EmbeddingProvider
+	}
+	if patch.EmbeddingModel != nil {
+		updates["embedding_model"] = *patch.EmbeddingModel
+	}
+	if patch.EmbeddingDimension != nil {
+		updates["embedding_dimension"] = *patch.EmbeddingDimension
+	}
+	if patch.VectorStatus != nil {
+		updates["vector_status"] = *patch.VectorStatus
+	}
+	if patch.LastErrorCode != nil {
+		updates["last_error_code"] = *patch.LastErrorCode
+	}
+	if patch.LastErrorMessage != nil {
+		updates["last_error_message"] = *patch.LastErrorMessage
+	}
+	if patch.MetadataJSON != nil {
+		metadata, err := r.mergedMetadataJSON(ctx, id, patch.MetadataJSON)
+		if err != nil {
+			return nil, err
+		}
+		updates["metadata_json"] = metadata
+	}
+	if patch.ClearActiveProcessingRunIDs {
+		updates["active_processing_request_id"] = nil
+		updates["processing_run_id"] = nil
+	}
+	if patch.ClearParseArtifactID {
+		updates["parse_artifact_id"] = nil
+	}
+	if patch.ClearChunkArtifactSetID {
+		updates["chunk_artifact_set_id"] = nil
+		updates["chunk_count"] = 0
+	}
+	if patch.ClearEmbeddingMetadata {
+		updates["embedding_provider"] = nil
+		updates["embedding_model"] = nil
+		updates["embedding_dimension"] = nil
+	}
+	if patch.ClearError {
+		updates["last_error_code"] = nil
+		updates["last_error_message"] = nil
+	}
+
+	query := r.db.WithContext(ctx).Model(&model.DocumentAsset{}).
+		Where("id = ?", id).
+		Where("deleted_at IS NULL")
+	if patch.OrganizationID != "" {
+		query = query.Where("organization_id = ?", patch.OrganizationID)
+	}
+	if patch.RequireProcessingRunID != nil {
+		query = query.Where("processing_run_id = ?", *patch.RequireProcessingRunID)
+	}
+	if patch.RequireGenerationNo != nil {
+		query = query.Where("generation_no = ?", *patch.RequireGenerationNo)
+	}
+	result := query.Updates(updates)
+	if result.Error != nil {
+		return nil, result.Error
+	}
+	return r.GetAssetByID(ctx, id)
+}
+
+func (r *documentAssetRepository) mergedMetadataJSON(ctx context.Context, id uuid.UUID, patch map[string]any) (datatypes.JSON, error) {
+	merged := map[string]any{}
+
+	var current model.DocumentAsset
+	if err := r.db.WithContext(ctx).
+		Select("metadata_json").
+		Where("id = ?", id).
+		Where("deleted_at IS NULL").
+		First(&current).Error; err != nil && err != gorm.ErrRecordNotFound {
+		return nil, err
+	}
+	for key, value := range current.MetadataJSON {
+		merged[key] = value
+	}
+	for key, value := range patch {
+		merged[key] = value
+	}
+
+	metadataJSON, err := json.Marshal(merged)
+	if err != nil {
+		return nil, err
+	}
+	return datatypes.JSON(metadataJSON), nil
+}
+
+func (r *documentAssetRepository) CreateVersion(ctx context.Context, item *model.DocumentVersion) error {
+	return r.db.WithContext(ctx).Create(item).Error
+}
+
+func (r *documentAssetRepository) GetVersionByID(ctx context.Context, id uuid.UUID) (*model.DocumentVersion, error) {
+	var item model.DocumentVersion
+	err := r.db.WithContext(ctx).Where("id = ?", id).First(&item).Error
+	if err != nil {
+		if err == gorm.ErrRecordNotFound {
+			return nil, nil
+		}
+		return nil, err
+	}
+	return &item, nil
+}
+
+func (r *documentAssetRepository) ListVersionsByAssetID(ctx context.Context, assetID uuid.UUID) ([]*model.DocumentVersion, error) {
+	var items []*model.DocumentVersion
+	err := r.db.WithContext(ctx).
+		Where("asset_id = ?", assetID).
+		Order("version_no DESC, created_at DESC").
+		Find(&items).Error
+	if err != nil {
+		return nil, err
+	}
+	return items, nil
+}

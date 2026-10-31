@@ -1,0 +1,142 @@
+'use client';
+
+import { useEffect } from 'react';
+import { queryClient } from '@/lib/query-client';
+import { useAuthStore } from '@/store/auth-store';
+import { useOrganizationStore } from '@/store/organization-store';
+import { useWorkspaceStore } from '@/store/workspace-store';
+import { clearSessionBoundClientState, clearSessionBoundQueryState } from '@/lib/auth/client-state';
+import { sessionManager, type AuthSyncEvent } from '@/lib/auth/session-manager';
+import { PROFILE_KEYS } from '@/hooks/query-keys';
+import { clearProfileClientCache } from '@/utils/client-cache';
+import { isLogoutInProgress } from '@/lib/auth/logout-state';
+
+interface AuthProviderProps {
+  children: React.ReactNode;
+}
+
+function syncClientContextStores(event: AuthSyncEvent): void {
+  const { payload } = event;
+  if (!payload) {
+    return;
+  }
+
+  const workspaceStore = useWorkspaceStore.getState();
+  const workspaceID = payload.currentWorkspaceId;
+  const organizationID = payload.currentOrganizationId;
+
+  if (organizationID) {
+    const organizationStore = useOrganizationStore.getState();
+    const nextOrganization =
+      organizationStore.organizations.find(organization => organization.id === organizationID) ??
+      null;
+    organizationStore.setCurrentOrganization(nextOrganization);
+    workspaceStore.resetForOrganizationSwitch();
+    return;
+  }
+
+  if (workspaceID === null || workspaceID === '') {
+    workspaceStore.resetForOrganizationSwitch();
+    return;
+  }
+
+  if (typeof workspaceID !== 'string') {
+    return;
+  }
+
+  const nextWorkspace = workspaceStore.workspaces.find(workspace => workspace.id === workspaceID);
+  if (nextWorkspace) {
+    workspaceStore.selectWorkspace(nextWorkspace);
+    return;
+  }
+
+  workspaceStore.resetForOrganizationSwitch();
+}
+
+async function handleCrossTabEvent(event: AuthSyncEvent): Promise<void> {
+  switch (event.type) {
+    case 'SIGNED_IN': {
+      await clearSessionBoundClientState();
+      await useAuthStore.getState().initializeAuth({ force: true });
+      return;
+    }
+    case 'SIGNED_OUT': {
+      if (event.sourceTabId === sessionManager.getCurrentTabId()) {
+        return;
+      }
+      await clearSessionBoundClientState();
+      useAuthStore.getState().reset({ clearSession: false });
+      await useAuthStore.getState().initializeAuth({ force: true });
+      return;
+    }
+    case 'TOKEN_REFRESHED': {
+      useAuthStore.getState().clearError();
+      useAuthStore.getState().setNetworkError(false);
+      return;
+    }
+    case 'PROFILE_UPDATED': {
+      clearProfileClientCache();
+      await queryClient.invalidateQueries({ queryKey: PROFILE_KEYS.current() });
+      if (useAuthStore.getState().isAuthenticated) {
+        try {
+          await useAuthStore.getState().refreshProfile({ refresh: true });
+        } catch {
+          // Ignore refresh failures here and let the global auth flow decide next steps.
+        }
+      }
+      return;
+    }
+    case 'CONTEXT_CHANGED': {
+      syncClientContextStores(event);
+      clearProfileClientCache();
+      if (useAuthStore.getState().isAuthenticated) {
+        try {
+          await useAuthStore.getState().refreshProfile({ refresh: true });
+        } catch {
+          // Ignore refresh failures here and let the global auth flow decide next steps.
+        }
+      } else {
+        await useAuthStore.getState().initializeAuth({ force: true });
+      }
+      clearSessionBoundQueryState();
+      return;
+    }
+    default:
+      return;
+  }
+}
+
+/**
+ * Authentication provider that initializes auth state on app startup
+ * and keeps session state synchronized across browser tabs.
+ */
+export function AuthProvider({ children }: AuthProviderProps) {
+  const initializeAuth = useAuthStore.use.initializeAuth();
+
+  useEffect(() => {
+    void initializeAuth();
+  }, [initializeAuth]);
+
+  useEffect(() => {
+    if (typeof window === 'undefined') {
+      return;
+    }
+
+    const unsubscribeLocal = sessionManager.subscribe(event => {
+      if (event.type !== 'SIGNED_OUT' || isLogoutInProgress()) return;
+
+      useAuthStore.getState().reset({ clearSession: false });
+      void clearSessionBoundClientState();
+    });
+    const unsubscribeCrossTab = sessionManager.subscribeToCrossTabEvents(event => {
+      void handleCrossTabEvent(event);
+    });
+
+    return () => {
+      unsubscribeLocal();
+      unsubscribeCrossTab();
+    };
+  }, []);
+
+  return <>{children}</>;
+}

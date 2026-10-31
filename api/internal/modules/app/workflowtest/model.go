@@ -1,0 +1,356 @@
+package workflowtest
+
+import (
+	"database/sql/driver"
+	"encoding/json"
+	"fmt"
+	"time"
+
+	"github.com/google/uuid"
+)
+
+const (
+	CaseStatusEnabled  = "enabled"
+	CaseStatusDisabled = "disabled"
+
+	CaseTypeCore      = "core"
+	CaseTypeExtension = "extension"
+	CaseTypeFuzzy     = "fuzzy"
+	CaseTypeManual    = "manual"
+
+	BatchStatusQueued    = "queued"
+	BatchStatusRunning   = "running"
+	BatchStatusCompleted = "completed"
+	BatchStatusStopped   = "stopped"
+	BatchStatusCanceled  = "canceled"
+
+	GenerationTaskStatusQueued    = "queued"
+	GenerationTaskStatusRunning   = "running"
+	GenerationTaskStatusCanceling = "canceling"
+	GenerationTaskStatusCanceled  = "canceled"
+	GenerationTaskStatusCompleted = "completed"
+	GenerationTaskStatusFailed    = "failed"
+)
+
+const DefaultJudgePromptTemplate = `你是工作流自动化测试的 AI 评分助手。请根据测试问题、智能体回复、期望要点和业务场景，判断本次回答是否有效解决用户问题。
+
+评分时不要只按文本相似度判断。实际回复不需要和预期结果逐字一致，只要业务动作和处理逻辑符合预期即可；回答流畅但意图理解错、结果跑偏或业务动作缺失，仍然应判为不通过或需复核。
+
+评分结果只能归为以下三类：
+1. 通过：回答满足用户核心诉求，没有明显事实错误或流程错误。
+2. 不通过：回答未解决核心诉求，或存在明显错误、遗漏、与业务流程冲突。
+3. 需复核：信息不足、判断边界模糊，或需要人工结合业务上下文确认。
+
+判断原则：
+1. 区分任务工作流和对话工作流。任务工作流类似函数调用，只有本次输入参数和输出结果；对话工作流才有多轮上下文、追问和持续澄清能力。
+2. 任务工作流输入缺少关键信息时，输出中明确标注缺失、待补充、未知、N/A、占位符或缺失清单，通常应视为符合“不得编造”的预期；不得仅因没有使用期望中的同义固定词而判不通过。
+3. 任务工作流中，要区分“技术性内容缺失/文件解析失败”和“业务文档未约定的补充信息”。完整可读文件不应被错误说成无法读取或内容为空；但输出列出合同总金额、验收标准、争议解决等未约定事项，通常是合理的风险/缺失信息分析。
+4. 对话工作流中，用户输入缺少关键信息时，智能体应主动追问或澄清，不能擅自假设。
+5. 用户请求超出能力范围、涉及投诉、越权、异常或需要人工介入时，应正确兜底、拒绝、说明限制或转人工；但不要把这类对话动作强加给单次任务工作流，除非测试期望明确要求输出这些字段。
+6. 如果实际回复没有体现某个动作，不能替智能体补全或脑补。
+7. 如果执行异常、超时、工具失败或无有效输出，应判为不通过或需复核。
+
+请输出判断结果、简要理由、改进建议。`
+
+type Setting struct {
+	ID                  string    `gorm:"type:uuid;primaryKey" json:"id"`
+	AgentID             string    `gorm:"type:uuid;not null;uniqueIndex:idx_workflow_test_settings_agent" json:"agent_id"`
+	JudgePromptTemplate string    `gorm:"type:text;not null" json:"judge_prompt_template"`
+	JudgeModelProvider  string    `gorm:"type:varchar(100);not null;default:''" json:"judge_model_provider"`
+	JudgeModelName      string    `gorm:"type:varchar(160);not null;default:''" json:"judge_model_name"`
+	CreatedAt           time.Time `gorm:"not null;default:CURRENT_TIMESTAMP" json:"created_at"`
+	UpdatedAt           time.Time `gorm:"not null;default:CURRENT_TIMESTAMP" json:"updated_at"`
+}
+
+func (Setting) TableName() string {
+	return "workflow_test_settings"
+}
+
+type Scenario struct {
+	ID          string    `gorm:"type:uuid;primaryKey" json:"id"`
+	AgentID     string    `gorm:"type:uuid;not null;index:idx_workflow_test_scenarios_agent" json:"agent_id"`
+	Name        string    `gorm:"type:varchar(120);not null" json:"name"`
+	Description string    `gorm:"type:text;not null;default:''" json:"description"`
+	Source      string    `gorm:"type:varchar(32);not null;default:'manual'" json:"source"`
+	CaseCount   int       `gorm:"type:int;not null;default:0" json:"case_count"`
+	CreatedAt   time.Time `gorm:"not null;default:CURRENT_TIMESTAMP" json:"created_at"`
+	UpdatedAt   time.Time `gorm:"not null;default:CURRENT_TIMESTAMP" json:"updated_at"`
+}
+
+func (Scenario) TableName() string {
+	return "workflow_test_scenarios"
+}
+
+type CaseAttachment struct {
+	Type           string `json:"type"`
+	TransferMethod string `json:"transfer_method"`
+	URL            string `json:"url,omitempty"`
+	UploadFileID   string `json:"upload_file_id,omitempty"`
+	Name           string `json:"name,omitempty"`
+}
+
+type CaseTurn struct {
+	Role        string           `json:"role"`
+	Content     string           `json:"content"`
+	Attachments []CaseAttachment `json:"attachments,omitempty"`
+	Inputs      JSONMap          `json:"inputs,omitempty"`
+}
+
+type CaseTurns []CaseTurn
+
+func (t CaseTurns) Value() (driver.Value, error) {
+	if t == nil {
+		return "[]", nil
+	}
+	data, err := json.Marshal(t)
+	return string(data), err
+}
+
+func (t *CaseTurns) Scan(value interface{}) error {
+	if value == nil {
+		*t = CaseTurns{}
+		return nil
+	}
+	var bytes []byte
+	switch v := value.(type) {
+	case []byte:
+		bytes = v
+	case string:
+		bytes = []byte(v)
+	default:
+		return fmt.Errorf("unsupported CaseTurns scan type %T", value)
+	}
+	if len(bytes) == 0 {
+		*t = CaseTurns{}
+		return nil
+	}
+	return json.Unmarshal(bytes, t)
+}
+
+type JSONList []string
+
+func (l JSONList) Value() (driver.Value, error) {
+	if l == nil {
+		return "[]", nil
+	}
+	data, err := json.Marshal(l)
+	return string(data), err
+}
+
+func (l *JSONList) Scan(value interface{}) error {
+	if value == nil {
+		*l = JSONList{}
+		return nil
+	}
+	var bytes []byte
+	switch v := value.(type) {
+	case []byte:
+		bytes = v
+	case string:
+		bytes = []byte(v)
+	default:
+		return fmt.Errorf("unsupported JSONList scan type %T", value)
+	}
+	if len(bytes) == 0 {
+		*l = JSONList{}
+		return nil
+	}
+	return json.Unmarshal(bytes, l)
+}
+
+type Case struct {
+	ID             string    `gorm:"type:uuid;primaryKey" json:"id"`
+	AgentID        string    `gorm:"type:uuid;not null;index:idx_workflow_test_cases_agent" json:"agent_id"`
+	ScenarioID     *string   `gorm:"type:uuid;index:idx_workflow_test_cases_scenario" json:"scenario_id,omitempty"`
+	Content        string    `gorm:"type:text;not null" json:"content"`
+	ExpectedResult string    `gorm:"type:text;not null;default:''" json:"expected_result"`
+	QuestionType   string    `gorm:"type:varchar(32);not null;default:'core'" json:"question_type"`
+	Status         string    `gorm:"type:varchar(32);not null;default:'enabled'" json:"status"`
+	Turns          CaseTurns `gorm:"type:jsonb;not null" json:"turns"`
+	CreatedAt      time.Time `gorm:"not null;default:CURRENT_TIMESTAMP" json:"created_at"`
+	UpdatedAt      time.Time `gorm:"not null;default:CURRENT_TIMESTAMP" json:"updated_at"`
+}
+
+func (Case) TableName() string {
+	return "workflow_test_cases"
+}
+
+type CaseSnapshot struct {
+	ID             string    `json:"id"`
+	ScenarioID     *string   `json:"scenario_id,omitempty"`
+	Content        string    `json:"content"`
+	ExpectedResult string    `json:"expected_result"`
+	QuestionType   string    `json:"question_type"`
+	Turns          CaseTurns `json:"turns"`
+}
+
+type BatchItemStatus string
+
+const (
+	BatchItemStatusPending  BatchItemStatus = "pending"
+	BatchItemStatusRunning  BatchItemStatus = "running"
+	BatchItemStatusPassed   BatchItemStatus = "passed"
+	BatchItemStatusFailed   BatchItemStatus = "failed"
+	BatchItemStatusReview   BatchItemStatus = "review"
+	BatchItemStatusCanceled BatchItemStatus = "canceled"
+)
+
+type BatchItem struct {
+	ID              string           `gorm:"type:uuid;primaryKey" json:"id"`
+	AgentID         string           `gorm:"type:uuid;not null;index:idx_workflow_test_batch_items_agent" json:"agent_id"`
+	BatchID         string           `gorm:"type:uuid;not null;index:idx_workflow_test_batch_items_batch" json:"batch_id"`
+	CaseID          string           `gorm:"type:uuid;not null;index:idx_workflow_test_batch_items_case" json:"case_id"`
+	CaseSnapshot    JSONCaseSnapshot `gorm:"type:jsonb;not null" json:"case_snapshot"`
+	Status          string           `gorm:"type:varchar(32);not null;default:'pending'" json:"status"`
+	WorkflowRunID   string           `gorm:"type:varchar(120);not null;default:''" json:"workflow_run_id"`
+	Outputs         JSONMap          `gorm:"type:jsonb;not null" json:"outputs"`
+	Error           string           `gorm:"type:text;not null;default:''" json:"error"`
+	JudgeReason     string           `gorm:"type:text;not null;default:''" json:"judge_reason"`
+	JudgeSuggestion string           `gorm:"type:text;not null;default:''" json:"judge_suggestion"`
+	JudgeConfidence float64          `gorm:"type:decimal(5,4);not null;default:0" json:"judge_confidence"`
+	CreatedAt       time.Time        `gorm:"not null;default:CURRENT_TIMESTAMP" json:"created_at"`
+	UpdatedAt       time.Time        `gorm:"not null;default:CURRENT_TIMESTAMP" json:"updated_at"`
+}
+
+func (BatchItem) TableName() string {
+	return "workflow_test_batch_items"
+}
+
+type JSONCaseSnapshot CaseSnapshot
+
+func (s JSONCaseSnapshot) Value() (driver.Value, error) {
+	data, err := json.Marshal(s)
+	return string(data), err
+}
+
+func (s *JSONCaseSnapshot) Scan(value interface{}) error {
+	if value == nil {
+		*s = JSONCaseSnapshot{}
+		return nil
+	}
+	var bytes []byte
+	switch v := value.(type) {
+	case []byte:
+		bytes = v
+	case string:
+		bytes = []byte(v)
+	default:
+		return fmt.Errorf("unsupported JSONCaseSnapshot scan type %T", value)
+	}
+	if len(bytes) == 0 {
+		*s = JSONCaseSnapshot{}
+		return nil
+	}
+	return json.Unmarshal(bytes, s)
+}
+
+type JSONMap map[string]interface{}
+
+func (m JSONMap) Value() (driver.Value, error) {
+	if m == nil {
+		return "{}", nil
+	}
+	data, err := json.Marshal(m)
+	return string(data), err
+}
+
+func (m *JSONMap) Scan(value interface{}) error {
+	if value == nil {
+		*m = JSONMap{}
+		return nil
+	}
+	var bytes []byte
+	switch v := value.(type) {
+	case []byte:
+		bytes = v
+	case string:
+		bytes = []byte(v)
+	default:
+		return fmt.Errorf("unsupported JSONMap scan type %T", value)
+	}
+	if len(bytes) == 0 {
+		*m = JSONMap{}
+		return nil
+	}
+	return json.Unmarshal(bytes, m)
+}
+
+type Batch struct {
+	ID                         string    `gorm:"type:uuid;primaryKey" json:"id"`
+	AgentID                    string    `gorm:"type:uuid;not null;index:idx_workflow_test_batches_agent" json:"agent_id"`
+	Name                       string    `gorm:"type:varchar(160);not null" json:"name"`
+	Status                     string    `gorm:"type:varchar(32);not null;default:'queued'" json:"status"`
+	CaseCount                  int       `gorm:"type:int;not null;default:0" json:"case_count"`
+	PassedCount                int       `gorm:"type:int;not null;default:0" json:"passed_count"`
+	FailedCount                int       `gorm:"type:int;not null;default:0" json:"failed_count"`
+	ReviewCount                int       `gorm:"type:int;not null;default:0" json:"review_count"`
+	JudgePromptSnapshot        string    `gorm:"type:text;not null" json:"judge_prompt_snapshot"`
+	JudgeModelProviderSnapshot string    `gorm:"type:varchar(100);not null;default:''" json:"judge_model_provider_snapshot"`
+	JudgeModelNameSnapshot     string    `gorm:"type:varchar(160);not null;default:''" json:"judge_model_name_snapshot"`
+	WorkflowVersionMode        string    `gorm:"type:varchar(40);not null;default:'draft'" json:"workflow_version_mode"`
+	WorkflowVersionUUID        *string   `gorm:"type:uuid" json:"workflow_version_uuid,omitempty"`
+	WorkflowVersionLabel       string    `gorm:"type:varchar(160);not null;default:'current_draft'" json:"workflow_version_label"`
+	Summary                    string    `gorm:"type:text;not null;default:''" json:"summary"`
+	CreatedAt                  time.Time `gorm:"not null;default:CURRENT_TIMESTAMP" json:"created_at"`
+	UpdatedAt                  time.Time `gorm:"not null;default:CURRENT_TIMESTAMP" json:"updated_at"`
+}
+
+func (Batch) TableName() string {
+	return "workflow_test_batches"
+}
+
+type GenerationTask struct {
+	ID                string     `gorm:"type:uuid;primaryKey" json:"id"`
+	AgentID           string     `gorm:"type:uuid;not null;index:idx_workflow_test_generation_tasks_agent;index:idx_workflow_test_generation_tasks_agent_status_created,priority:1" json:"agent_id"`
+	WorkspaceID       string     `gorm:"type:uuid;not null;index:idx_workflow_test_generation_tasks_workspace" json:"workspace_id"`
+	AccountID         string     `gorm:"type:uuid;not null;index:idx_workflow_test_generation_tasks_account" json:"account_id"`
+	Status            string     `gorm:"type:varchar(32);not null;default:'queued';index:idx_workflow_test_generation_tasks_status;index:idx_workflow_test_generation_tasks_agent_status_created,priority:2" json:"status"`
+	RequestedCount    int        `gorm:"type:int;not null;default:0" json:"requested_count"`
+	CreatedCount      int        `gorm:"type:int;not null;default:0" json:"created_count"`
+	ScenarioIDs       JSONList   `gorm:"type:jsonb;not null" json:"scenario_ids"`
+	QuestionTypes     JSONList   `gorm:"type:jsonb;not null" json:"question_types"`
+	TurnStrategy      string     `gorm:"type:varchar(32);not null;default:'mixed'" json:"turn_strategy"`
+	Prompt            string     `gorm:"type:text;not null;default:''" json:"prompt"`
+	Context           string     `gorm:"type:text;not null;default:''" json:"context"`
+	ModelProvider     string     `gorm:"type:varchar(100);not null;default:''" json:"model_provider"`
+	ModelName         string     `gorm:"type:varchar(160);not null;default:''" json:"model_name"`
+	Error             string     `gorm:"type:text;not null;default:''" json:"error"`
+	StartedAt         *time.Time `gorm:"type:timestamptz" json:"started_at,omitempty"`
+	CancelRequestedAt *time.Time `gorm:"type:timestamptz" json:"cancel_requested_at,omitempty"`
+	CompletedAt       *time.Time `gorm:"type:timestamptz" json:"completed_at,omitempty"`
+	CreatedAt         time.Time  `gorm:"not null;default:CURRENT_TIMESTAMP;index:idx_workflow_test_generation_tasks_agent_status_created,priority:3" json:"created_at"`
+	UpdatedAt         time.Time  `gorm:"not null;default:CURRENT_TIMESTAMP" json:"updated_at"`
+}
+
+func (GenerationTask) TableName() string {
+	return "workflow_test_generation_tasks"
+}
+
+type ScenarioRecognitionTask struct {
+	ID                      string     `gorm:"type:uuid;primaryKey" json:"id"`
+	AgentID                 string     `gorm:"type:uuid;not null;index:idx_workflow_test_scenario_recognition_tasks_agent;index:idx_workflow_test_scenario_recognition_tasks_agent_status_created,priority:1" json:"agent_id"`
+	WorkspaceID             string     `gorm:"type:uuid;not null;index:idx_workflow_test_scenario_recognition_tasks_workspace" json:"workspace_id"`
+	AccountID               string     `gorm:"type:uuid;not null;index:idx_workflow_test_scenario_recognition_tasks_account" json:"account_id"`
+	Status                  string     `gorm:"type:varchar(32);not null;default:'queued';index:idx_workflow_test_scenario_recognition_tasks_status;index:idx_workflow_test_scenario_recognition_tasks_agent_status_created,priority:2" json:"status"`
+	Prompt                  string     `gorm:"type:text;not null;default:''" json:"prompt"`
+	Context                 string     `gorm:"type:text;not null;default:''" json:"context"`
+	WorkflowContextSnapshot string     `gorm:"type:text;not null;default:''" json:"workflow_context_snapshot"`
+	ModelProvider           string     `gorm:"type:varchar(100);not null;default:''" json:"model_provider"`
+	ModelName               string     `gorm:"type:varchar(160);not null;default:''" json:"model_name"`
+	RecognizedCount         int        `gorm:"type:int;not null;default:0" json:"recognized_count"`
+	AssignedCaseCount       int        `gorm:"type:int;not null;default:0" json:"assigned_case_count"`
+	Error                   string     `gorm:"type:text;not null;default:''" json:"error"`
+	StartedAt               *time.Time `gorm:"type:timestamptz" json:"started_at,omitempty"`
+	CancelRequestedAt       *time.Time `gorm:"type:timestamptz" json:"cancel_requested_at,omitempty"`
+	CompletedAt             *time.Time `gorm:"type:timestamptz" json:"completed_at,omitempty"`
+	CreatedAt               time.Time  `gorm:"not null;default:CURRENT_TIMESTAMP;index:idx_workflow_test_scenario_recognition_tasks_agent_status_created,priority:3" json:"created_at"`
+	UpdatedAt               time.Time  `gorm:"not null;default:CURRENT_TIMESTAMP" json:"updated_at"`
+}
+
+func (ScenarioRecognitionTask) TableName() string {
+	return "workflow_test_scenario_recognition_tasks"
+}
+
+func newID() string {
+	return uuid.NewString()
+}

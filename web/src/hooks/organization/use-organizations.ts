@@ -1,0 +1,201 @@
+'use client';
+
+import { useCallback, useEffect } from 'react';
+import { useQuery, useQueryClient } from '@tanstack/react-query';
+import { organizationService } from '@/services/organization.service';
+import { accountService } from '@/services/account.service';
+import type { Organization } from '@/services/types/organization';
+import { toast } from 'sonner';
+import { useOrganizationStore } from '@/store/organization-store';
+import { useAuthStore } from '@/store/auth-store';
+import { useWorkspaceStore } from '@/store/workspace-store';
+import { useT } from '@/i18n';
+import { ORGANIZATION_KEYS, PROFILE_KEYS, WORKSPACE_KEYS } from '../query-keys';
+import { sessionManager } from '@/lib/auth/session-manager';
+import { clearProfileClientCache } from '@/utils/client-cache';
+import { shouldRetryAccessLoadError } from '@/utils/access-load-error';
+
+interface UseOrganizationsResult {
+  organizations: Organization[];
+  currentOrganization: Organization | null;
+  isLoading: boolean;
+  isFetching: boolean;
+  reload: () => Promise<void>;
+  switchOrganization: (organization: Organization) => Promise<void>;
+}
+
+/**
+ * React hook to manage organizations for the current user.
+ */
+export function useOrganizations(autoLoad: boolean = true): UseOrganizationsResult {
+  const t = useT();
+
+  const queryClient = useQueryClient();
+
+  const organizations = useOrganizationStore.use.organizations();
+  const currentOrganization = useOrganizationStore.use.currentOrganization();
+  const isSwitchingOrganization =
+    useOrganizationStore.use.isSwitchingOrganization();
+  const setOrganizations = useOrganizationStore.use.setOrganizations();
+  const setCurrentOrganization = useOrganizationStore.use.setCurrentOrganization();
+  const setSwitchingOrganization =
+    useOrganizationStore.use.setSwitchingOrganization();
+  const resetWorkspaceForOrganizationSwitch =
+    useWorkspaceStore.use.resetForOrganizationSwitch();
+  const isAuthenticated = useAuthStore.use.isAuthenticated();
+  const isLoggingOut = useAuthStore.use.isLoggingOut();
+  const shouldAutoLoad =
+    autoLoad && isAuthenticated && !isLoggingOut && !isSwitchingOrganization;
+
+  /* ----------------------------- Data fetching ----------------------------- */
+  // Fetch organizations list
+  const {
+    data: fetchedOrganizations,
+    isLoading: listLoading,
+    isFetching: listFetching,
+  } = useQuery({
+    queryKey: ORGANIZATION_KEYS.list({ page: 1, limit: 100 }),
+    enabled: shouldAutoLoad,
+    staleTime: 5 * 60 * 1000,
+    queryFn: async () => {
+      const list = await organizationService.getOrganizationList({ page: 1, limit: 100 });
+      return list.data;
+    },
+    retry: (failureCount, queryError) =>
+      shouldRetryAccessLoadError(failureCount, queryError),
+    retryDelay: attemptIndex => Math.min(250 * 2 ** attemptIndex, 1000),
+  });
+
+  useEffect(() => {
+    if (fetchedOrganizations) {
+      setOrganizations(fetchedOrganizations);
+    }
+  }, [fetchedOrganizations, setOrganizations]);
+
+  // Fetch current organization
+  const { data: fetchedCurrentOrganization } = useQuery({
+    queryKey: ORGANIZATION_KEYS.current(),
+    enabled: shouldAutoLoad,
+    staleTime: 5 * 60 * 1000,
+    refetchInterval: 5 * 60 * 1000,
+    queryFn: async () => {
+      return await organizationService.getCurrentOrganization();
+    },
+    retry: (failureCount, queryError) =>
+      shouldRetryAccessLoadError(failureCount, queryError),
+    retryDelay: attemptIndex => Math.min(250 * 2 ** attemptIndex, 1000),
+  });
+
+  useEffect(() => {
+    if (fetchedCurrentOrganization) {
+      setCurrentOrganization(fetchedCurrentOrganization);
+    }
+  }, [fetchedCurrentOrganization, setCurrentOrganization]);
+
+  // If still no currentOrganization
+  useEffect(() => {
+    if (shouldAutoLoad && !currentOrganization) {
+      queryClient.invalidateQueries({ queryKey: ORGANIZATION_KEYS.current() });
+    }
+  }, [currentOrganization, queryClient, shouldAutoLoad]);
+
+  // Sync reference
+  useEffect(() => {
+    if (currentOrganization && organizations.length > 0) {
+      const matched = organizations.find(g => g.id === currentOrganization.id);
+      if (matched && matched !== currentOrganization) {
+        setCurrentOrganization(matched);
+      }
+    }
+  }, [currentOrganization, organizations, setCurrentOrganization]);
+
+  const reload = useCallback(async () => {
+    await Promise.all([
+      queryClient.invalidateQueries({ queryKey: ORGANIZATION_KEYS.lists() }),
+      queryClient.invalidateQueries({ queryKey: ORGANIZATION_KEYS.current() }),
+    ]);
+  }, [queryClient]);
+
+  const switchOrganization = useCallback(
+    async (organization: Organization) => {
+      if (currentOrganization?.id === organization.id) {
+        return;
+      }
+      const previousOrganization = currentOrganization;
+      const workspaceStore = useWorkspaceStore.getState();
+      const previousWorkspace = workspaceStore.currentWorkspace;
+      const previousContextStatus = workspaceStore.contextStatus;
+
+      const restorePreviousWorkspaceContext = () => {
+        const store = useWorkspaceStore.getState();
+        if (previousContextStatus === 'ready' && previousWorkspace) {
+          store.selectWorkspace(previousWorkspace);
+          return;
+        }
+        if (previousContextStatus === 'workspace_required') {
+          store.markWorkspaceRequired();
+          return;
+        }
+        store.resetForOrganizationSwitch();
+      };
+
+      try {
+        setSwitchingOrganization(true);
+        await queryClient.cancelQueries();
+        resetWorkspaceForOrganizationSwitch();
+        setCurrentOrganization(null);
+        queryClient.removeQueries({ queryKey: WORKSPACE_KEYS.all });
+        queryClient.removeQueries({ queryKey: PROFILE_KEYS.capabilities() });
+        await accountService.updateContext({
+          mode: 'organization',
+          current_organization_id: organization.id,
+        });
+      } catch {
+        setCurrentOrganization(previousOrganization);
+        restorePreviousWorkspaceContext();
+        setSwitchingOrganization(false);
+        toast.error(t('common.organization.switchOrgFailed'));
+        return;
+      }
+
+      clearProfileClientCache();
+      try {
+        await useAuthStore.getState().refreshProfile({ refresh: true });
+      } catch {
+        // Ignore refresh failures here and let the global auth flow decide next steps.
+      }
+
+      setCurrentOrganization(organization);
+      setSwitchingOrganization(false);
+      try {
+        // Invalidate ALL queries because organization context change affects everything
+        await queryClient.invalidateQueries();
+      } catch {
+        // ignore
+      }
+
+      sessionManager.broadcastContextChanged({
+        currentOrganizationId: organization.id,
+        currentWorkspaceId: null,
+      });
+      toast.success(t('common.organization.switchOrgSuccess'));
+    },
+    [
+      currentOrganization,
+      resetWorkspaceForOrganizationSwitch,
+      setCurrentOrganization,
+      setSwitchingOrganization,
+      t,
+      queryClient,
+    ]
+  );
+
+  return {
+    organizations,
+    currentOrganization,
+    isLoading: listLoading,
+    isFetching: listFetching,
+    reload,
+    switchOrganization,
+  };
+}

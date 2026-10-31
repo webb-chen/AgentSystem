@@ -1,0 +1,210 @@
+'use client';
+
+import * as React from 'react';
+import { useParams, usePathname } from 'next/navigation';
+import { useDataset } from '@/hooks/dataset/use-datasets';
+import { useT } from '@/i18n';
+import { FileText, Search, Cog, ShieldAlert, Network } from 'lucide-react';
+import { getSidebarCollapsed, saveSidebarCollapsed } from '@/utils/ui-local';
+import { useAccountPermissions } from '@/hooks/organization/use-account-permissions';
+import { WorkspaceMismatchGuard } from '@/components/common/workspace-mismatch-guard';
+import { ICON_BG } from '@/lib/config';
+import {
+  ResourceSidebar,
+  ResourceSidebarHeader,
+  type ResourceSidebarNavItem,
+} from '@/components/common/resource-sidebar';
+import { IconPreview } from '@/components/common/icon-input/icon-preview';
+import {
+  KNOWLEDGE_BASE_PERMISSION_ACTIONS,
+  KNOWLEDGE_BASE_VISIBLE_PERMISSION_CODES,
+} from '@/constants/permissions';
+import { useContextualAIChat } from '@/components/aichat/contextual';
+
+export default function DatasetDetailLayout({ children }: { children: React.ReactNode }) {
+  const { datasetId } = useParams<{ datasetId: string }>();
+  const pathname = usePathname();
+  const t = useT();
+  const { isOpen: isContextualAIChatOpen } = useContextualAIChat();
+
+  // Permission checking
+  const { hasAnyPermission, isLoading: isPermissionsLoading } = useAccountPermissions();
+  const canView = hasAnyPermission(KNOWLEDGE_BASE_VISIBLE_PERMISSION_CODES);
+  const canViewDocuments = hasAnyPermission([
+    ...KNOWLEDGE_BASE_PERMISSION_ACTIONS.documentView,
+    ...KNOWLEDGE_BASE_PERMISSION_ACTIONS.documentCreate,
+    ...KNOWLEDGE_BASE_PERMISSION_ACTIONS.documentUpdate,
+    ...KNOWLEDGE_BASE_PERMISSION_ACTIONS.documentDelete,
+    ...KNOWLEDGE_BASE_PERMISSION_ACTIONS.indexManage,
+  ]);
+  const canUseRetrievalTest = hasAnyPermission(KNOWLEDGE_BASE_PERMISSION_ACTIONS.retrievalTest);
+  const canViewGraph = hasAnyPermission([
+    ...KNOWLEDGE_BASE_PERMISSION_ACTIONS.graphView,
+    ...KNOWLEDGE_BASE_PERMISSION_ACTIONS.graphManage,
+  ]);
+
+  const { data, isLoading } = useDataset(datasetId, {
+    enabled: canView,
+    // Refetch periodically to update available_document_count when documents finish indexing
+    refetchInterval: 10000,
+    refetchIntervalInBackground: false,
+  });
+  const canOpenSettings = hasAnyPermission([...KNOWLEDGE_BASE_PERMISSION_ACTIONS.update]);
+
+  // Get dataset details for conditional rendering
+  const dataset = data?.data;
+
+  // Persist collapsed state to localStorage
+  const [isCollapsed, setIsCollapsed] = React.useState<boolean>(() =>
+    getSidebarCollapsed('dataset', true)
+  );
+  React.useEffect(() => {
+    saveSidebarCollapsed('dataset', isCollapsed);
+  }, [isCollapsed]);
+
+  const toggleCollapse = () => setIsCollapsed(prev => !prev);
+
+  // Check if dataset has completed documents
+  // const hasCompletedDocuments = (dataset?.available_document_count ?? 0) > 0;
+
+  // Check if graph flow is enabled for this dataset
+  const isGraphEnabled = dataset?.enable_graph_flow ?? false;
+
+  // Dynamic nav items based on permissions and feature flags
+  const navItems: ResourceSidebarNavItem[] = React.useMemo(() => {
+    const items: ResourceSidebarNavItem[] = [];
+
+    if (canViewDocuments) {
+      items.push({
+        title: t('datasets.documentsTitle'),
+        href: `/console/dataset/${datasetId}/documents`,
+        icon: FileText,
+      });
+    }
+
+    if (canUseRetrievalTest) {
+      items.push({
+        title: t('datasets.hitTestingTitle'),
+        href: `/console/dataset/${datasetId}/hit-testing`,
+        icon: Search,
+      });
+    }
+
+    // Only show Knowledge Graph when graph flow is enabled
+    if (isGraphEnabled && canViewGraph) {
+      items.push({
+        title: t('datasets.knowledgeGraphTitle'),
+        href: `/console/dataset/${datasetId}/graph`,
+        icon: Network,
+      });
+    }
+
+    // Only show settings when user can change dataset-level configuration.
+    if (canOpenSettings) {
+      items.push({
+        title: t('datasets.settingsTitle'),
+        href: `/console/dataset/${datasetId}/settings`,
+        icon: Cog,
+      });
+    }
+
+    return items;
+  }, [
+    canOpenSettings,
+    canUseRetrievalTest,
+    canViewDocuments,
+    canViewGraph,
+    datasetId,
+    isGraphEnabled,
+    t,
+  ]);
+
+  // Access denied state
+  if (!isPermissionsLoading && !canView) {
+    return (
+      <div className="flex flex-col items-center justify-center h-full gap-4 text-center p-8">
+        <div className="w-16 h-16 rounded-full bg-muted flex items-center justify-center">
+          <ShieldAlert className="w-8 h-8 text-muted-foreground" />
+        </div>
+        <div className="space-y-2">
+          <h2 className="text-lg font-semibold text-foreground">{t('common.accessDenied')}</h2>
+          <p className="text-sm text-muted-foreground max-w-md">
+            {t('common.unauthorizedDescription')}
+          </p>
+        </div>
+      </div>
+    );
+  }
+
+  const iconType = dataset?.icon_type;
+  const textIcon = dataset?.icon || dataset?.name?.slice(0, 2).toUpperCase() || 'DS';
+  const iconBackground = dataset?.icon_background || ICON_BG;
+  const imgSrc = iconType === 'image' ? dataset?.icon_url : undefined;
+
+  return (
+    <WorkspaceMismatchGuard
+      isLoading={isLoading}
+      targetWorkspaceId={dataset?.workspace_id || ''}
+      targetWorkspaceName={dataset?.workspace?.name}
+    >
+      <div className="flex h-full bg-background min-w-0">
+        <ResourceSidebar
+          isCollapsed={isCollapsed}
+          temporarilyCollapsed={isContextualAIChatOpen}
+          onToggleCollapse={toggleCollapse}
+          expandLabel={t('navigation.expand')}
+          collapseLabel={t('navigation.collapse')}
+          header={
+            <ResourceSidebarHeader
+              isCollapsed={isCollapsed}
+              iconType={iconType}
+              iconSrc={imgSrc}
+              icon={textIcon}
+              iconBackground={iconBackground}
+              showIdentity={false}
+              backHref="/console/dataset"
+              backLabel={t('datasets.backToDatasetList')}
+            />
+          }
+          navItems={navItems}
+          pathname={pathname}
+        />
+
+        {/* Main Content Area */}
+        <div className="flex flex-col grow min-w-0 relative">
+          <div className="flex min-h-14 shrink-0 items-center justify-between gap-4 border-b bg-background px-6 py-3">
+            <div className="flex min-w-0 items-center gap-3">
+              <IconPreview
+                iconType={iconType === 'image' ? 'image' : 'text'}
+                src={iconType === 'image' ? imgSrc : ''}
+                icon={textIcon}
+                iconBackground={iconBackground}
+                editable={false}
+                size="sidebar"
+              />
+              <div className="min-w-0">
+                <div
+                  className="truncate text-sm font-semibold leading-5 text-foreground"
+                  title={dataset?.name}
+                >
+                  {dataset?.name || (isLoading ? t('datasets.loading') : '-')}
+                </div>
+                <div
+                  className="truncate text-xs leading-5 text-muted-foreground"
+                  title={dataset?.description || t('datasets.noDescription')}
+                >
+                  {dataset?.description || t('datasets.noDescription')}
+                </div>
+              </div>
+            </div>
+          </div>
+          <div className="flex-1 overflow-hidden">
+            <div className="h-full overflow-y-auto" id="dataset-content-area">
+              <div className="h-full">{children}</div>
+            </div>
+          </div>
+        </div>
+      </div>
+    </WorkspaceMismatchGuard>
+  );
+}

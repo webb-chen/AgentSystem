@@ -1,0 +1,9 @@
+.git
+.gitignore
+.mingyingkeji-sandbox-data
+**/.mingyingkeji-sandbox-data
+tmp
+dist
+bin
+node_modules
+coverage

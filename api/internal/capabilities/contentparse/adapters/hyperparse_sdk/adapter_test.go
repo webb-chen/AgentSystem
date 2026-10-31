@@ -1,0 +1,752 @@
+package hyperparsesdk
+
+import (
+	"archive/zip"
+	"bytes"
+	"context"
+	"errors"
+	"fmt"
+	"image"
+	"image/color"
+	"image/png"
+	"os"
+	"os/exec"
+	"path/filepath"
+	"runtime"
+	"strings"
+	"sync"
+	"testing"
+	"time"
+
+	extractcommon "github.com/webb-chen/AgentSystem/api/internal/capabilities/contentparse/engines/hyperparse/pkg/providers/common"
+	"github.com/webb-chen/AgentSystem/api/internal/contracts"
+)
+
+type fakeFigureSummaryEnhancer struct {
+	mu        sync.Mutex
+	output    string
+	err       error
+	calls     []string
+	delay     time.Duration
+	active    int
+	maxActive int
+}
+
+func (f *fakeFigureSummaryEnhancer) LocalizeReductoFigureSummary(ctx context.Context, organizationID, text string) (string, error) {
+	f.calls = append(f.calls, organizationID+"|"+text)
+	if f.err != nil {
+		return "", f.err
+	}
+	return f.output, nil
+}
+
+func (f *fakeFigureSummaryEnhancer) SummarizeMineruFigureImage(ctx context.Context, organizationID, imageURL string) (string, error) {
+	f.mu.Lock()
+	f.calls = append(f.calls, organizationID+"|"+imageURL)
+	f.active++
+	if f.active > f.maxActive {
+		f.maxActive = f.active
+	}
+	delay := f.delay
+	f.mu.Unlock()
+	defer func() {
+		f.mu.Lock()
+		f.active--
+		f.mu.Unlock()
+	}()
+	if delay > 0 {
+		select {
+		case <-time.After(delay):
+		case <-ctx.Done():
+			return "", ctx.Err()
+		}
+	}
+	if f.err != nil {
+		return "", f.err
+	}
+	return f.output, nil
+}
+
+func TestAdapterParsesPlainTextBytes(t *testing.T) {
+	adapter := NewAdapter()
+
+	artifact, err := adapter.Parse(context.Background(), contracts.ParseRequest{
+		SourceType: contracts.ParseSourceTypeBytes,
+		FileName:   "sample.txt",
+		Data:       []byte("hello from content parse foundation"),
+		Intent:     contracts.ParseIntentPreview,
+		Profile:    contracts.ParseProfileFastPreview,
+		EngineHint: contracts.ParseEngineLocal,
+	})
+	if err != nil {
+		t.Fatalf("Parse() error = %v", err)
+	}
+	if artifact.Status != contracts.ParseStatusSucceeded {
+		t.Fatalf("Status = %q, want %q", artifact.Status, contracts.ParseStatusSucceeded)
+	}
+	if artifact.EngineUsed != contracts.ParseEngineLocal {
+		t.Fatalf("EngineUsed = %q, want %q", artifact.EngineUsed, contracts.ParseEngineLocal)
+	}
+	if !strings.Contains(artifact.Text, "hello from content parse foundation") {
+		t.Fatalf("Text = %q, want substring", artifact.Text)
+	}
+	if len(artifact.Elements) == 0 {
+		t.Fatal("expected parsed elements")
+	}
+}
+
+func TestAdapterParsesUploadFileWithLoadedBytes(t *testing.T) {
+	adapter := NewAdapter()
+
+	artifact, err := adapter.Parse(context.Background(), contracts.ParseRequest{
+		SourceType: contracts.ParseSourceTypeUploadFile,
+		SourceRef:  "file-1",
+		FileName:   "sample.txt",
+		Data:       []byte("hello from uploaded file bytes"),
+		Intent:     contracts.ParseIntentDatasetIndex,
+		Profile:    contracts.ParseProfileDatasetIndex,
+		EngineHint: contracts.ParseEngineLocal,
+	})
+	if err != nil {
+		t.Fatalf("Parse() error = %v", err)
+	}
+	if artifact.SourceType != contracts.ParseSourceTypeUploadFile {
+		t.Fatalf("SourceType = %q, want %q", artifact.SourceType, contracts.ParseSourceTypeUploadFile)
+	}
+	if !strings.Contains(artifact.Text, "hello from uploaded file bytes") {
+		t.Fatalf("Text = %q, want uploaded byte content", artifact.Text)
+	}
+}
+
+func TestMapDocumentResultCarriesConfidence(t *testing.T) {
+	result := &extractcommon.DocumentResult{
+		DocID:    "doc-1",
+		Markdown: "hello",
+		ExtractOutput: &extractcommon.ExtractOutput{
+			Elements: []extractcommon.ExtractElement{
+				{
+					ID:      "el-1",
+					Type:    "text",
+					Page:    0,
+					Content: "hello",
+					Ordinal: 1,
+					Metadata: map[string]any{
+						"confidence": 0.73,
+					},
+				},
+			},
+			Metadata: map[string]any{},
+		},
+	}
+	artifact := mapDocumentResult(contracts.ParseRequest{
+		SourceType: contracts.ParseSourceTypeBytes,
+		FileName:   "sample.txt",
+		Intent:     contracts.ParseIntentPreview,
+		Profile:    contracts.ParseProfileFastPreview,
+	}, extractcommon.EngineLocal, result)
+	if len(artifact.Elements) != 1 {
+		t.Fatalf("elements=%d", len(artifact.Elements))
+	}
+	if artifact.Elements[0].Confidence == nil || *artifact.Elements[0].Confidence != 0.73 {
+		t.Fatalf("confidence=%v", artifact.Elements[0].Confidence)
+	}
+	if artifact.Metadata["structured_elements"] != nil {
+		t.Fatalf("local engine output must not be marked structured: %#v", artifact.Metadata)
+	}
+}
+
+func TestMapDocumentResultMarksEmptyOutputDegraded(t *testing.T) {
+	result := &extractcommon.DocumentResult{
+		DocID:     "doc-empty",
+		PageCount: 3,
+		ExtractOutput: &extractcommon.ExtractOutput{
+			Metadata: map[string]any{},
+		},
+	}
+	artifact := mapDocumentResult(contracts.ParseRequest{
+		SourceType: contracts.ParseSourceTypeBytes,
+		FileName:   "scan.pdf",
+		Intent:     contracts.ParseIntentPreview,
+		Profile:    contracts.ParseProfileFastPreview,
+	}, extractcommon.EngineLocal, result)
+	if artifact.Status != contracts.ParseStatusDegraded {
+		t.Fatalf("Status = %q, want %q", artifact.Status, contracts.ParseStatusDegraded)
+	}
+	if artifact.QualityLevel != contracts.ParseQualityDegraded {
+		t.Fatalf("QualityLevel = %q, want %q", artifact.QualityLevel, contracts.ParseQualityDegraded)
+	}
+	if artifact.Diagnostics["empty_output"] == nil {
+		t.Fatal("expected empty_output diagnostic")
+	}
+}
+
+func TestMapDocumentResultCarriesImageAssetsForNormalization(t *testing.T) {
+	result := &extractcommon.DocumentResult{
+		DocID:       "doc-images",
+		Markdown:    "![figure](images/chart.jpg)",
+		ImageAssets: map[string]string{"chart.jpg": "data:image/jpeg;base64,aGVsbG8="},
+		ExtractOutput: &extractcommon.ExtractOutput{
+			Metadata: map[string]any{},
+			Elements: []extractcommon.ExtractElement{
+				{
+					ID:      "figure-1",
+					Type:    "figure",
+					Content: "[figure]",
+					Metadata: map[string]any{
+						"payload": map[string]any{
+							"mineru_type":       "chart",
+							"structure_version": "mineru_content_list_v1",
+							"img_path":          "images/chart.jpg",
+						},
+					},
+				},
+			},
+		},
+	}
+	artifact := mapDocumentResult(contracts.ParseRequest{
+		SourceType: contracts.ParseSourceTypeBytes,
+		FileName:   "sample.pdf",
+		Intent:     contracts.ParseIntentPreview,
+		Profile:    contracts.ParseProfileFastPreview,
+	}, extractcommon.EngineMineru, result)
+	assets, ok := artifact.Metadata["image_assets"].(map[string]any)
+	if !ok || assets["chart.jpg"] != "data:image/jpeg;base64,aGVsbG8=" {
+		t.Fatalf("image assets not carried for normalization: %#v", artifact.Metadata["image_assets"])
+	}
+	if artifact.Metadata["structured_elements"] != true {
+		t.Fatalf("expected structured element marker: %#v", artifact.Metadata)
+	}
+}
+
+func TestMapDocumentResultLocalizesReductoFigureSummary(t *testing.T) {
+	localizer := &fakeFigureSummaryEnhancer{output: "图片展示了一株浅色花朵的植物。"}
+	result := &extractcommon.DocumentResult{
+		DocID:    "doc-reducto",
+		Markdown: "The image displays a plant with small flowers.",
+		ExtractOutput: &extractcommon.ExtractOutput{
+			Metadata: map[string]any{},
+			Elements: []extractcommon.ExtractElement{
+				{
+					ID:      "figure-1",
+					Type:    "figure",
+					Content: "The image displays a plant with small flowers.",
+					Metadata: map[string]any{
+						"payload": map[string]any{
+							"source":     "reducto",
+							"image_url":  "https://example.com/plant.png",
+							"page_index": 1,
+						},
+					},
+				},
+			},
+		},
+	}
+
+	artifact := mapDocumentResultWithOptions(contracts.ParseRequest{
+		SourceType: contracts.ParseSourceTypeBytes,
+		FileName:   "sample.pdf",
+		Intent:     contracts.ParseIntentDatasetIndex,
+		Profile:    contracts.ParseProfileDatasetIndex,
+		Metadata:   map[string]any{"organization_id": "org-1"},
+	}, extractcommon.EngineReducto, result, mapDocumentOptions{figureSummaryEnhancer: localizer})
+
+	if got := artifact.Elements[0].Content; got != "图片展示了一株浅色花朵的植物。" {
+		t.Fatalf("localized content = %q", got)
+	}
+	payload := artifact.Elements[0].Metadata["payload"].(map[string]any)
+	if got := payload["reducto_original_figure_summary"]; got != "The image displays a plant with small flowers." {
+		t.Fatalf("original summary payload = %v", got)
+	}
+	if got := payload["reducto_figure_summary_language"]; got != "zh-Hans" {
+		t.Fatalf("summary language payload = %v", got)
+	}
+	if len(localizer.calls) != 1 || localizer.calls[0] != "org-1|The image displays a plant with small flowers." {
+		t.Fatalf("localizer calls = %#v", localizer.calls)
+	}
+}
+
+func TestMapDocumentResultKeepsReductoFigureSummaryWhenLocalizationFails(t *testing.T) {
+	localizer := &fakeFigureSummaryEnhancer{err: errors.New("model unavailable")}
+	result := &extractcommon.DocumentResult{
+		DocID: "doc-reducto",
+		ExtractOutput: &extractcommon.ExtractOutput{
+			Metadata: map[string]any{},
+			Elements: []extractcommon.ExtractElement{
+				{
+					ID:      "figure-1",
+					Type:    "figure",
+					Content: "The image displays a plant with small flowers.",
+					Metadata: map[string]any{
+						"payload": map[string]any{
+							"source":    "reducto",
+							"image_url": "https://example.com/plant.png",
+						},
+					},
+				},
+			},
+		},
+	}
+
+	artifact := mapDocumentResultWithOptions(contracts.ParseRequest{
+		SourceType: contracts.ParseSourceTypeBytes,
+		FileName:   "sample.pdf",
+		Intent:     contracts.ParseIntentDatasetIndex,
+		Profile:    contracts.ParseProfileDatasetIndex,
+		Metadata:   map[string]any{"organization_id": "org-1"},
+	}, extractcommon.EngineReducto, result, mapDocumentOptions{figureSummaryEnhancer: localizer})
+
+	if got := artifact.Elements[0].Content; got != "The image displays a plant with small flowers." {
+		t.Fatalf("content after failed localization = %q", got)
+	}
+	payload := artifact.Elements[0].Metadata["payload"].(map[string]any)
+	if _, ok := payload["reducto_original_figure_summary"]; ok {
+		t.Fatalf("failed localization should not add original summary payload: %#v", payload)
+	}
+}
+
+func TestMapDocumentResultAppendsMineruFigureSummary(t *testing.T) {
+	localizer := &fakeFigureSummaryEnhancer{output: "图片展示了一张趋势图。"}
+	result := &extractcommon.DocumentResult{
+		DocID: "doc-mineru",
+		ExtractOutput: &extractcommon.ExtractOutput{
+			Metadata: map[string]any{},
+			Elements: []extractcommon.ExtractElement{
+				{
+					ID:      "figure-1",
+					Type:    "figure",
+					Content: "[figure]",
+					Metadata: map[string]any{
+						"markdown": "![Trend chart](data:image/jpeg;base64,aGVsbG8=)",
+						"payload": map[string]any{
+							"mineru_type":    "chart",
+							"image_data_uri": "data:image/jpeg;base64,aGVsbG8=",
+						},
+					},
+				},
+			},
+		},
+	}
+
+	artifact := mapDocumentResultWithOptions(contracts.ParseRequest{
+		SourceType: contracts.ParseSourceTypeBytes,
+		FileName:   "sample.pdf",
+		Intent:     contracts.ParseIntentDatasetIndex,
+		Profile:    contracts.ParseProfileDatasetIndex,
+		Metadata:   map[string]any{"organization_id": "org-1"},
+	}, extractcommon.EngineMineru, result, mapDocumentOptions{figureSummaryEnhancer: localizer})
+
+	if got := artifact.Elements[0].Content; got != "图片展示了一张趋势图。" {
+		t.Fatalf("mineru figure content = %q", got)
+	}
+	payload := artifact.Elements[0].Metadata["payload"].(map[string]any)
+	if got := payload["mineru_visual_summary"]; got != "图片展示了一张趋势图。" {
+		t.Fatalf("mineru visual summary payload = %v", got)
+	}
+	if got := payload["mineru_visual_summary_language"]; got != "zh-Hans" {
+		t.Fatalf("mineru visual summary language = %v", got)
+	}
+	if len(localizer.calls) != 1 || localizer.calls[0] != "org-1|data:image/jpeg;base64,aGVsbG8=" {
+		t.Fatalf("localizer calls = %#v", localizer.calls)
+	}
+}
+
+func TestMapDocumentResultKeepsMineruFigureWhenSummaryFails(t *testing.T) {
+	localizer := &fakeFigureSummaryEnhancer{err: errors.New("vision unavailable")}
+	result := &extractcommon.DocumentResult{
+		DocID: "doc-mineru",
+		ExtractOutput: &extractcommon.ExtractOutput{
+			Metadata: map[string]any{},
+			Elements: []extractcommon.ExtractElement{
+				{
+					ID:      "figure-1",
+					Type:    "figure",
+					Content: "[figure]",
+					Metadata: map[string]any{
+						"markdown": "![Trend chart](data:image/jpeg;base64,aGVsbG8=)",
+						"payload": map[string]any{
+							"mineru_type":    "chart",
+							"image_data_uri": "data:image/jpeg;base64,aGVsbG8=",
+						},
+					},
+				},
+			},
+		},
+	}
+
+	artifact := mapDocumentResultWithOptions(contracts.ParseRequest{
+		SourceType: contracts.ParseSourceTypeBytes,
+		FileName:   "sample.pdf",
+		Intent:     contracts.ParseIntentDatasetIndex,
+		Profile:    contracts.ParseProfileDatasetIndex,
+		Metadata:   map[string]any{"organization_id": "org-1"},
+	}, extractcommon.EngineMineru, result, mapDocumentOptions{figureSummaryEnhancer: localizer})
+
+	if got := artifact.Elements[0].Content; got != "[figure]" {
+		t.Fatalf("content after failed mineru summary = %q", got)
+	}
+	payload := artifact.Elements[0].Metadata["payload"].(map[string]any)
+	if _, ok := payload["mineru_visual_summary"]; ok {
+		t.Fatalf("failed summary should not add mineru summary payload: %#v", payload)
+	}
+}
+
+func TestMapDocumentResultBoundsAndParallelizesMineruFigureSummariesForChatContext(t *testing.T) {
+	t.Setenv(envChatContextImageSummaryMax, "8")
+	t.Setenv(envMineruImageSummaryConcurrency, "4")
+	localizer := &fakeFigureSummaryEnhancer{output: "图片摘要", delay: 10 * time.Millisecond}
+	elements := make([]extractcommon.ExtractElement, 10)
+	for index := range elements {
+		elements[index] = extractcommon.ExtractElement{
+			ID:      fmt.Sprintf("figure-%d", index),
+			Type:    "figure",
+			Content: "[figure]",
+			Metadata: map[string]any{
+				"payload": map[string]any{
+					"mineru_type": "figure",
+					"image_url":   fmt.Sprintf("https://example.com/%d.png", index),
+				},
+			},
+		}
+	}
+
+	artifact := mapDocumentResultWithOptions(contracts.ParseRequest{
+		SourceType: contracts.ParseSourceTypeBytes,
+		FileName:   "sample.pdf",
+		Intent:     contracts.ParseIntentChatContext,
+		Metadata:   map[string]any{"organization_id": "org-1"},
+	}, extractcommon.EngineMineru, &extractcommon.DocumentResult{
+		DocID: "doc-mineru-chat",
+		ExtractOutput: &extractcommon.ExtractOutput{
+			Metadata: map[string]any{},
+			Elements: elements,
+		},
+	}, mapDocumentOptions{figureSummaryEnhancer: localizer})
+
+	localizer.mu.Lock()
+	callCount, maxActive := len(localizer.calls), localizer.maxActive
+	localizer.mu.Unlock()
+	if callCount != 8 {
+		t.Fatalf("summary calls = %d, want 8", callCount)
+	}
+	if maxActive != 4 {
+		t.Fatalf("maximum summary concurrency = %d, want 4", maxActive)
+	}
+	for index, element := range artifact.Elements {
+		if index < 8 && element.Content != "图片摘要" {
+			t.Fatalf("element %d content = %q, want visual summary", index, element.Content)
+		}
+		if index >= 8 && element.Content != "[figure]" {
+			t.Fatalf("element %d content = %q, want unchanged figure", index, element.Content)
+		}
+	}
+	stats, ok := artifact.Metadata["mineru_visual_summary"].(map[string]any)
+	if !ok || stats["requested"] != 10 || stats["attempted"] != 8 || stats["skipped"] != 2 || stats["concurrency"] != 4 {
+		t.Fatalf("summary stats = %#v", artifact.Metadata["mineru_visual_summary"])
+	}
+}
+
+func TestMapDocumentResultParallelizesAllMineruFigureSummariesForDatasetIndex(t *testing.T) {
+	t.Setenv(envMineruImageSummaryConcurrency, "4")
+	localizer := &fakeFigureSummaryEnhancer{output: "图片摘要", delay: 10 * time.Millisecond}
+	elements := make([]extractcommon.ExtractElement, 10)
+	for index := range elements {
+		elements[index] = extractcommon.ExtractElement{
+			ID:      fmt.Sprintf("figure-%d", index),
+			Type:    "figure",
+			Content: "[figure]",
+			Metadata: map[string]any{
+				"payload": map[string]any{
+					"mineru_type": "figure",
+					"image_url":   fmt.Sprintf("https://example.com/%d.png", index),
+				},
+			},
+		}
+	}
+
+	artifact := mapDocumentResultWithOptions(contracts.ParseRequest{
+		SourceType: contracts.ParseSourceTypeBytes,
+		FileName:   "sample.pdf",
+		Intent:     contracts.ParseIntentDatasetIndex,
+		Metadata:   map[string]any{"organization_id": "org-1"},
+	}, extractcommon.EngineMineru, &extractcommon.DocumentResult{
+		DocID: "doc-mineru-dataset",
+		ExtractOutput: &extractcommon.ExtractOutput{
+			Metadata: map[string]any{},
+			Elements: elements,
+		},
+	}, mapDocumentOptions{figureSummaryEnhancer: localizer})
+
+	localizer.mu.Lock()
+	callCount, maxActive := len(localizer.calls), localizer.maxActive
+	localizer.mu.Unlock()
+	if callCount != 10 {
+		t.Fatalf("summary calls = %d, want 10", callCount)
+	}
+	if maxActive != 4 {
+		t.Fatalf("maximum summary concurrency = %d, want 4", maxActive)
+	}
+	stats, ok := artifact.Metadata["mineru_visual_summary"].(map[string]any)
+	if !ok || stats["requested"] != 10 || stats["attempted"] != 10 || stats["skipped"] != 0 || stats["concurrency"] != 4 {
+		t.Fatalf("summary stats = %#v", artifact.Metadata["mineru_visual_summary"])
+	}
+}
+
+func TestShouldDisableThinkingForFigureSummary(t *testing.T) {
+	for _, testCase := range []struct {
+		name     string
+		provider string
+		model    string
+		want     bool
+	}{
+		{name: "qwen provider", provider: "qwen", model: "custom-vision", want: true},
+		{name: "qwen model", provider: "mingyingkeji-cloud", model: "qwen3-vl-plus", want: true},
+		{name: "other provider", provider: "openai", model: "gpt-4.1-mini", want: false},
+	} {
+		t.Run(testCase.name, func(t *testing.T) {
+			if got := shouldDisableThinkingForFigureSummary(testCase.provider, testCase.model); got != testCase.want {
+				t.Fatalf("shouldDisableThinkingForFigureSummary(%q, %q) = %t, want %t", testCase.provider, testCase.model, got, testCase.want)
+			}
+		})
+	}
+}
+
+func TestReadConfidence(t *testing.T) {
+	if got := readConfidence(map[string]any{"confidence": 0.73}); got == nil || *got != 0.73 {
+		t.Fatalf("readConfidence() = %v", got)
+	}
+	if got := readConfidence(nil); got != nil {
+		t.Fatalf("expected nil confidence, got %v", got)
+	}
+}
+
+func TestAdapterParsesCSVBytes(t *testing.T) {
+	adapter := NewAdapter()
+
+	artifact, err := adapter.Parse(context.Background(), contracts.ParseRequest{
+		SourceType: contracts.ParseSourceTypeBytes,
+		FileName:   "sample.csv",
+		Data:       []byte("name,age\nalice,30\nbob,28\n"),
+		Intent:     contracts.ParseIntentDatasetIndex,
+		Profile:    contracts.ParseProfileDatasetIndex,
+		EngineHint: contracts.ParseEngineLocal,
+	})
+	if err != nil {
+		t.Fatalf("Parse() error = %v", err)
+	}
+	if artifact.Status != contracts.ParseStatusSucceeded {
+		t.Fatalf("Status = %q, want %q", artifact.Status, contracts.ParseStatusSucceeded)
+	}
+	if !strings.Contains(artifact.Markdown, `"name":"alice";"age":"30"`) {
+		t.Fatalf("Markdown = %q, want parsed csv content", artifact.Markdown)
+	}
+	if len(artifact.Elements) != 2 || artifact.Elements[0].Type != "table" {
+		t.Fatalf("Elements = %+v, want one table element per csv row", artifact.Elements)
+	}
+}
+
+func TestAdapterParsesXLSXBytes(t *testing.T) {
+	adapter := NewAdapter()
+
+	artifact, err := adapter.Parse(context.Background(), contracts.ParseRequest{
+		SourceType: contracts.ParseSourceTypeBytes,
+		FileName:   "sample.xlsx",
+		Data: buildZipFixture(t, map[string]string{
+			"xl/worksheets/sheet1.xml": `<worksheet><sheetData><row><c><v>A1</v></c><c><v>B1</v></c></row></sheetData></worksheet>`,
+			"xl/sharedStrings.xml":     `<sst><si><t>Revenue</t></si><si><t>42</t></si></sst>`,
+		}),
+		Intent:     contracts.ParseIntentPreview,
+		Profile:    contracts.ParseProfileFastPreview,
+		EngineHint: contracts.ParseEngineLocal,
+	})
+	if err != nil {
+		t.Fatalf("Parse() error = %v", err)
+	}
+	if artifact.EngineUsed != contracts.ParseEngineLocal {
+		t.Fatalf("EngineUsed = %q, want %q", artifact.EngineUsed, contracts.ParseEngineLocal)
+	}
+	if len(artifact.Elements) == 0 {
+		t.Fatal("expected xlsx elements")
+	}
+}
+
+func TestAdapterParsesPPTXBytes(t *testing.T) {
+	adapter := NewAdapter()
+
+	artifact, err := adapter.Parse(context.Background(), contracts.ParseRequest{
+		SourceType: contracts.ParseSourceTypeBytes,
+		FileName:   "deck.pptx",
+		Data: buildZipFixture(t, map[string]string{
+			"ppt/slides/slide1.xml": `<p:sld><p:cSld><p:spTree><p:sp><p:txBody><a:p><a:r><a:t>Quarterly Review</a:t></a:r></a:p></p:txBody></p:sp></p:spTree></p:cSld></p:sld>`,
+		}),
+		Intent:     contracts.ParseIntentPreview,
+		Profile:    contracts.ParseProfileFastPreview,
+		EngineHint: contracts.ParseEngineLocal,
+	})
+	if err != nil {
+		t.Fatalf("Parse() error = %v", err)
+	}
+	if !strings.Contains(artifact.Markdown, "Quarterly Review") {
+		t.Fatalf("Markdown = %q, want pptx text", artifact.Markdown)
+	}
+}
+
+func TestAdapterParsesPDFFixture(t *testing.T) {
+	if _, err := exec.LookPath("pdftoppm"); err != nil {
+		if _, terr := exec.LookPath("tesseract"); terr != nil {
+			t.Skip("pdf fixture requires pdftoppm or tesseract to be available")
+		}
+	}
+
+	adapter := NewAdapter()
+	data := mustReadFixture(t, "sample.pdf")
+
+	artifact, err := adapter.Parse(context.Background(), contracts.ParseRequest{
+		SourceType: contracts.ParseSourceTypeBytes,
+		FileName:   "sample.pdf",
+		Data:       data,
+		Intent:     contracts.ParseIntentPreview,
+		Profile:    contracts.ParseProfileFastPreview,
+		EngineHint: contracts.ParseEngineLocal,
+	})
+	if err != nil {
+		t.Fatalf("Parse() error = %v", err)
+	}
+	if artifact.EngineUsed != contracts.ParseEngineLocal {
+		t.Fatalf("EngineUsed = %q, want %q", artifact.EngineUsed, contracts.ParseEngineLocal)
+	}
+	if len(artifact.Elements) == 0 {
+		t.Fatal("expected pdf elements")
+	}
+}
+
+func TestAdapterParsesImageBytes(t *testing.T) {
+	if _, err := exec.LookPath("tesseract"); err != nil {
+		t.Skip("image parsing requires tesseract in current local adapter path")
+	}
+
+	adapter := NewAdapter()
+	data := buildPNGFixture(t)
+
+	artifact, err := adapter.Parse(context.Background(), contracts.ParseRequest{
+		SourceType: contracts.ParseSourceTypeBytes,
+		FileName:   "fixture-image.png",
+		Data:       data,
+		Intent:     contracts.ParseIntentPreview,
+		Profile:    contracts.ParseProfileFastPreview,
+		EngineHint: contracts.ParseEngineLocal,
+	})
+	if err != nil {
+		t.Fatalf("Parse() error = %v", err)
+	}
+	if artifact.Status != contracts.ParseStatusSucceeded {
+		t.Fatalf("Status = %q, want %q", artifact.Status, contracts.ParseStatusSucceeded)
+	}
+	if len(artifact.Elements) == 0 {
+		t.Fatal("expected image elements")
+	}
+}
+
+func TestAdapterParsesLegacyDocBytes(t *testing.T) {
+	adapter := NewAdapter()
+
+	artifact, err := adapter.Parse(context.Background(), contracts.ParseRequest{
+		SourceType: contracts.ParseSourceTypeBytes,
+		FileName:   "legacy.doc",
+		Data:       []byte("Project Plan 2026\x00\x00Budget Overview\x00\x00Delivery Milestones\x00"),
+		Intent:     contracts.ParseIntentPreview,
+		Profile:    contracts.ParseProfileFastPreview,
+		EngineHint: contracts.ParseEngineLocal,
+	})
+	if err != nil {
+		t.Fatalf("Parse() error = %v", err)
+	}
+	if artifact.Status != contracts.ParseStatusSucceeded {
+		t.Fatalf("Status = %q, want %q", artifact.Status, contracts.ParseStatusSucceeded)
+	}
+	if !strings.Contains(artifact.Markdown, "Project Plan 2026") {
+		t.Fatalf("Markdown = %q, want legacy office text", artifact.Markdown)
+	}
+}
+
+func TestAdapterHealthSurface(t *testing.T) {
+	adapter := NewAdapter()
+
+	health, err := adapter.Health(context.Background())
+	if err != nil {
+		t.Fatalf("Health() error = %v", err)
+	}
+	if health.Name != "hyperparse_sdk" {
+		t.Fatalf("Name = %q", health.Name)
+	}
+	if !health.Available {
+		t.Fatal("expected adapter to report available")
+	}
+}
+
+func TestSupportsInputRef(t *testing.T) {
+	if !supportsInputRef("reducto", contracts.ParseSourceTypeURL, "https://example.com/doc.pdf") {
+		t.Fatal("expected reducto URL passthrough support")
+	}
+	if !supportsInputRef("reducto", contracts.ParseSourceTypeUploadFile, "reducto://abc.pdf") {
+		t.Fatal("expected reducto upload-file passthrough support")
+	}
+	if supportsInputRef("reducto", contracts.ParseSourceTypeUploadFile, "file-1") {
+		t.Fatal("did not expect platform upload file ID passthrough support")
+	}
+	if supportsInputRef("local", contracts.ParseSourceTypeURL, "https://example.com/doc.pdf") {
+		t.Fatal("did not expect local URL passthrough support")
+	}
+}
+
+func mustReadFixture(t *testing.T, name string) []byte {
+	t.Helper()
+	_, file, _, ok := runtime.Caller(0)
+	if !ok {
+		t.Fatal("failed to resolve caller")
+	}
+	path := filepath.Join(filepath.Dir(file), "../../../../../tests/file_process/hyperparse/fixtures", name)
+	data, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("read fixture %s: %v", name, err)
+	}
+	return data
+}
+
+func buildZipFixture(t *testing.T, files map[string]string) []byte {
+	t.Helper()
+	buf := bytes.NewBuffer(nil)
+	zw := zip.NewWriter(buf)
+	for name, content := range files {
+		w, err := zw.Create(name)
+		if err != nil {
+			t.Fatalf("create zip entry %s: %v", name, err)
+		}
+		if _, err := w.Write([]byte(content)); err != nil {
+			t.Fatalf("write zip entry %s: %v", name, err)
+		}
+	}
+	if err := zw.Close(); err != nil {
+		t.Fatalf("close zip: %v", err)
+	}
+	return buf.Bytes()
+}
+
+func buildPNGFixture(t *testing.T) []byte {
+	t.Helper()
+	img := image.NewRGBA(image.Rect(0, 0, 48, 24))
+	for y := 0; y < 24; y++ {
+		for x := 0; x < 48; x++ {
+			img.Set(x, y, color.White)
+		}
+	}
+	for y := 6; y < 18; y++ {
+		for x := 10; x < 38; x++ {
+			img.Set(x, y, color.Black)
+		}
+	}
+	buf := bytes.NewBuffer(nil)
+	if err := png.Encode(buf, img); err != nil {
+		t.Fatalf("encode png: %v", err)
+	}
+	return buf.Bytes()
+}

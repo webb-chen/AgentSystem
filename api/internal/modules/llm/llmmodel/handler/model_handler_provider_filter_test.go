@@ -1,0 +1,323 @@
+package handler
+
+import (
+	"context"
+	"encoding/json"
+	"errors"
+	"net/http"
+	"net/http/httptest"
+	"testing"
+
+	"github.com/gin-gonic/gin"
+	"github.com/google/uuid"
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
+	"github.com/webb-chen/AgentSystem/api/internal/modules/llm/llmmodel/dto"
+	"github.com/webb-chen/AgentSystem/api/internal/modules/llm/llmmodel/model"
+	"github.com/webb-chen/AgentSystem/api/internal/modules/llm/llmmodel/service"
+	"github.com/webb-chen/AgentSystem/api/pkg/response"
+)
+
+type fakeModelService struct {
+	models              []*model.ModelView
+	parameters          model.ConfigParameters
+	parametersErr       error
+	err                 error
+	seenProvider        string
+	seenStatus          string
+	configureCalls      int
+	createCustomCalls   int
+	updateCustomCalls   int
+	deleteCustomCalls   int
+	toggleProviderCalls int
+	batchToggleCalls    int
+}
+
+func (f *fakeModelService) CreateGlobal(ctx context.Context, req *dto.CreateModelRequest) (*model.LLMModel, error) {
+	return nil, errors.New("not implemented")
+}
+
+func (f *fakeModelService) GetGlobal(ctx context.Context, id uuid.UUID) (*model.LLMModel, error) {
+	return nil, errors.New("not implemented")
+}
+
+func (f *fakeModelService) ListGlobal(ctx context.Context, req *dto.ListModelRequest) ([]*model.LLMModel, int64, error) {
+	models := []*model.LLMModel{{ID: uuid.New(), Provider: req.Provider, Model: "qwen-plus"}}
+	return models, int64(len(models)), nil
+}
+
+func (f *fakeModelService) UpdateGlobal(ctx context.Context, id uuid.UUID, req *dto.UpdateModelRequest) (*model.LLMModel, error) {
+	return nil, errors.New("not implemented")
+}
+
+func (f *fakeModelService) DeleteGlobal(ctx context.Context, id uuid.UUID) error {
+	return errors.New("not implemented")
+}
+
+func (f *fakeModelService) ConfigureModel(ctx context.Context, organizationID uuid.UUID, req *dto.ConfigureModelRequest) (*model.ModelConfig, error) {
+	f.configureCalls++
+	return &model.ModelConfig{ID: uuid.New(), OrganizationID: organizationID, ModelID: req.ModelID}, nil
+}
+
+func (f *fakeModelService) GetModelConfig(ctx context.Context, organizationID, modelID uuid.UUID) (*model.ModelConfig, error) {
+	return nil, errors.New("not implemented")
+}
+
+func (f *fakeModelService) ListModelConfigs(ctx context.Context, organizationID uuid.UUID, req *dto.ListModelRequest) ([]*model.ModelConfig, int64, error) {
+	return nil, 0, errors.New("not implemented")
+}
+
+func (f *fakeModelService) CreateCustom(ctx context.Context, organizationID uuid.UUID, req *dto.CreateCustomModelRequest) (*model.CustomModel, error) {
+	f.createCustomCalls++
+	return &model.CustomModel{
+		ID:             uuid.New(),
+		OrganizationID: organizationID,
+		Provider:       req.Provider,
+		Name:           req.Name,
+		DisplayName:    req.DisplayName,
+	}, nil
+}
+
+func (f *fakeModelService) GetCustom(ctx context.Context, organizationID, id uuid.UUID) (*model.CustomModel, error) {
+	return nil, errors.New("not implemented")
+}
+
+func (f *fakeModelService) ListCustom(ctx context.Context, organizationID uuid.UUID, req *dto.ListModelRequest) ([]*model.CustomModel, int64, error) {
+	return nil, 0, errors.New("not implemented")
+}
+
+func (f *fakeModelService) UpdateCustom(ctx context.Context, organizationID, id uuid.UUID, req *dto.UpdateCustomModelRequest) (*model.CustomModel, error) {
+	f.updateCustomCalls++
+	displayName := "updated"
+	if req.DisplayName != nil {
+		displayName = *req.DisplayName
+	}
+	return &model.CustomModel{ID: id, OrganizationID: organizationID, DisplayName: displayName}, nil
+}
+
+func (f *fakeModelService) DeleteCustom(ctx context.Context, organizationID, id uuid.UUID) error {
+	f.deleteCustomCalls++
+	return nil
+}
+
+func (f *fakeModelService) ListTenantModels(ctx context.Context, organizationID uuid.UUID, useCase string, provider string, status string) ([]*model.ModelView, error) {
+	f.seenProvider = provider
+	f.seenStatus = status
+	if provider == "" {
+		return f.models, f.err
+	}
+	filtered := make([]*model.ModelView, 0, len(f.models))
+	for _, item := range f.models {
+		if item.Provider == provider {
+			filtered = append(filtered, item)
+		}
+	}
+	return filtered, f.err
+}
+
+func (f *fakeModelService) GetModelParameters(ctx context.Context, organizationID uuid.UUID, provider, modelName string) (model.ConfigParameters, error) {
+	return f.parameters, f.parametersErr
+}
+
+func (f *fakeModelService) ToggleProviderModels(ctx context.Context, organizationID uuid.UUID, provider string, isEnabled bool) error {
+	f.toggleProviderCalls++
+	return nil
+}
+
+func (f *fakeModelService) BatchToggleModels(ctx context.Context, organizationID uuid.UUID, modelIDs []uuid.UUID, isEnabled bool) error {
+	f.batchToggleCalls++
+	return nil
+}
+
+func (f *fakeModelService) ListOfficialModels(ctx context.Context) ([]*model.LLMModel, error) {
+	return nil, errors.New("not implemented")
+}
+
+func (f *fakeModelService) CheckAvailability(ctx context.Context, organizationID uuid.UUID, modelID uuid.UUID) (*dto.ModelAvailabilityResponse, error) {
+	return nil, errors.New("not implemented")
+}
+
+func (f *fakeModelService) BatchCheckAvailability(ctx context.Context, organizationID uuid.UUID, req *dto.BatchModelAvailabilityRequest) (*dto.BatchModelAvailabilityResponse, error) {
+	return nil, errors.New("not implemented")
+}
+
+func (f *fakeModelService) SetAvailableModelsService(svc service.AvailableModelsService) {}
+
+func TestListTenantModels_FilterByProvider_Hit(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	organizationID := uuid.New()
+	svc := &fakeModelService{
+		models: []*model.ModelView{
+			{ID: uuid.New(), Provider: "test-provider", Model: "ernie-x1-turbo-32k"},
+			{ID: uuid.New(), Provider: "other-provider", Model: "gpt-4"},
+		},
+	}
+	h := NewModelHandler(svc)
+
+	router := gin.New()
+	router.GET("/llm/models", h.ListTenantModels)
+
+	req := httptest.NewRequest(http.MethodGet, "/llm/models?provider=test-provider", nil)
+	req.Header.Set("X-Organization-ID", organizationID.String())
+	w := httptest.NewRecorder()
+	router.ServeHTTP(w, req)
+
+	require.Equal(t, http.StatusOK, w.Code)
+	assert.Equal(t, "test-provider", svc.seenProvider)
+	assert.Equal(t, "active", svc.seenStatus)
+
+	data := decodeTenantModelListData(t, w.Body.Bytes())
+	items := data["items"].([]interface{})
+	require.Len(t, items, 1)
+	assert.Equal(t, float64(1), data["total"])
+
+	item := items[0].(map[string]interface{})
+	assert.Equal(t, "test-provider", item["provider"])
+	assert.Equal(t, "ernie-x1-turbo-32k", item["model"])
+}
+
+func TestListTenantModels_NoProviderFilter_ReturnAll(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	organizationID := uuid.New()
+	svc := &fakeModelService{
+		models: []*model.ModelView{
+			{ID: uuid.New(), Provider: "test-provider", Model: "ernie-x1-turbo-32k"},
+			{ID: uuid.New(), Provider: "other-provider", Model: "gpt-4"},
+		},
+	}
+	h := NewModelHandler(svc)
+
+	router := gin.New()
+	router.GET("/llm/models", h.ListTenantModels)
+
+	req := httptest.NewRequest(http.MethodGet, "/llm/models", nil)
+	req.Header.Set("X-Organization-ID", organizationID.String())
+	w := httptest.NewRecorder()
+	router.ServeHTTP(w, req)
+
+	require.Equal(t, http.StatusOK, w.Code)
+	assert.Empty(t, svc.seenProvider)
+	assert.Equal(t, "active", svc.seenStatus)
+
+	data := decodeTenantModelListData(t, w.Body.Bytes())
+	items := data["items"].([]interface{})
+	require.Len(t, items, 2)
+	assert.Equal(t, float64(2), data["total"])
+}
+
+func TestListTenantModels_AvailableOnlyFiltersBeforePagination(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	organizationID := uuid.New()
+	svc := &fakeModelService{
+		models: []*model.ModelView{
+			{ID: uuid.New(), Provider: "deepseek", Model: "unavailable", IsAvailable: false},
+			{ID: uuid.New(), Provider: "deepseek", Model: "available", IsAvailable: true},
+		},
+	}
+	h := NewModelHandler(svc)
+
+	router := gin.New()
+	router.GET("/llm/models", h.ListTenantModels)
+
+	req := httptest.NewRequest(http.MethodGet, "/llm/models?available_only=true&page=1&page_size=1", nil)
+	req.Header.Set("X-Organization-ID", organizationID.String())
+	w := httptest.NewRecorder()
+	router.ServeHTTP(w, req)
+
+	require.Equal(t, http.StatusOK, w.Code)
+	data := decodeTenantModelListData(t, w.Body.Bytes())
+	items := data["items"].([]interface{})
+	require.Len(t, items, 1)
+	assert.Equal(t, float64(1), data["total"])
+	assert.Equal(t, "available", items[0].(map[string]interface{})["model"])
+}
+
+func TestListTenantModels_FilterByProvider_Miss(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	organizationID := uuid.New()
+	svc := &fakeModelService{
+		models: []*model.ModelView{
+			{ID: uuid.New(), Provider: "test-provider", Model: "ernie-x1-turbo-32k"},
+		},
+	}
+	h := NewModelHandler(svc)
+
+	router := gin.New()
+	router.GET("/llm/models", h.ListTenantModels)
+
+	req := httptest.NewRequest(http.MethodGet, "/llm/models?provider=other-provider", nil)
+	req.Header.Set("X-Organization-ID", organizationID.String())
+	w := httptest.NewRecorder()
+	router.ServeHTTP(w, req)
+
+	require.Equal(t, http.StatusOK, w.Code)
+	assert.Equal(t, "other-provider", svc.seenProvider)
+	assert.Equal(t, "active", svc.seenStatus)
+
+	data := decodeTenantModelListData(t, w.Body.Bytes())
+	items := data["items"].([]interface{})
+	require.Len(t, items, 0)
+	assert.Equal(t, float64(0), data["total"])
+}
+
+func TestGetModelParameters_ReturnsRawConfigParameters(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	organizationID := uuid.New()
+	h := NewModelHandler(&fakeModelService{
+		parameters: model.ConfigParameters{
+			{
+				Name:        "default_voice",
+				TemplateKey: "default_voice",
+				Type:        "string",
+				Required:    true,
+				Default:     json.RawMessage(`"voice-1"`),
+				Options:     []string{"voice-1"},
+				OptionLabels: map[string]model.ConfigParameterLocalizedText{
+					"voice-1": {ZhHans: "音色一", EnUS: "Voice One"},
+				},
+			},
+		},
+	})
+
+	router := gin.New()
+	router.GET("/llm/models/parameters", h.GetModelParameters)
+
+	req := httptest.NewRequest(http.MethodGet, "/llm/models/parameters?provider=openai&model=gpt-4.1", nil)
+	req.Header.Set("X-Organization-ID", organizationID.String())
+	w := httptest.NewRecorder()
+	router.ServeHTTP(w, req)
+
+	require.Equal(t, http.StatusOK, w.Code)
+
+	var resp response.Response
+	require.NoError(t, json.Unmarshal(w.Body.Bytes(), &resp))
+	require.Equal(t, "0", resp.Code)
+
+	items, ok := resp.Data.([]interface{})
+	require.True(t, ok)
+	require.Len(t, items, 1)
+
+	item := items[0].(map[string]interface{})
+	assert.Equal(t, "default_voice", item["name"])
+	assert.Equal(t, "default_voice", item["template_key"])
+	assert.Equal(t, "string", item["type"])
+	assert.Equal(t, []interface{}{"voice-1"}, item["options"])
+	optionLabels := item["option_labels"].(map[string]interface{})
+	voiceLabel := optionLabels["voice-1"].(map[string]interface{})
+	assert.Equal(t, "音色一", voiceLabel["zh_Hans"])
+	assert.Equal(t, "Voice One", voiceLabel["en_US"])
+	_, hasLabel := item["label"]
+	assert.False(t, hasLabel)
+}
+
+func decodeTenantModelListData(t *testing.T, body []byte) map[string]interface{} {
+	t.Helper()
+
+	var resp response.Response
+	require.NoError(t, json.Unmarshal(body, &resp))
+	require.Equal(t, "0", resp.Code)
+
+	data, ok := resp.Data.(map[string]interface{})
+	require.True(t, ok)
+	return data
+}

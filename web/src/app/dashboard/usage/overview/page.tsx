@@ -1,0 +1,363 @@
+'use client';
+
+import { useMemo, useState } from 'react';
+import { endOfDay, format, getUnixTime, parseISO, startOfDay, subDays } from 'date-fns';
+import { RefreshCw } from 'lucide-react';
+
+import { useT } from '@/i18n';
+import { AppTypeDistributionSection } from '@/components/usage/app-type-distribution-section';
+import { ModelDetailsSection } from '@/components/usage/model-details-section';
+import { StatsCards } from '@/components/usage/stats-cards';
+import { TokenTrendChart } from '@/components/usage/token-trend-chart';
+import { Button } from '@/components/ui/button';
+import { Card, CardContent, CardDescription, CardHeader, CardTitle } from '@/components/ui/card';
+import { Input, SearchInput } from '@/components/ui/input';
+import {
+  Select,
+  SelectContent,
+  SelectItem,
+  SelectTrigger,
+  SelectValue,
+} from '@/components/ui/select';
+import { Skeleton } from '@/components/ui/skeleton';
+import { useDebouncedValue } from '@/hooks/use-debounced-value';
+import { useOrganizations } from '@/hooks/organization/use-organizations';
+import { useModelUsage } from '@/hooks/statistics';
+import { IS_CLOUD } from '@/lib/config';
+import { cn } from '@/lib/utils';
+import type { ModelUsageAppType, ModelUsageSummary } from '@/services/types/statistics';
+import { getBillingDisplaySettings } from '@/utils/billing-display';
+import { MODEL_USAGE_APP_TYPES } from '@/utils/model-usage-app-type';
+import { isCustomDateRangeValid } from '@/utils/usage-date-range';
+
+type DateRangeKey = 'today' | 'last7Days' | 'last30Days' | 'last90Days' | 'custom';
+type AppTypeFilter = 'all' | ModelUsageAppType;
+type SourceFilter = 'all' | 'official' | 'private';
+
+const DATE_RANGE_DAYS: Record<Exclude<DateRangeKey, 'custom'>, number> = {
+  today: 0,
+  last7Days: 7,
+  last30Days: 30,
+  last90Days: 90,
+};
+
+const EMPTY_SUMMARY: ModelUsageSummary = {
+  attempt_count: 0,
+  success_count: 0,
+  failed_count: 0,
+  partial_count: 0,
+  prompt_tokens: 0,
+  cache_read_tokens: 0,
+  cache_write_tokens: 0,
+  completion_tokens: 0,
+  total_tokens: 0,
+  official_points: 0,
+  private_points: 0,
+  total_points: 0,
+};
+
+function clampDateToToday(value: string, today: string): string {
+  return value && value > today ? today : value;
+}
+
+function SectionEyebrow({ children }: { children: React.ReactNode }) {
+  return (
+    <div className="mb-3 text-xs font-medium uppercase tracking-[0.12em] text-muted-foreground">
+      {children}
+    </div>
+  );
+}
+
+export default function UsageOverviewPage() {
+  const t = useT('dashboard');
+  const tCommon = useT('common');
+  const { currentOrganization, isLoading: isOrganizationLoading } = useOrganizations(true);
+  const [dateRange, setDateRange] = useState<DateRangeKey>('last7Days');
+  const [customStartDate, setCustomStartDate] = useState('');
+  const [customEndDate, setCustomEndDate] = useState('');
+  const [appType, setAppType] = useState<AppTypeFilter>('all');
+  const [sourceFilter, setSourceFilter] = useState<SourceFilter>('all');
+  const [modelNameInput, setModelNameInput] = useState('');
+  const debouncedModelName = useDebouncedValue(modelNameInput.trim(), 300);
+  const todayString = format(new Date(), 'yyyy-MM-dd');
+
+  const isCustomRange = dateRange === 'custom';
+  const isCustomRangeValid =
+    !isCustomRange || isCustomDateRangeValid(customStartDate, customEndDate);
+  const isCustomRangeReversed =
+    isCustomRange && Boolean(customStartDate && customEndDate) && !isCustomRangeValid;
+  const showSourceBreakdown = IS_CLOUD && sourceFilter === 'all';
+  const hasActiveFilters =
+    dateRange !== 'last7Days' ||
+    appType !== 'all' ||
+    sourceFilter !== 'all' ||
+    Boolean(modelNameInput.trim());
+
+  const params = useMemo(() => {
+    let startDate = new Date(0);
+    let endDate = new Date(0);
+
+    if (isCustomRange) {
+      if (customStartDate && customEndDate) {
+        startDate = startOfDay(parseISO(customStartDate));
+        endDate = endOfDay(parseISO(customEndDate));
+      }
+    } else {
+      const days = DATE_RANGE_DAYS[dateRange];
+      const now = new Date();
+      startDate = startOfDay(subDays(now, days));
+      endDate = endOfDay(now);
+    }
+
+    return {
+      start_time: getUnixTime(startDate),
+      end_time: getUnixTime(endDate),
+      app_type: appType === 'all' ? undefined : appType,
+      model_name: debouncedModelName || undefined,
+      use_system_provider:
+        IS_CLOUD && sourceFilter !== 'all' ? sourceFilter === 'official' : undefined,
+    };
+  }, [
+    appType,
+    customEndDate,
+    customStartDate,
+    dateRange,
+    debouncedModelName,
+    isCustomRange,
+    sourceFilter,
+  ]);
+
+  const { data, isLoading, isFetching, refetch } = useModelUsage(params, {
+    enabled: isCustomRangeValid,
+  });
+  const billingDisplay = useMemo(
+    () => getBillingDisplaySettings(currentOrganization),
+    [currentOrganization]
+  );
+  const isPageLoading = isLoading || isOrganizationLoading;
+  const summary = data?.summary ?? EMPTY_SUMMARY;
+
+  const resetFilters = () => {
+    setDateRange('last7Days');
+    setCustomStartDate('');
+    setCustomEndDate('');
+    setAppType('all');
+    setSourceFilter('all');
+    setModelNameInput('');
+  };
+
+  const refreshAllUsage = () => refetch();
+
+  return (
+    <div className="flex h-full flex-col overflow-auto">
+      <div className="space-y-6 p-6">
+        <div className="flex flex-col gap-4 lg:flex-row lg:items-start lg:justify-between">
+          <div>
+            <h1 className="text-2xl font-semibold">{t('usage.title')}</h1>
+            <p className="mt-1 text-sm text-muted-foreground">{t('usage.subtitle')}</p>
+          </div>
+        </div>
+
+        <Card className="border-border/80 shadow-sm">
+          <CardHeader className="pb-3">
+            <div className="flex flex-col gap-3 md:flex-row md:items-start md:justify-between">
+              <div>
+                <SectionEyebrow>{tCommon('filter')}</SectionEyebrow>
+                <CardTitle className="text-base">{t('usage.filters.appType')}</CardTitle>
+                <CardDescription>{t('usage.filters.description')}</CardDescription>
+              </div>
+              <div className="flex items-center gap-2 self-start">
+                {hasActiveFilters ? (
+                  <Button variant="ghost" size="sm" onClick={resetFilters}>
+                    {tCommon('resetFilters')}
+                  </Button>
+                ) : null}
+                <Button
+                  type="button"
+                  variant="outline"
+                  size="sm"
+                  onClick={refreshAllUsage}
+                  disabled={isFetching || !isCustomRangeValid}
+                  className="gap-2"
+                >
+                  <RefreshCw className={cn('h-4 w-4', isFetching && 'animate-spin')} />
+                  {tCommon('refresh')}
+                </Button>
+              </div>
+            </div>
+          </CardHeader>
+          <CardContent className="space-y-4">
+            <div className="flex flex-wrap items-center gap-3">
+              <Select
+                value={dateRange}
+                onValueChange={value => setDateRange(value as DateRangeKey)}
+              >
+                <SelectTrigger className="w-[150px]">
+                  <SelectValue />
+                </SelectTrigger>
+                <SelectContent>
+                  <SelectItem value="today">{t('usage.dateRange.today')}</SelectItem>
+                  <SelectItem value="last7Days">{t('usage.dateRange.last7Days')}</SelectItem>
+                  <SelectItem value="last30Days">{t('usage.dateRange.last30Days')}</SelectItem>
+                  <SelectItem value="last90Days">{t('usage.dateRange.last90Days')}</SelectItem>
+                  <SelectItem value="custom">{t('usage.dateRange.custom')}</SelectItem>
+                </SelectContent>
+              </Select>
+
+              <Select value={appType} onValueChange={value => setAppType(value as AppTypeFilter)}>
+                <SelectTrigger className="w-[170px]">
+                  <SelectValue placeholder={t('usage.filters.appTypePlaceholder')} />
+                </SelectTrigger>
+                <SelectContent>
+                  <SelectItem value="all">{t('usage.filters.appTypePlaceholder')}</SelectItem>
+                  {MODEL_USAGE_APP_TYPES.map(appType => (
+                    <SelectItem key={appType} value={appType}>
+                      {t(`usage.appTypes.${appType}`)}
+                    </SelectItem>
+                  ))}
+                </SelectContent>
+              </Select>
+
+              {IS_CLOUD ? (
+                <Select
+                  value={sourceFilter}
+                  onValueChange={value => setSourceFilter(value as SourceFilter)}
+                >
+                  <SelectTrigger className="w-[170px]">
+                    <SelectValue placeholder={t('usage.filters.sourcePlaceholder')} />
+                  </SelectTrigger>
+                  <SelectContent>
+                    <SelectItem value="all">{t('usage.filters.sourceAll')}</SelectItem>
+                    <SelectItem value="official">{t('usage.filters.sourceOfficial')}</SelectItem>
+                    <SelectItem value="private">{t('usage.filters.sourcePrivate')}</SelectItem>
+                  </SelectContent>
+                </Select>
+              ) : null}
+
+              <SearchInput
+                value={modelNameInput}
+                onChange={event => setModelNameInput(event.target.value)}
+                placeholder={t('usage.filters.modelNamePlaceholder')}
+                className="w-full min-w-[220px] sm:w-[260px]"
+              />
+            </div>
+
+            <div className="flex items-center justify-end border-t border-border/60 pt-3">
+              <span className="text-xs tabular-nums text-muted-foreground">
+                {isPageLoading
+                  ? tCommon('loading')
+                  : t('usage.cards.modelCount', { count: data?.by_model?.length ?? 0 })}
+              </span>
+            </div>
+
+            {isCustomRange ? (
+              <div className="grid gap-3 sm:grid-cols-2 lg:max-w-lg">
+                <label className="flex flex-col gap-1.5">
+                  <span className="text-xs font-medium text-muted-foreground">
+                    {t('usage.filters.startDate')}
+                  </span>
+                  <Input
+                    type="date"
+                    value={customStartDate}
+                    onChange={event =>
+                      setCustomStartDate(clampDateToToday(event.target.value, todayString))
+                    }
+                    max={todayString}
+                  />
+                </label>
+                <label className="flex flex-col gap-1.5">
+                  <span className="text-xs font-medium text-muted-foreground">
+                    {t('usage.filters.endDate')}
+                  </span>
+                  <Input
+                    type="date"
+                    value={customEndDate}
+                    onChange={event =>
+                      setCustomEndDate(clampDateToToday(event.target.value, todayString))
+                    }
+                    min={customStartDate || undefined}
+                    max={todayString}
+                    aria-invalid={isCustomRangeReversed}
+                    error={isCustomRangeReversed}
+                    errorText={
+                      isCustomRangeReversed ? t('usage.filters.dateRangeInvalid') : undefined
+                    }
+                  />
+                </label>
+              </div>
+            ) : null}
+          </CardContent>
+        </Card>
+
+        {isPageLoading ? (
+          <div className="grid gap-4 md:grid-cols-2 xl:grid-cols-5">
+            {Array.from({ length: showSourceBreakdown ? 5 : 4 }).map((_, index) => (
+              <Card key={index}>
+                <CardContent className="p-5">
+                  <Skeleton className="mb-3 h-4 w-24" />
+                  <Skeleton className="mb-3 h-8 w-28" />
+                  <Skeleton className="h-4 w-full" />
+                </CardContent>
+              </Card>
+            ))}
+          </div>
+        ) : (
+          <StatsCards
+            summary={summary}
+            models={data?.by_model ?? []}
+            showSourceBreakdown={showSourceBreakdown}
+            billingDisplay={billingDisplay}
+          />
+        )}
+
+        {isPageLoading ? (
+          <LoadingSection />
+        ) : (
+          <TokenTrendChart
+            dailyData={data?.daily_trend ?? []}
+            showSourceBreakdown={showSourceBreakdown}
+            billingDisplay={billingDisplay}
+          />
+        )}
+
+        {isPageLoading ? (
+          <LoadingSection />
+        ) : (
+          <ModelDetailsSection
+            models={data?.by_model ?? []}
+            totalPoints={summary.total_points}
+            totalAttempts={summary.attempt_count}
+            totalTokens={summary.total_tokens}
+            promptTokens={summary.prompt_tokens}
+            cacheReadTokens={summary.cache_read_tokens}
+            cacheWriteTokens={summary.cache_write_tokens}
+            completionTokens={summary.completion_tokens}
+            showSourceBreakdown={showSourceBreakdown}
+            billingDisplay={billingDisplay}
+          />
+        )}
+
+        {isPageLoading ? (
+          <LoadingSection />
+        ) : (
+          <AppTypeDistributionSection
+            items={data?.by_app_type ?? []}
+            billingDisplay={billingDisplay}
+          />
+        )}
+      </div>
+    </div>
+  );
+}
+
+function LoadingSection() {
+  return (
+    <Card>
+      <CardContent className="p-6">
+        <Skeleton className="mb-2 h-6 w-48" />
+        <Skeleton className="mb-6 h-4 w-64" />
+        <Skeleton className="h-[300px] w-full" />
+      </CardContent>
+    </Card>
+  );
+}
