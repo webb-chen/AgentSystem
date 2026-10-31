@@ -267,12 +267,25 @@ check_ports() {
     "$(env_get "$ENV_FILE" NEO4J_BOLT_PORT 7687):Neo4j Bolt"
   )
 
+  # 本产品既有实例占用的端口允许被本次部署接管（重装 / 升级场景）
+  local -A own_port=()
+  local cid
+  for cid in $(docker ps -q -f "label=com.docker.compose.project=${PROJECT_NAME}" 2>/dev/null); do
+    while IFS= read -r p; do
+      [ -n "$p" ] && own_port["$p"]=1
+    done < <(docker inspect -f '{{range $k,$v := .NetworkSettings.Ports}}{{if $v}}{{(index $v 0).HostPort}}{{"\n"}}{{end}}{{end}}' "$cid" 2>/dev/null || true)
+  done
+
   local conflict=0 item port name
   for item in "${ports[@]}"; do
     port="${item%%:*}"; name="${item#*:}"
     if port_busy "$port"; then
-      err "端口 ${port} 已被占用（${name}）"
-      conflict=$((conflict+1))
+      if [ -n "${own_port[$port]:-}" ]; then
+        ok "端口 ${port} 由本产品既有实例占用，本次部署将接管（${name}）"
+      else
+        err "端口 ${port} 已被其它进程占用（${name}）"
+        conflict=$((conflict+1))
+      fi
     else
       ok "端口 ${port} 空闲（${name}）"
     fi
