@@ -85,14 +85,28 @@ cmd_status() {
       continue
     fi
     st="$(docker inspect -f '{{.State.Status}}' "$cid" 2>/dev/null || echo unknown)"
-    health="$(docker inspect -f '{{if .State.Health}}{{.State.Health.Status}}{{else}}-{{end}}' "$cid" 2>/dev/null || echo -)"
-    up="$(docker inspect -f '{{.State.StartedAt}}' "$cid" 2>/dev/null | cut -c1-19 | tr 'T' ' ' || echo -)"
+    health="$(docker inspect -f '{{if .State.Health}}{{.State.Health.Status}}{{else}}n/a{{end}}' "$cid" 2>/dev/null || echo n/a)"
+    local started_s now_s up_s
+    started_s="$(docker inspect -f '{{.State.StartedAt}}' "$cid" 2>/dev/null || true)"
+    now_s="$(date -u +%Y-%m-%dT%H:%M:%S)"
+    up="-"
+    if [ -n "$started_s" ]; then
+      local a b
+      a="$(date -u -d "${started_s}" +%s 2>/dev/null || echo 0)"
+      b="$(date -u -d "${now_s}" +%s 2>/dev/null || echo 0)"
+      if [ "$a" -gt 0 ] && [ "$b" -ge "$a" ]; then
+        local d=$(( b - a ))
+        if [ "$d" -ge 86400 ]; then up="$((d/86400))d$(((d%86400)/3600))h"
+        elif [ "$d" -ge 3600 ]; then up="$((d/3600))h$(((d%3600)/60))m"
+        else up="$((d/60))m"; fi
+      fi
+    fi
     img="$(docker inspect -f '{{.Config.Image}}' "$cid" 2>/dev/null || echo -)"
     local color="$C_GRN"
     [ "$st" = "running" ] || color="$C_RED"
     [ "$health" = "unhealthy" ] && color="$C_RED"
     [ "$health" = "starting" ] && color="$C_YEL"
-    printf "  %-12s %s%-10s%s %-22s %-10s %s\n" "$svc" "$color" "$st" "$C_RST" "$health" "${up#* }" "$img"
+    printf "  %-12s %s%-10s%s %-22s %-10s %s\n" "$svc" "$color" "$st" "$C_RST" "$health" "$up" "$img"
   done
   hr_thin
   printf "  入口: %s%s%s   本机: %shttp://127.0.0.1:%s%s\n" "$C_CYN" "$url" "$C_RST" "$C_CYN" "$port" "$C_RST"

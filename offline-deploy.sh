@@ -523,11 +523,18 @@ wait_healthy() {
   local max_wait=360 elapsed=0
   local -A state=()
   while [ "$elapsed" -lt "$max_wait" ]; do
-    local up=0 healthy=0 svc cid st
+    local up=0 healthy=0 svc cid st health_now state_now
     for svc in $SERVICE_LIST; do
       cid="$(docker ps -aq -f "label=com.docker.compose.project=${PROJECT_NAME}" -f "label=com.docker.compose.service=${svc}" | head -1)"
       if [ -z "$cid" ]; then state[$svc]="missing"; continue; fi
-      st="$(docker inspect -f '{{if .State.Health}}{{.State.Health.Status}}{{else}}{{.State.Status}}{{end}}' "$cid" 2>/dev/null || echo unknown)"
+      health_now="$(docker inspect -f '{{if .State.Health}}{{.State.Health.Status}}{{else}}none{{end}}' "$cid" 2>/dev/null || echo none)"
+      state_now="$(docker inspect -f '{{.State.Status}}' "$cid" 2>/dev/null || echo unknown)"
+      if [ "$health_now" = "none" ]; then
+        # 无 healthcheck 的服务（weaviate 等）：running 即视为就绪
+        if [ "$state_now" = "running" ]; then st="healthy"; else st="$state_now"; fi
+      else
+        st="$health_now"
+      fi
       state[$svc]="$st"
       if [ "$st" = "healthy" ] || [ "$st" = "running" ]; then up=$((up+1)); fi
       if [ "$st" = "healthy" ]; then healthy=$((healthy+1)); fi
