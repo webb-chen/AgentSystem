@@ -22,12 +22,17 @@ function formatDateTime(value: string | null | undefined): string {
 }
 
 export default function LicensePage() {
-  const { status, isLoading } = useLicenseStatus();
+  const { status, isLoading, error: statusError } = useLicenseStatus();
   const { data: machine } = useMachineCode();
   const uploadLicense = useUploadLicense();
   const reloadLicense = useReloadLicense();
   const fileInputRef = useRef<HTMLInputElement>(null);
   const [selectedFile, setSelectedFile] = useState<File | null>(null);
+
+  // On the server React Query reports isLoading=false before any fetch has
+  // started, which would flash the "not licensed" alert. Treat "no data and
+  // no error yet" as loading as well.
+  const showLoading = isLoading || (!status && !statusError);
 
   const isValid = status?.valid ?? false;
   const license = status?.license ?? null;
@@ -51,7 +56,9 @@ export default function LicensePage() {
 
   const statusText = status
     ? licenseFailureMessage(status.code, status.message || '授权状态未知')
-    : '';
+    : statusError
+      ? `授权状态查询失败：${statusError}`
+      : '';
 
   return (
     <div className="min-h-svh w-full flex items-center justify-center bg-background p-6">
@@ -64,7 +71,7 @@ export default function LicensePage() {
         </CardHeader>
 
         <CardContent className="space-y-5">
-          {isLoading ? (
+          {showLoading ? (
             <div className="space-y-4">
               <Skeleton className="h-10 w-full" />
               <Skeleton className="h-24 w-full" />
@@ -179,7 +186,7 @@ export default function LicensePage() {
           )}
         </CardContent>
       </Card>
-      {!isLoading && status?.code === 'license_not_init' ? (
+      {!showLoading && status?.code === 'license_not_init' ? (
         <div className="sr-only" role="status">
           {status.message}
         </div>

@@ -14,7 +14,6 @@ import {
   X,
 } from 'lucide-react';
 import Link from 'next/link';
-import { toast } from 'sonner';
 import { Button } from '@/components/ui/button';
 import { Input } from '@/components/ui/input';
 import { Badge } from '@/components/ui/badge';
@@ -158,7 +157,8 @@ export default function ExcelImportShell({ dbId }: ExcelImportShellProps) {
     return saved ? { provider: saved.provider, model: saved.model } : null;
   });
   const [recognitionDraft, setRecognitionDraft] = useState<RecognizeExcelImportData | null>(null);
-  const [hasRecognitionCompleted, setHasRecognitionCompleted] = useState(false);
+  // Recognition is optional: the analyzed schema is importable on its own.
+  const [, setHasRecognitionCompleted] = useState(false);
   const [recognitionDialogOpen, setRecognitionDialogOpen] = useState(false);
   const [createdTableId, setCreatedTableId] = useState<string | null>(null);
   const [importResult, setImportResult] = useState<ConfirmExcelImportData | null>(null);
@@ -288,10 +288,9 @@ export default function ExcelImportShell({ dbId }: ExcelImportShellProps) {
   };
 
   const handleConfirm = async () => {
-    if (!hasRecognitionCompleted) {
-      toast.info(t('excelImport.schema.recognitionIncomplete'));
-      return;
-    }
+    // AI recognition only refines column names/types. The heuristic analysis
+    // already produced a valid schema, so importing must not require a model:
+    // offline deployments often have no text-chat model configured at all.
     if (!analysis || !canImport || !canExecuteImport) return;
     const payload: ConfirmExcelImportRequest = {
       table: {
@@ -844,13 +843,7 @@ export default function ExcelImportShell({ dbId }: ExcelImportShellProps) {
             </Button>
             <Button
               onClick={handleConfirm}
-              aria-disabled={!hasRecognitionCompleted || !canImport || !canExecuteImport}
-              disabled={
-                !canExecuteImport ||
-                confirmMutation.isPending ||
-                (hasRecognitionCompleted && !canImport)
-              }
-              className={cn(!hasRecognitionCompleted && 'opacity-50')}
+              disabled={!canExecuteImport || confirmMutation.isPending || !canImport}
             >
               {confirmMutation.isPending && <Loader2 className="h-4 w-4 animate-spin" />}
               {t('excelImport.schema.import')}

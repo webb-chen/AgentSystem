@@ -44,6 +44,10 @@ export function useLicenseStatus(): UseLicenseStatusReturn {
     gcTime: 5 * 60 * 1000,
     refetchOnWindowFocus: false,
     retry: false,
+    // The app-level QueryClient ships with queries disabled until the auth
+    // store is ready. Public routes (e.g. /license) never initialize auth, so
+    // every query there must opt in explicitly or it will never run.
+    enabled: true,
   });
 
   return {
@@ -60,6 +64,9 @@ export function useUploadLicense() {
   return useMutation<LicenseStatusResponse, unknown, File>({
     mutationFn: (file: File) => licenseService.upload(file),
     onSuccess: result => {
+      // Surface the server verdict immediately, even if the status query is
+      // disabled or the follow-up refetch fails.
+      queryClient.setQueryData(getLicenseStatusKey(), result);
       if (!result.valid) {
         toast.error(licenseFailureMessage(result.code, result.message || '授权文件上传失败'));
         return;
@@ -79,6 +86,7 @@ export function useReloadLicense() {
   return useMutation<LicenseStatusResponse, unknown, void>({
     mutationFn: () => licenseService.reload(),
     onSuccess: result => {
+      queryClient.setQueryData(getLicenseStatusKey(), result);
       if (!result.valid) {
         toast.error(licenseFailureMessage(result.code, result.message || '授权无效'));
         return;
@@ -99,5 +107,6 @@ export function useMachineCode() {
     staleTime: 5 * 60 * 1000,
     refetchOnWindowFocus: false,
     retry: false,
+    enabled: true,
   });
 }
